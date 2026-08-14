@@ -4,8 +4,10 @@
 
 pub const common = @import("common.zig");
 pub const http1 = @import("http1.zig");
+pub const http2 = @import("http2.zig");
 
 test {
     _ = common;
     _ = http1;
+    _ = http2;
 }
