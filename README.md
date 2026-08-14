@@ -20,7 +20,7 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — protocol state primitives.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
-- `hpack` dependency — standalone RFC 7541 codec with Huffman and dynamic-table support.
+- `hpack` 0.2.0 dependency — standalone RFC 7541 codec with compact dynamic-table metadata, fast static lookup, Huffman support, and bounded decoding.
 
 ## Dependency
 

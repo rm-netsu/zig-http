@@ -1,12 +1,12 @@
 .{
     .name = .http,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .fingerprint = 0x97780db2dca25ca8,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .hpack = .{
-            .url = "git+https://github.com/rm-netsu/zig-hpack.git#42994394d836705d824204ddbc8358f61ea7a742",
-            .hash = "hpack-0.1.0-I4dbbpkaAQArJg1hsdFAXKZQTjIOOlb2tBhDlNWNf3VI",
+            .url = "git+https://github.com/rm-netsu/zig-hpack.git#abd8179b71e5f870c00cf3de4e35a830747e3b02",
+            .hash = "hpack-0.2.0-I4dbbpVeAQAflaNTrRMeUXGs23p0PFR21GhvtZjtoi_D",
         },
     },
     .paths = .{
