@@ -3,7 +3,9 @@
 //! pair these parsers/writers with their own event loop and transport strategy.
 
 pub const common = @import("common.zig");
+pub const http1 = @import("http1.zig");
 
 test {
     _ = common;
+    _ = http1;
 }
