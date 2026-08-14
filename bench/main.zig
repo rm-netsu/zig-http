@@ -117,6 +117,61 @@ fn benchFrameComplete(io: Io, wire: []const u8, operations: u64) !i96 {
     return elapsed;
 }
 
+fn benchFrameBatchParse(io: Io, wire: []const u8, frames_per_batch: usize, frame_operations: u64) !i96 {
+    var sum: usize = 0;
+    const batches = frame_operations / frames_per_batch;
+    const start = now(io);
+    for (0..batches) |_| {
+        var remaining = wire;
+        while (remaining.len != 0) {
+            const r = (try http.http2.parseCompleteFrame(remaining, http.http2.frame.default_max_frame_size)).?;
+            sum +%= r.frame.payload.len;
+            remaining = remaining[r.consumed..];
+        }
+    }
+    const elapsed = now(io) - start;
+    std.mem.doNotOptimizeAway(sum);
+    return elapsed;
+}
+
+fn benchFrameBatchIterator(io: Io, wire: []const u8, frames_per_batch: usize, frame_operations: u64) !i96 {
+    var sum: usize = 0;
+    const batches = frame_operations / frames_per_batch;
+    const start = now(io);
+    for (0..batches) |_| {
+        var it = http.http2.frame.CompleteIterator.init(wire, http.http2.frame.default_max_frame_size);
+        while (try it.next()) |frame| sum +%= frame.payload.len;
+    }
+    const elapsed = now(io) - start;
+    std.mem.doNotOptimizeAway(sum);
+    return elapsed;
+}
+
+fn benchH2Fields(io: Io, entropy: u8, operations: u64) !i96 {
+    var request_id = "0123456789abcdef".*;
+    request_id[0] = 'a' + entropy % 6;
+    const fields = [_]http.common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/api/v1/items" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "user-agent", .value = "benchmark/1.0" },
+        .{ .name = "accept", .value = "application/json" },
+        .{ .name = "x-request-id", .value = &request_id },
+    };
+    var sum: usize = 0;
+    const start = now(io);
+    for (0..operations) |_| {
+        var validator = http.http2.fields.Validator.init(.request);
+        for (fields) |field| try validator.field(field);
+        try validator.finish();
+        sum +%= @intFromBool(validator.regular_seen);
+    }
+    const elapsed = now(io) - start;
+    std.mem.doNotOptimizeAway(sum);
+    return elapsed;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var stdout_buffer: [1024]u8 = undefined;
@@ -145,6 +200,10 @@ pub fn main(init: std.process.Init) !void {
     @memcpy(frame_wire[0..9], &frame_header);
     @memcpy(frame_wire[9..], payload);
 
+    const frames_per_batch = 8;
+    var frame_batch: [41 * frames_per_batch]u8 = undefined;
+    for (0..frames_per_batch) |i| @memcpy(frame_batch[i * 41 ..][0..41], &frame_wire);
+
     const head_ops: u64 = 1_000_000;
     const chunk_ops: u64 = 2_000_000;
     const frame_ops: u64 = 10_000_000;
@@ -155,13 +214,18 @@ pub fn main(init: std.process.Init) !void {
     try report(out, "http1 chunk decode", try benchChunkDecode(io, &chunked, chunk_ops), chunk_ops);
     try report(out, "http2 frame incremental", try benchFrameIncremental(io, &frame_wire, frame_ops), frame_ops);
     try report(out, "http2 frame complete", try benchFrameComplete(io, &frame_wire, frame_ops), frame_ops);
+    try report(out, "http2 batch parseComplete", try benchFrameBatchParse(io, &frame_batch, frames_per_batch, frame_ops), frame_ops);
+    try report(out, "http2 batch iterator", try benchFrameBatchIterator(io, &frame_batch, frames_per_batch, frame_ops), frame_ops);
+    try report(out, "http2 field validation", try benchH2Fields(io, entropy, head_ops), head_ops);
 
-    try out.print("state sizes: HeadParser={d} ChunkDecoder={d} FrameDecoder={d} FlowWindow={d} Guard={d} Collector={d}\n", .{
+    try out.print("state sizes: HeadParser={d} ChunkDecoder={d} FrameDecoder={d} CompleteFrameIterator={d} FlowWindow={d} Guard={d} Collector={d} H2FieldValidator={d}\n", .{
         @sizeOf(http.http1.HeadParser),
         @sizeOf(http.http1.ChunkDecoder),
         @sizeOf(http.http2.FrameDecoder),
+        @sizeOf(http.http2.CompleteFrameIterator),
         @sizeOf(http.http2.FlowWindow),
         @sizeOf(http.http2.continuation.Guard),
         @sizeOf(http.http2.header_block.Collector),
+        @sizeOf(http.http2.fields.Validator),
     });
 }
