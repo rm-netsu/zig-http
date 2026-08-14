@@ -74,7 +74,8 @@ pub const ParseResult = struct {
 
 /// Parse a complete HTTP/1 head directly from caller-owned input. This is the
 /// zero-copy fast path for transports that retain their read buffer while the
-/// returned `Head` is consumed. Returns `null` until CRLF CRLF is present.
+/// returned `Head` is consumed. Returns `null` while another complete line is
+/// needed; malformed complete lines may fail before the terminating empty line.
 pub fn parse(mode: Mode, input: []const u8) Error!?ParseResult {
     const first_eol = std.mem.indexOf(u8, input, "\r\n") orelse return null;
     var head = try parseStartLine(mode, input[0..first_eol]);

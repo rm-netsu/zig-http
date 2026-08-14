@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0
+
+- Parse contiguous HTTP/1 heads line-by-line without a preliminary CRLF-CRLF scan.
+- Use process-wide byte-class tables, four-byte token validation, and short SIMD blocks for HTTP field validation.
+- Keep the validation tables to 512 bytes of read-only process state; persistent per-connection parser sizes are unchanged.
+- Collapse HTTP/2 frame stream/length validation into one frame-type dispatch.
+- Add `CompleteFrameIterator` for zero-copy traversal of multiple complete frames in one transport buffer.
+- Accelerate HTTP/2 field validation with direct pseudo-header classification, one-pass lowercase token checks, and SIMD value checks.
+- Enforce the RFC 9113 prohibition on leading/trailing SP or HTAB in HTTP/2 field values.
+- Extend the regression benchmark with batched HTTP/2 frame traversal and field validation.
+
 ## 0.3.0
 
 - Add zero-copy contiguous HTTP/1 request and response head parsing.

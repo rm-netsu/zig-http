@@ -1,53 +1,55 @@
 # Benchmarks
 
-These microbenchmarks exercise parser hot paths without networking, TLS, or HPACK work. They are intended for regression tracking rather than as end-to-end HTTP throughput claims.
+These microbenchmarks exercise parser hot paths without networking, TLS, or HPACK work. They are regression tests for protocol-core overhead rather than end-to-end HTTP throughput claims.
 
-Run with the supplied Zig 0.16.0 toolchain:
+Run with Zig 0.16.0:
 
 ```sh
 zig build bench -Doptimize=ReleaseFast
 ```
 
-The benchmark mutates its wire input from the runtime clock before timing so the compiler cannot fold the parser work into constants.
+Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
-## 0.3.0 hot paths
+## 0.4.0 versus 0.3.0
 
-Three consecutive runs on the development x86_64 Linux host produced:
+Five consecutive ReleaseFast runs were collected from clean worktrees on the same x86_64 Linux host. Values below are medians.
 
-| Benchmark | Run 1 | Run 2 | Run 3 | Median |
-| --- | ---: | ---: | ---: | ---: |
-| HTTP/1 legacy head + separate framing | 2.019 M ops/s | 2.013 M ops/s | 1.988 M ops/s | 2.013 M ops/s |
-| HTTP/1 incremental single-pass framing | 3.133 M ops/s | 3.026 M ops/s | 3.108 M ops/s | 3.108 M ops/s |
-| HTTP/1 contiguous single-pass framing | 3.198 M ops/s | 3.193 M ops/s | 3.113 M ops/s | 3.193 M ops/s |
-| HTTP/1 chunk decoder | 40.527 M ops/s | 39.438 M ops/s | 39.810 M ops/s | 39.810 M ops/s |
-| HTTP/2 incremental frame decoder | 264.020 M ops/s | 246.705 M ops/s | 271.180 M ops/s | 264.020 M ops/s |
-| HTTP/2 contiguous complete-frame parser | 595.830 M ops/s | 606.036 M ops/s | 565.634 M ops/s | 595.830 M ops/s |
+| Benchmark | 0.3.0 | 0.4.0 | Change |
+| --- | ---: | ---: | ---: |
+| HTTP/1 legacy head + separate framing | 2.192 M ops/s | 2.931 M ops/s | 1.34x |
+| HTTP/1 incremental framed head | 3.443 M ops/s | 4.313 M ops/s | 1.25x |
+| HTTP/1 contiguous framed head | 3.472 M ops/s | 6.494 M ops/s | 1.87x |
+| HTTP/2 incremental frame decoder | 280.4 M ops/s | 275.6 M ops/s | ~flat |
+| HTTP/2 contiguous complete-frame parser | 606.6 M ops/s | 680.6 M ops/s | 1.12x |
+| HTTP/2 request field validation | 8.013 M sets/s | 21.518 M sets/s | 2.69x |
 
-On this workload, the HTTP/1 single-pass paths are about 1.54x to 1.59x faster than validating the head and then scanning fields again for framing. The complete HTTP/2 frame path is about 2.26x faster than driving the two-event incremental decoder when the transport already has a full frame available.
+The field-validation result includes the stricter RFC 9113 check that rejects leading/trailing SP and HTAB.
 
-## Connection-state size
+For a buffer containing eight 32-byte DATA frames, repeatedly calling `parseCompleteFrame` reaches about 398.4 M frames/s, while `CompleteFrameIterator` reaches about 442.0 M frames/s, approximately 1.11x faster. The iterator uses 32 bytes of temporary state on x86_64.
 
-Type sizes on x86_64 Linux:
+## Memory trade-off
 
-| Type | 0.2.2 | 0.3.0 |
-| --- | ---: | ---: |
-| `http1.HeadParser` | 32 B | 24 B |
-| `http1.ChunkDecoder` | 40 B | 32 B |
-| `http2.FrameDecoder` | 36 B | 20 B |
-| `http2.FlowWindow` | 8 B | 4 B |
-| `http2.continuation.Guard` | 8 B | 4 B |
-| `http2.header_block.Collector` | 32 B | 24 B |
+The optimized common validator keeps two 256-byte read-only byte-class tables: one for HTTP token characters and one for scalar field-value tails. This is about 512 bytes per process/module image, not per connection. The existing persistent parser state sizes remain unchanged from 0.3.0:
 
-A representative HTTP/2 parser-state set consisting of one frame decoder, one flow window, one continuation guard, and one header-block collector is 52 B in 0.3.0 versus 84 B in 0.2.2. Each additional per-stream `FlowWindow` is 4 B instead of 8 B.
+| Type | Size on x86_64 Linux |
+| --- | ---: |
+| `http1.HeadParser` | 24 B |
+| `http1.ChunkDecoder` | 32 B |
+| `http2.FrameDecoder` | 20 B |
+| `http2.FlowWindow` | 4 B |
+| `http2.continuation.Guard` | 4 B |
+| `http2.header_block.Collector` | 24 B |
+| `http2.fields.Validator` | 8 B |
+| `http2.CompleteFrameIterator` | 32 B temporary |
 
-## Rejected experiments
+## Retained implementation choices
 
-The following experiments were measured and intentionally not retained:
+- HTTP/1 field values use 8-byte SIMD validation blocks followed by the byte-class table. Larger 16- and 32-byte blocks were slower for the representative short-header workload.
+- HTTP token validation is unrolled four bytes at a time. Eight-byte unrolling increased code size and regressed the parser benchmark.
+- HTTP/2 field values use 8-byte SIMD blocks. A 256-byte lowercase-name table did not improve the validator enough to justify another global table.
+- HTTP/2 frame validation uses one type switch. A special DATA/HEADERS pre-branch did not improve the measured hot path.
+- The batch iterator is retained; a comptime callback dispatcher was only about 1-2% faster and added API complexity.
 
-- `std.Io.Writer.writeVecAll` for HTTP/2 frame output was slower than two `writeAll` calls in the tested buffered-writer workload.
-- `writeVecAll` for HTTP/1 field lines was slower than the existing small `writeAll` sequence.
-- Manual hexadecimal chunk-size formatting did not improve over Zig 0.16.0 `Writer.print`.
-- A more branch-minimized HTTP/2 field validator regressed the representative validation benchmark.
-- Replacing the optimized CRLF substring search with a scalar CR scan did not improve HTTP/1 header iteration.
+## Earlier rejected experiments
 
-These are deliberately excluded to keep the implementation simple and to avoid trading benchmark-neutral or negative changes for extra code.
+The 0.3.0 investigations also rejected `std.Io.Writer.writeVecAll` for the tested HTTP/1 and HTTP/2 serialization workloads, manual hexadecimal chunk-size formatting, scalar CR scanning in HTTP/1, and a more branch-minimized HTTP/2 field validator when those variants did not improve measured performance.
