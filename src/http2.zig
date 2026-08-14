@@ -8,7 +8,7 @@ pub const preface = @import("http2/preface.zig");
 pub const protocol = @import("http2/protocol.zig");
 pub const stream = @import("http2/stream.zig");
 pub const header_block = @import("http2/header_block.zig");
-pub const hpack = @import("http2/hpack.zig");
+pub const hpack = @import("hpack");
 
 pub const FrameHeader = frame.FrameHeader;
 pub const FrameDecoder = frame.FrameDecoder;

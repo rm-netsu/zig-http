@@ -8,7 +8,7 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - Slice-oriented parsers with caller-owned bounded storage.
 - HTTP/1 bodies and HTTP/2 frame payloads are streamed without whole-message buffering.
 - Strict HTTP/1 framing checks reject ambiguous `Transfer-Encoding` / `Content-Length` input.
-- HPACK dynamic memory and decompressed header-list size are explicitly bounded.
+- HPACK is provided by the standalone `hpack` package, with explicit memory and decode limits.
 - `std.Io.Writer` is used by serialization APIs from Zig 0.16.0.
 
 ## Modules
@@ -20,7 +20,11 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — protocol state primitives.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
-- `http2/hpack/*` — RFC 7541 integer/string coding, static/dynamic tables and Huffman.
+- `hpack` dependency — standalone RFC 7541 codec with Huffman and dynamic-table support.
+
+## Dependency
+
+HPACK is fetched from `https://github.com/rm-netsu/zig-hpack` and pinned by both Git commit and Zig package hash in `build.zig.zon`.
 
 ## Build
 
@@ -29,7 +33,7 @@ zig build test
 zig build test -Doptimize=ReleaseFast
 ```
 
-The package exports the module name `http`.
+The package exports module `http`.
 
 ## Scope
 
