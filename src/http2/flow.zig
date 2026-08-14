@@ -3,29 +3,30 @@ const std = @import("std");
 /// Signed local accounting is useful when SETTINGS_INITIAL_WINDOW_SIZE shrinks
 /// a peer's per-stream send window below zero.
 pub const FlowWindow = struct {
-    value: i64 = 65_535,
+    value: i32 = 65_535,
 
     pub fn consume(self: *FlowWindow, amount: u32) error{FlowControl}!void {
-        const next = self.value - @as(i64, amount);
+        const next = @as(i64, self.value) - @as(i64, amount);
         if (next < 0) return error.FlowControl;
-        self.value = next;
+        self.value = @intCast(next);
     }
 
     pub fn update(self: *FlowWindow, increment: u31) error{FlowControl}!void {
         if (increment == 0) return error.FlowControl;
-        const next = self.value + @as(i64, increment);
+        const next = @as(i64, self.value) + @as(i64, increment);
         if (next > 0x7fff_ffff) return error.FlowControl;
-        self.value = next;
+        self.value = @intCast(next);
     }
 
     pub fn applyInitialDelta(self: *FlowWindow, old: u31, new: u31) error{FlowControl}!void {
-        self.value += @as(i64, new) - @as(i64, old);
-        if (self.value > 0x7fff_ffff or self.value < -0x7fff_ffff) return error.FlowControl;
+        const next = @as(i64, self.value) + @as(i64, new) - @as(i64, old);
+        if (next > 0x7fff_ffff or next < -0x7fff_ffff) return error.FlowControl;
+        self.value = @intCast(next);
     }
 
     pub fn available(self: FlowWindow) u31 {
         if (self.value <= 0) return 0;
-        return @intCast(@min(self.value, 0x7fff_ffff));
+        return @intCast(self.value);
     }
 };
 

@@ -52,9 +52,20 @@ pub const FrameHeader = struct {
             else => {},
         }
         switch (self.type) {
+            .data => if ((self.flags & 0x08) != 0 and self.length < 1) return error.FrameSize,
+            .headers => {
+                const minimum: u32 = @as(u32, @intFromBool((self.flags & 0x08) != 0)) +
+                    5 * @as(u32, @intFromBool((self.flags & 0x20) != 0));
+                if (self.length < minimum) return error.FrameSize;
+            },
             .priority => if (self.length != 5) return error.FrameSize,
             .rst_stream => if (self.length != 4) return error.FrameSize,
+            .push_promise => {
+                const minimum: u32 = 4 + @as(u32, @intFromBool((self.flags & 0x08) != 0));
+                if (self.length < minimum) return error.FrameSize;
+            },
             .ping => if (self.length != 8) return error.FrameSize,
+            .goaway => if (self.length < 8) return error.FrameSize,
             .window_update => if (self.length != 4) return error.FrameSize,
             .settings => {
                 if ((self.flags & 0x1) != 0 and self.length != 0) return error.FrameSize;
@@ -80,55 +91,71 @@ pub const Result = struct {
     event: ?Event = null,
 };
 
+pub const CompleteFrame = struct {
+    header: FrameHeader,
+    payload: []const u8,
+};
+
+pub const CompleteResult = struct {
+    consumed: usize,
+    frame: CompleteFrame,
+};
+
+/// Stateless zero-copy fast path for a frame already contiguous in a transport
+/// buffer. Returns `null` if either the 9-byte header or its complete payload is
+/// not available; use `FrameDecoder` when reads can be consumed incrementally.
+pub fn parseComplete(input: []const u8, receiver_max_frame_size: u32) error{ FrameSize, Protocol }!?CompleteResult {
+    if (input.len < 9) return null;
+    const ptr: *const [9]u8 = input[0..9];
+    const h = FrameHeader.parse(ptr);
+    try h.validate(receiver_max_frame_size);
+    const total = 9 + @as(usize, h.length);
+    if (input.len < total) return null;
+    return .{
+        .consumed = total,
+        .frame = .{ .header = h, .payload = input[9..total] },
+    };
+}
+
 /// Streaming HTTP/2 frame decoder. The fixed 9-byte frame header is copied only
 /// when fragmented across transport reads; payload is always surfaced zero-copy.
 pub const FrameDecoder = struct {
+    peer_max_frame_size: u32 = default_max_frame_size,
+    payload_remaining: u32 = 0,
     header_buf: [9]u8 = undefined,
     header_used: u4 = 0,
-    current: ?FrameHeader = null,
-    payload_read: u32 = 0,
-    peer_max_frame_size: u32 = default_max_frame_size,
 
     pub fn init(peer_max: u32) FrameDecoder {
         return .{ .peer_max_frame_size = peer_max };
     }
 
     pub fn next(self: *FrameDecoder, input: []const u8) error{ FrameSize, Protocol }!Result {
-        if (self.current) |h| {
-            if (self.payload_read == h.length) {
-                self.current = null;
-                self.payload_read = 0;
-            } else if (input.len == 0) return .{ .consumed = 0 } else {
-                const n = @min(input.len, @as(usize, h.length - self.payload_read));
-                self.payload_read += @intCast(n);
-                return .{
-                    .consumed = n,
-                    .event = .{ .payload = .{ .bytes = input[0..n], .end_frame = self.payload_read == h.length } },
-                };
-            }
+        if (self.payload_remaining != 0) {
+            if (input.len == 0) return .{ .consumed = 0 };
+            const n = @min(input.len, @as(usize, self.payload_remaining));
+            self.payload_remaining -= @intCast(n);
+            return .{
+                .consumed = n,
+                .event = .{ .payload = .{ .bytes = input[0..n], .end_frame = self.payload_remaining == 0 } },
+            };
         }
 
         if (self.header_used == 0 and input.len >= 9) {
             const ptr: *const [9]u8 = input[0..9];
             const h = FrameHeader.parse(ptr);
             try h.validate(self.peer_max_frame_size);
-            self.current = h;
-            self.payload_read = 0;
+            self.payload_remaining = h.length;
             return .{ .consumed = 9, .event = .{ .header = h } };
         }
 
-        var consumed: usize = 0;
-        while (self.header_used < 9 and consumed < input.len) {
-            self.header_buf[self.header_used] = input[consumed];
-            self.header_used += 1;
-            consumed += 1;
-        }
+        const consumed = @min(input.len, 9 - @as(usize, self.header_used));
+        @memcpy(self.header_buf[self.header_used..][0..consumed], input[0..consumed]);
+        self.header_used += @intCast(consumed);
         if (self.header_used == 9) {
             const h = FrameHeader.parse(&self.header_buf);
             try h.validate(self.peer_max_frame_size);
             self.header_used = 0;
-            self.current = h;
-            self.payload_read = 0;
+            self.payload_remaining = h.length;
             return .{ .consumed = consumed, .event = .{ .header = h } };
         }
         return .{ .consumed = consumed };
@@ -177,4 +204,22 @@ test "frame decoder survives one-byte fragmentation" {
     }
     try std.testing.expect(saw_header);
     try std.testing.expectEqual(@as(usize, 3), payload_bytes);
+}
+
+test "complete frame fast path is zero-copy" {
+    const h: FrameHeader = .{ .length = 5, .type = .data, .flags = 1, .stream_id = 3 };
+    var header: [9]u8 = undefined;
+    try h.encode(&header);
+    const wire = header ++ "hello".*;
+    const r = (try parseComplete(&wire, default_max_frame_size)).?;
+    try std.testing.expectEqual(h, r.frame.header);
+    try std.testing.expectEqualStrings("hello", r.frame.payload);
+    try std.testing.expectEqual(wire.len, r.consumed);
+}
+
+test "frame validation rejects flag-dependent undersized payloads" {
+    try std.testing.expectError(error.FrameSize, (FrameHeader{ .length = 0, .type = .data, .flags = 0x08, .stream_id = 1 }).validate(default_max_frame_size));
+    try std.testing.expectError(error.FrameSize, (FrameHeader{ .length = 5, .type = .headers, .flags = 0x28, .stream_id = 1 }).validate(default_max_frame_size));
+    try std.testing.expectError(error.FrameSize, (FrameHeader{ .length = 4, .type = .push_promise, .flags = 0x08, .stream_id = 1 }).validate(default_max_frame_size));
+    try std.testing.expectError(error.FrameSize, (FrameHeader{ .length = 7, .type = .goaway, .flags = 0, .stream_id = 0 }).validate(default_max_frame_size));
 }
