@@ -1,6 +1,6 @@
 .{
     .name = .http,
-    .version = "0.2.2",
+    .version = "0.3.0",
     .fingerprint = 0x97780db2dca25ca8,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -13,6 +13,9 @@
         "build.zig",
         "build.zig.zon",
         "README.md",
+        "CHANGELOG.md",
+        "BENCHMARKS.md",
+        "bench",
         "src",
     },
 }
