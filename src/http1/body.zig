@@ -31,14 +31,14 @@ pub const ChunkResult = struct {
     event: ?ChunkEvent = null,
 };
 
-/// Zero-copy decoder for HTTP/1.1 chunked transfer coding. Only chunk-size
-/// lines are buffered (bounded by `line_storage`); chunk data is returned as
-/// slices of caller input.
+/// Zero-copy decoder for HTTP/1.1 chunked transfer coding. Complete size and
+/// trailer lines are parsed directly from caller input. Only lines fragmented
+/// across transport reads are copied into the bounded `line_storage` buffer.
 pub const ChunkDecoder = struct {
-    state: State = .size,
-    remaining: u64 = 0,
     line_storage: []u8,
-    line_used: usize = 0,
+    remaining: u64 = 0,
+    line_used: u32 = 0,
+    state: State = .size,
 
     const State = enum { size, data, data_cr, data_lf, trailers, done };
 
@@ -81,41 +81,106 @@ pub const ChunkDecoder = struct {
                 self.state = .size;
             },
             .size, .trailers => {
-                while (i < input.len) : (i += 1) {
-                    if (self.line_used == self.line_storage.len) return error.LineTooLong;
-                    self.line_storage[self.line_used] = input[i];
-                    self.line_used += 1;
-                    if (self.line_used >= 2 and self.line_storage[self.line_used - 2] == '\r' and self.line_storage[self.line_used - 1] == '\n') {
-                        i += 1;
-                        const line = self.line_storage[0 .. self.line_used - 2];
-                        self.line_used = 0;
+                const line_result = try self.takeLine(input, &i);
+                switch (line_result) {
+                    .need_more => return .{ .consumed = i },
+                    .line => |line| {
                         if (self.state == .size) {
-                            const semi = std.mem.indexOfScalar(u8, line, ';');
-                            const number = if (semi) |p| line[0..p] else line;
-                            if (number.len == 0) return error.InvalidChunk;
-                            const size = std.fmt.parseInt(u64, number, 16) catch return error.InvalidChunk;
-                            self.remaining = size;
-                            self.state = if (size == 0) .trailers else .data;
-                            break;
-                        } else {
-                            if (line.len == 0) {
-                                self.state = .done;
-                                return .{ .consumed = i, .event = .trailers_done };
-                            }
-                            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidChunk;
-                            const name = line[0..colon];
-                            if (!common.isToken(name)) return error.InvalidChunk;
-                            const value = common.trimOws(line[colon + 1 ..]);
-                            for (value) |c| if (c == 0 or c == '\r' or c == '\n') return error.InvalidChunk;
-                            return .{ .consumed = i, .event = .{ .trailer = .{ .name = name, .value = value } } };
+                            self.remaining = try parseChunkSize(line);
+                            self.state = if (self.remaining == 0) .trailers else .data;
+                            continue;
                         }
-                    }
+                        if (line.len == 0) {
+                            self.state = .done;
+                            return .{ .consumed = i, .event = .trailers_done };
+                        }
+                        return .{ .consumed = i, .event = .{ .trailer = try parseTrailer(line) } };
+                    },
                 }
-                if (i == input.len) return .{ .consumed = i };
             },
         };
     }
+
+    const LineResult = union(enum) {
+        need_more,
+        line: []const u8,
+    };
+
+    fn takeLine(self: *ChunkDecoder, input: []const u8, pos: *usize) error{LineTooLong}!LineResult {
+        var i = pos.*;
+        const buffered = @as(usize, self.line_used);
+
+        // Handle CRLF split exactly between transport reads.
+        if (buffered != 0 and self.line_storage[buffered - 1] == '\r' and i < input.len and input[i] == '\n') {
+            i += 1;
+            pos.* = i;
+            self.line_used = 0;
+            return .{ .line = self.line_storage[0 .. buffered - 1] };
+        }
+
+        if (std.mem.indexOf(u8, input[i..], "\r\n")) |rel| {
+            if (buffered == 0) {
+                if (rel > self.line_storage.len) return error.LineTooLong;
+                const line = input[i .. i + rel];
+                pos.* = i + rel + 2;
+                return .{ .line = line };
+            }
+            if (rel > self.line_storage.len - buffered) return error.LineTooLong;
+            @memcpy(self.line_storage[buffered .. buffered + rel], input[i .. i + rel]);
+            const line_len = buffered + rel;
+            self.line_used = 0;
+            pos.* = i + rel + 2;
+            return .{ .line = self.line_storage[0..line_len] };
+        }
+
+        const available = input.len - i;
+        if (available > self.line_storage.len - buffered) return error.LineTooLong;
+        if (available > std.math.maxInt(u32) - buffered) return error.LineTooLong;
+        @memcpy(self.line_storage[buffered .. buffered + available], input[i..]);
+        self.line_used = @intCast(buffered + available);
+        pos.* = input.len;
+        return .need_more;
+    }
 };
+
+fn parseChunkSize(line: []const u8) error{InvalidChunk}!u64 {
+    const semi = std.mem.indexOfScalar(u8, line, ';');
+    const number = if (semi) |p| line[0..p] else line;
+    if (number.len == 0) return error.InvalidChunk;
+
+    var value: u64 = 0;
+    for (number) |c| {
+        const digit: u8 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => return error.InvalidChunk,
+        };
+        if (value > (std.math.maxInt(u64) - @as(u64, digit)) / 16) return error.InvalidChunk;
+        value = value * 16 + digit;
+    }
+
+    // Extensions are ignored by the transfer decoder, but reject control bytes
+    // that cannot participate in a valid token/quoted-string representation.
+    if (semi) |p| {
+        if (p + 1 == line.len) return error.InvalidChunk;
+        for (line[p + 1 ..]) |c| {
+            if (c == 0 or c == '\r' or c == '\n' or (c < 0x20 and c != '\t') or c == 0x7f)
+                return error.InvalidChunk;
+        }
+    }
+    return value;
+}
+
+fn parseTrailer(line: []const u8) error{InvalidChunk}!common.Header {
+    if (line[0] == ' ' or line[0] == '\t') return error.InvalidChunk;
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidChunk;
+    const name = line[0..colon];
+    if (!common.isToken(name)) return error.InvalidChunk;
+    const value = common.trimOws(line[colon + 1 ..]);
+    if (!common.isFieldValue(value)) return error.InvalidChunk;
+    return .{ .name = name, .value = value };
+}
 
 test "chunk decoder streams body" {
     var line: [128]u8 = undefined;
@@ -139,4 +204,31 @@ test "chunk decoder streams body" {
         if (r.consumed == 0 and r.event == null) return error.TestUnexpectedResult;
     }
     try std.testing.expectEqualStrings("Wikipedia", out[0..used]);
+}
+
+test "chunk decoder handles fragmented lines without copying complete lines" {
+    var line: [32]u8 = undefined;
+    var d = ChunkDecoder.init(&line);
+    var r = try d.feed("a\r");
+    try std.testing.expect(r.event == null);
+    const second = "\n0123456789\r\n0\r\n\r\n";
+    r = try d.feed(second);
+    try std.testing.expectEqualStrings("0123456789", r.event.?.data);
+
+    r = try d.feed(second[r.consumed..]);
+    try std.testing.expect(r.event.? == .trailers_done);
+}
+
+test "chunk size rejects overflow and invalid controls" {
+    var line: [64]u8 = undefined;
+    var d = ChunkDecoder.init(&line);
+    try std.testing.expectError(error.InvalidChunk, d.feed("10000000000000000\r\n"));
+    d.reset();
+    try std.testing.expectError(error.InvalidChunk, d.feed("1;bad\x00ext\r\n"));
+}
+
+test "line storage length remains a hard limit on zero-copy lines" {
+    var line: [4]u8 = undefined;
+    var d = ChunkDecoder.init(&line);
+    try std.testing.expectError(error.LineTooLong, d.feed("12345\r\n"));
 }
