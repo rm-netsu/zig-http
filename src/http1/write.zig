@@ -21,7 +21,7 @@ pub fn responseHead(w: *std.Io.Writer, status: u16, reason: []const u8, headers:
 pub fn writeHeaders(w: *std.Io.Writer, headers: []const common.Header) Error!void {
     for (headers) |h| {
         if (!common.isToken(h.name)) return error.InvalidHeader;
-        for (h.value) |c| if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeader;
+        if (!common.isFieldValue(h.value)) return error.InvalidHeader;
         try w.writeAll(h.name);
         try w.writeAll(": ");
         try w.writeAll(h.value);
@@ -49,6 +49,5 @@ fn validTarget(target: []const u8) bool {
 }
 
 fn validReason(reason: []const u8) bool {
-    for (reason) |c| if (c == 0 or c == '\r' or c == '\n') return false;
-    return true;
+    return common.isFieldValue(reason);
 }

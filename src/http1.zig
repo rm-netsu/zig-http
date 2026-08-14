@@ -7,3 +7,6 @@ pub const Head = head.Head;
 pub const HeaderIterator = head.HeaderIterator;
 pub const BodyFraming = head.BodyFraming;
 pub const ChunkDecoder = body.ChunkDecoder;
+pub const parse = head.parse;
+pub const parseRequest = head.parseRequest;
+pub const parseResponse = head.parseResponse;

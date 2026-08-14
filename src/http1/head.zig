@@ -53,9 +53,7 @@ pub const HeaderIterator = struct {
         const name = line[0..colon];
         if (!common.isToken(name)) return error.InvalidHeader;
         const value = common.trimOws(line[colon + 1 ..]);
-        for (value) |c| {
-            if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeader;
-        }
+        if (!common.isFieldValue(value)) return error.InvalidHeader;
         return .{ .name = name, .value = value };
     }
 };
@@ -65,12 +63,74 @@ pub const FeedResult = struct {
     head: ?Head = null,
 };
 
+pub const FramedHead = struct {
+    head: Head,
+    framing: BodyFraming,
+};
+
+pub const FramedFeedResult = struct {
+    consumed: usize,
+    framed: ?FramedHead = null,
+};
+
+pub const ParseResult = struct {
+    consumed: usize,
+    head: Head,
+};
+
+/// Parse a complete HTTP/1 head directly from caller-owned input. This is the
+/// zero-copy fast path for transports that retain their read buffer while the
+/// returned `Head` is consumed. Returns `null` until CRLF CRLF is present.
+pub fn parse(mode: Mode, input: []const u8) Error!?ParseResult {
+    const consumed = headEnd(input) orelse return null;
+    return .{
+        .consumed = consumed,
+        .head = try parseHead(mode, input[0..consumed]),
+    };
+}
+
+pub const FramedParseResult = struct {
+    consumed: usize,
+    head: Head,
+    framing: BodyFraming,
+};
+
+/// Zero-copy server fast path. Header syntax validation and request body framing
+/// are performed in the same header traversal rather than validating twice.
+pub fn parseRequest(input: []const u8) Error!?FramedParseResult {
+    const consumed = headEnd(input) orelse return null;
+    const head = try parseHeadStart(.request, input[0..consumed]);
+    return .{
+        .consumed = consumed,
+        .head = head,
+        .framing = try requestBodyFraming(head),
+    };
+}
+
+/// Zero-copy client fast path. `request_method` supplies the HEAD/CONNECT
+/// context required to determine response body framing.
+pub fn parseResponse(input: []const u8, request_method: []const u8) Error!?FramedParseResult {
+    const consumed = headEnd(input) orelse return null;
+    const head = try parseHeadStart(.response, input[0..consumed]);
+    return .{
+        .consumed = consumed,
+        .head = head,
+        .framing = try responseBodyFraming(head, request_method),
+    };
+}
+
+fn headEnd(input: []const u8) ?usize {
+    const marker = "\r\n\r\n";
+    const pos = std.mem.indexOf(u8, input, marker) orelse return null;
+    return pos + marker.len;
+}
+
 /// Incremental HTTP/1 head parser. The caller owns the scratch storage; body bytes
 /// are never copied into it. Returned slices remain valid until `reset` or reuse.
 pub const HeadParser = struct {
-    mode: Mode,
     scratch: []u8,
-    used: usize = 0,
+    used: u32 = 0,
+    mode: Mode,
     complete: bool = false,
 
     pub fn init(mode: Mode, scratch: []u8) HeadParser {
@@ -84,39 +144,80 @@ pub const HeadParser = struct {
     }
 
     pub fn feed(self: *HeadParser, input: []const u8) Error!FeedResult {
-        if (self.complete) return .{ .consumed = 0, .head = try parseHead(self.mode, self.scratch[0..self.used]) };
-        if (input.len == 0) return .{ .consumed = 0 };
+        const r = try self.accumulate(input);
+        if (!r.complete) return .{ .consumed = r.consumed };
+        return .{
+            .consumed = r.consumed,
+            .head = try parseHead(self.mode, self.scratch[0..self.used]),
+        };
+    }
+
+    /// Incremental server fast path. As with `parseRequest`, syntax validation
+    /// and request framing share one traversal once the head is complete.
+    pub fn feedRequest(self: *HeadParser, input: []const u8) Error!FramedFeedResult {
+        const r = try self.accumulate(input);
+        if (!r.complete) return .{ .consumed = r.consumed };
+        const head = try parseHeadStart(.request, self.scratch[0..self.used]);
+        return .{
+            .consumed = r.consumed,
+            .framed = .{ .head = head, .framing = try requestBodyFraming(head) },
+        };
+    }
+
+    /// Incremental client fast path with the request context needed for HEAD
+    /// and successful CONNECT response framing.
+    pub fn feedResponse(self: *HeadParser, input: []const u8, request_method: []const u8) Error!FramedFeedResult {
+        const r = try self.accumulate(input);
+        if (!r.complete) return .{ .consumed = r.consumed };
+        const head = try parseHeadStart(.response, self.scratch[0..self.used]);
+        return .{
+            .consumed = r.consumed,
+            .framed = .{ .head = head, .framing = try responseBodyFraming(head, request_method) },
+        };
+    }
+
+    const AccumulateResult = struct {
+        consumed: usize,
+        complete: bool,
+    };
+
+    fn accumulate(self: *HeadParser, input: []const u8) Error!AccumulateResult {
+        const used = @as(usize, self.used);
+        if (self.complete) return .{ .consumed = 0, .complete = true };
+        if (input.len == 0) return .{ .consumed = 0, .complete = false };
 
         // First check the only three ways the delimiter can straddle two reads.
         const marker = "\r\n\r\n";
         inline for (1..4) |old_count| {
-            if (self.used >= old_count and input.len >= marker.len - old_count and
-                std.mem.eql(u8, self.scratch[self.used - old_count .. self.used], marker[0..old_count]) and
+            if (used >= old_count and input.len >= marker.len - old_count and
+                std.mem.eql(u8, self.scratch[used - old_count .. used], marker[0..old_count]) and
                 std.mem.eql(u8, input[0 .. marker.len - old_count], marker[old_count..]))
             {
                 const consumed = marker.len - old_count;
-                if (self.used + consumed > self.scratch.len) return error.HeadTooLarge;
-                @memcpy(self.scratch[self.used .. self.used + consumed], input[0..consumed]);
-                self.used += consumed;
+                try self.append(input[0..consumed]);
                 self.complete = true;
-                return .{ .consumed = consumed, .head = try parseHead(self.mode, self.scratch[0..self.used]) };
+                return .{ .consumed = consumed, .complete = true };
             }
         }
 
         // Then search the transport buffer directly so body bytes are never copied.
         if (std.mem.indexOf(u8, input, marker)) |pos| {
             const consumed = pos + marker.len;
-            if (self.used + consumed > self.scratch.len) return error.HeadTooLarge;
-            @memcpy(self.scratch[self.used .. self.used + consumed], input[0..consumed]);
-            self.used += consumed;
+            try self.append(input[0..consumed]);
             self.complete = true;
-            return .{ .consumed = consumed, .head = try parseHead(self.mode, self.scratch[0..self.used]) };
+            return .{ .consumed = consumed, .complete = true };
         }
 
-        if (input.len > self.scratch.len - self.used) return error.HeadTooLarge;
-        @memcpy(self.scratch[self.used .. self.used + input.len], input);
-        self.used += input.len;
-        return .{ .consumed = input.len };
+        try self.append(input);
+        return .{ .consumed = input.len, .complete = false };
+    }
+
+    inline fn append(self: *HeadParser, bytes: []const u8) Error!void {
+        const used = @as(usize, self.used);
+        if (used > self.scratch.len or bytes.len > self.scratch.len - used) return error.HeadTooLarge;
+        if (bytes.len > std.math.maxInt(u32) - self.used) return error.HeadTooLarge;
+        @memcpy(self.scratch[used .. used + bytes.len], bytes);
+        self.used += @intCast(bytes.len);
     }
 };
 
@@ -127,6 +228,13 @@ fn parseVersion(bytes: []const u8) Error!Version {
 }
 
 fn parseHead(mode: Mode, bytes: []const u8) Error!Head {
+    const result = try parseHeadStart(mode, bytes);
+    var it = result.headerIterator();
+    while (try it.next()) |_| {}
+    return result;
+}
+
+fn parseHeadStart(mode: Mode, bytes: []const u8) Error!Head {
     const first_eol = std.mem.indexOf(u8, bytes, "\r\n") orelse return error.InvalidStartLine;
     const first = bytes[0..first_eol];
     const raw_headers = bytes[first_eol + 2 .. bytes.len - 2];
@@ -142,6 +250,7 @@ fn parseHead(mode: Mode, bytes: []const u8) Error!Head {
             const method = first[0..sp1];
             const target = first[sp1 + 1 .. sp2];
             if (!common.isToken(method) or target.len == 0) return error.InvalidStartLine;
+            for (target) |c| if (c <= 0x20 or c == 0x7f) return error.InvalidStartLine;
             result.version = try parseVersion(first[sp2 + 1 ..]);
             result.start = .{ .request = .{ .method = method, .target = target } };
         },
@@ -151,19 +260,19 @@ fn parseHead(mode: Mode, bytes: []const u8) Error!Head {
             const rest = first[sp1 + 1 ..];
             if (rest.len < 3) return error.InvalidStatus;
             const code_bytes = rest[0..3];
-            for (code_bytes) |c| if (!std.ascii.isDigit(c)) return error.InvalidStatus;
-            const status = std.fmt.parseInt(u16, code_bytes, 10) catch return error.InvalidStatus;
+            if (!std.ascii.isDigit(code_bytes[0]) or !std.ascii.isDigit(code_bytes[1]) or !std.ascii.isDigit(code_bytes[2]))
+                return error.InvalidStatus;
+            const status = @as(u16, code_bytes[0] - '0') * 100 + @as(u16, code_bytes[1] - '0') * 10 + code_bytes[2] - '0';
             if (status < 100 or status > 999) return error.InvalidStatus;
             const reason = if (rest.len == 3) "" else blk: {
                 if (rest[3] != ' ') return error.InvalidStartLine;
                 break :blk rest[4..];
             };
+            if (!common.isFieldValue(reason)) return error.InvalidStartLine;
             result.start = .{ .response = .{ .status = status, .reason = reason } };
         },
     }
 
-    var it = result.headerIterator();
-    while (try it.next()) |_| {}
     return result;
 }
 
@@ -203,11 +312,13 @@ pub fn responseBodyFraming(head: Head, request_method: []const u8) Error!BodyFra
         .response => |r| r.status,
         else => return error.InvalidStartLine,
     };
-    if (std.ascii.eqlIgnoreCase(request_method, "HEAD") or
-        (status >= 100 and status < 200) or status == 204 or status == 304)
+    if (responseHasNoBody(status, request_method)) {
+        // The framing decision is known from request/status context, but field
+        // syntax still has to be validated on the zero-copy fast path.
+        var validation = head.headerIterator();
+        while (try validation.next()) |_| {}
         return .none;
-    if (std.ascii.eqlIgnoreCase(request_method, "CONNECT") and status >= 200 and status < 300)
-        return .none;
+    }
 
     var it = head.headerIterator();
     var content_length: ?u64 = null;
@@ -227,6 +338,12 @@ pub fn responseBodyFraming(head: Head, request_method: []const u8) Error!BodyFra
     return .close;
 }
 
+fn responseHasNoBody(status: u16, request_method: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(request_method, "HEAD") or
+        (status >= 100 and status < 200) or status == 204 or status == 304 or
+        (std.ascii.eqlIgnoreCase(request_method, "CONNECT") and status >= 200 and status < 300);
+}
+
 fn mergeContentLength(slot: *?u64, value: []const u8) Error!void {
     var rest = value;
     var saw = false;
@@ -234,8 +351,7 @@ fn mergeContentLength(slot: *?u64, value: []const u8) Error!void {
         const comma = std.mem.indexOfScalar(u8, rest, ',');
         const part = common.trimOws(if (comma) |i| rest[0..i] else rest);
         if (part.len == 0) return error.InvalidContentLength;
-        for (part) |c| if (!std.ascii.isDigit(c)) return error.InvalidContentLength;
-        const parsed = std.fmt.parseInt(u64, part, 10) catch return error.InvalidContentLength;
+        const parsed = try parseContentLength(part);
         if (slot.*) |old| {
             if (old != parsed) return error.ConflictingContentLength;
         } else slot.* = parsed;
@@ -243,6 +359,18 @@ fn mergeContentLength(slot: *?u64, value: []const u8) Error!void {
         if (comma) |i| rest = rest[i + 1 ..] else break;
     }
     if (!saw) return error.InvalidContentLength;
+}
+
+fn parseContentLength(bytes: []const u8) Error!u64 {
+    if (bytes.len == 0) return error.InvalidContentLength;
+    var value: u64 = 0;
+    for (bytes) |c| {
+        if (!std.ascii.isDigit(c)) return error.InvalidContentLength;
+        const digit: u64 = c - '0';
+        if (value > (std.math.maxInt(u64) - digit) / 10) return error.InvalidContentLength;
+        value = value * 10 + digit;
+    }
+    return value;
 }
 
 const TransferEncodingState = struct {
@@ -281,6 +409,23 @@ test "incremental request head and body framing" {
     try std.testing.expectEqual(@as(u64, 5), framing.content_length);
 }
 
+test "incremental framed request avoids a second header traversal" {
+    var scratch: [256]u8 = undefined;
+    var p = HeadParser.init(.request, &scratch);
+    const first = try p.feedRequest("POST / HTTP/1.1\r\nHost: example.com\r\n");
+    try std.testing.expect(first.framed == null);
+    const second = try p.feedRequest("Content-Length: 7\r\n\r\npayload");
+    try std.testing.expectEqual(@as(u64, 7), second.framed.?.framing.content_length);
+    try std.testing.expectEqualStrings("POST", second.framed.?.head.start.request.method);
+}
+
+test "zero-copy parse leaves body in caller buffer" {
+    const wire = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\nbody";
+    const r = (try parse(.request, wire)).?;
+    try std.testing.expectEqualStrings("GET", r.head.start.request.method);
+    try std.testing.expectEqualStrings("body", wire[r.consumed..]);
+}
+
 test "reject smuggling framing" {
     var scratch: [1024]u8 = undefined;
     var p = HeadParser.init(.request, &scratch);
@@ -314,4 +459,22 @@ test "head storage is a hard bound" {
     var scratch: [16]u8 = undefined;
     var p = HeadParser.init(.request, &scratch);
     try std.testing.expectError(error.HeadTooLarge, p.feed("GET / HTTP/1.1\r\nHost: too-long.example\r\n\r\n"));
+}
+
+test "reject control bytes in HTTP/1 field values" {
+    var scratch: [128]u8 = undefined;
+    var p = HeadParser.init(.request, &scratch);
+    try std.testing.expectError(error.InvalidHeader, p.feed("GET / HTTP/1.1\r\nX-Test: bad\x01value\r\n\r\n"));
+}
+
+test "reject controls in HTTP/1 start lines" {
+    try std.testing.expectError(error.InvalidStartLine, parse(.request, "GET /bad\x01path HTTP/1.1\r\n\r\n"));
+    try std.testing.expectError(error.InvalidStartLine, parse(.response, "HTTP/1.1 200 bad\x01reason\r\n\r\n"));
+}
+
+test "bodyless response fast path still validates fields" {
+    try std.testing.expectError(
+        error.InvalidHeader,
+        parseResponse("HTTP/1.1 204 No Content\r\nX-Test: bad\x01value\r\n\r\n", "GET"),
+    );
 }

@@ -31,8 +31,24 @@ pub fn trimOws(value: []const u8) []const u8 {
     return value[start..end];
 }
 
+/// HTTP field values may contain HTAB, visible ASCII, and obs-text, but not
+/// other control bytes. This also rejects DEL.
+pub fn isFieldValue(bytes: []const u8) bool {
+    for (bytes) |c| {
+        if ((c < 0x20 and c != '\t') or c == 0x7f) return false;
+    }
+    return true;
+}
+
 test "token validation" {
     try std.testing.expect(isToken("content-type"));
     try std.testing.expect(isToken("X_Custom"));
     try std.testing.expect(!isToken("bad name"));
+}
+
+test "field value validation rejects controls" {
+    try std.testing.expect(isFieldValue("text\tvalue"));
+    try std.testing.expect(isFieldValue("\x80obs-text"));
+    try std.testing.expect(!isFieldValue("bad\x01value"));
+    try std.testing.expect(!isFieldValue("bad\x7fvalue"));
 }
