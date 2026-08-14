@@ -13,6 +13,7 @@ pub const hpack = @import("hpack");
 pub const FrameHeader = frame.FrameHeader;
 pub const FrameDecoder = frame.FrameDecoder;
 pub const CompleteFrame = frame.CompleteFrame;
+pub const CompleteFrameIterator = frame.CompleteIterator;
 pub const parseCompleteFrame = frame.parseComplete;
 pub const Settings = settings.Settings;
 pub const FlowWindow = flow.FlowWindow;

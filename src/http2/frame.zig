@@ -46,31 +46,44 @@ pub const FrameHeader = struct {
     pub fn validate(self: FrameHeader, peer_max_frame_size: u32) error{ FrameSize, Protocol }!void {
         if (self.length > peer_max_frame_size) return error.FrameSize;
         switch (self.type) {
-            .data, .headers, .priority, .rst_stream, .push_promise, .continuation => if (self.stream_id == 0) return error.Protocol,
-            .settings, .ping, .goaway => if (self.stream_id != 0) return error.Protocol,
-            .window_update => {},
-            else => {},
-        }
-        switch (self.type) {
-            .data => if ((self.flags & 0x08) != 0 and self.length < 1) return error.FrameSize,
+            .data => {
+                if (self.stream_id == 0) return error.Protocol;
+                if ((self.flags & 0x08) != 0 and self.length < 1) return error.FrameSize;
+            },
             .headers => {
+                if (self.stream_id == 0) return error.Protocol;
                 const minimum: u32 = @as(u32, @intFromBool((self.flags & 0x08) != 0)) +
                     5 * @as(u32, @intFromBool((self.flags & 0x20) != 0));
                 if (self.length < minimum) return error.FrameSize;
             },
-            .priority => if (self.length != 5) return error.FrameSize,
-            .rst_stream => if (self.length != 4) return error.FrameSize,
-            .push_promise => {
-                const minimum: u32 = 4 + @as(u32, @intFromBool((self.flags & 0x08) != 0));
-                if (self.length < minimum) return error.FrameSize;
+            .priority => {
+                if (self.stream_id == 0) return error.Protocol;
+                if (self.length != 5) return error.FrameSize;
             },
-            .ping => if (self.length != 8) return error.FrameSize,
-            .goaway => if (self.length < 8) return error.FrameSize,
-            .window_update => if (self.length != 4) return error.FrameSize,
+            .rst_stream => {
+                if (self.stream_id == 0) return error.Protocol;
+                if (self.length != 4) return error.FrameSize;
+            },
             .settings => {
+                if (self.stream_id != 0) return error.Protocol;
                 if ((self.flags & 0x1) != 0 and self.length != 0) return error.FrameSize;
                 if (self.length % 6 != 0) return error.FrameSize;
             },
+            .push_promise => {
+                if (self.stream_id == 0) return error.Protocol;
+                const minimum: u32 = 4 + @as(u32, @intFromBool((self.flags & 0x08) != 0));
+                if (self.length < minimum) return error.FrameSize;
+            },
+            .ping => {
+                if (self.stream_id != 0) return error.Protocol;
+                if (self.length != 8) return error.FrameSize;
+            },
+            .goaway => {
+                if (self.stream_id != 0) return error.Protocol;
+                if (self.length < 8) return error.FrameSize;
+            },
+            .window_update => if (self.length != 4) return error.FrameSize,
+            .continuation => if (self.stream_id == 0) return error.Protocol,
             else => {},
         }
     }
@@ -116,6 +129,36 @@ pub fn parseComplete(input: []const u8, receiver_max_frame_size: u32) error{ Fra
         .frame = .{ .header = h, .payload = input[9..total] },
     };
 }
+
+/// Iterates complete frames already present in one caller-owned transport buffer.
+/// The iterator keeps only the current offset and avoids rebuilding a remainder
+/// slice/result wrapper for every frame. The returned payload remains zero-copy.
+pub const CompleteIterator = struct {
+    input: []const u8,
+    receiver_max_frame_size: u32,
+    offset: usize = 0,
+
+    pub fn init(input: []const u8, receiver_max_frame_size: u32) CompleteIterator {
+        return .{ .input = input, .receiver_max_frame_size = receiver_max_frame_size };
+    }
+
+    pub inline fn next(self: *CompleteIterator) error{ FrameSize, Protocol }!?CompleteFrame {
+        if (self.input.len - self.offset < 9) return null;
+        const ptr: *const [9]u8 = self.input[self.offset..][0..9];
+        const h = FrameHeader.parse(ptr);
+        try h.validate(self.receiver_max_frame_size);
+        const total = 9 + @as(usize, h.length);
+        if (self.input.len - self.offset < total) return null;
+        const payload_start = self.offset + 9;
+        const end = self.offset + total;
+        self.offset = end;
+        return .{ .header = h, .payload = self.input[payload_start..end] };
+    }
+
+    pub fn consumed(self: CompleteIterator) usize {
+        return self.offset;
+    }
+};
 
 /// Streaming HTTP/2 frame decoder. The fixed 9-byte frame header is copied only
 /// when fragmented across transport reads; payload is always surfaced zero-copy.
@@ -222,4 +265,27 @@ test "frame validation rejects flag-dependent undersized payloads" {
     try std.testing.expectError(error.FrameSize, (FrameHeader{ .length = 5, .type = .headers, .flags = 0x28, .stream_id = 1 }).validate(default_max_frame_size));
     try std.testing.expectError(error.FrameSize, (FrameHeader{ .length = 4, .type = .push_promise, .flags = 0x08, .stream_id = 1 }).validate(default_max_frame_size));
     try std.testing.expectError(error.FrameSize, (FrameHeader{ .length = 7, .type = .goaway, .flags = 0, .stream_id = 0 }).validate(default_max_frame_size));
+}
+
+test "complete iterator scans frames and leaves an incomplete tail" {
+    const first: FrameHeader = .{ .length = 1, .type = .data, .flags = 0, .stream_id = 1 };
+    const second: FrameHeader = .{ .length = 2, .type = .data, .flags = 1, .stream_id = 3 };
+    var h1: [9]u8 = undefined;
+    var h2: [9]u8 = undefined;
+    try first.encode(&h1);
+    try second.encode(&h2);
+    var wire: [9 + 1 + 9 + 2 + 4]u8 = undefined;
+    @memcpy(wire[0..9], &h1);
+    wire[9] = 'a';
+    @memcpy(wire[10..19], &h2);
+    @memcpy(wire[19..21], "bc");
+    @memcpy(wire[21..], "tail");
+
+    var it = CompleteIterator.init(&wire, default_max_frame_size);
+    const a = (try it.next()).?;
+    const b = (try it.next()).?;
+    try std.testing.expectEqualStrings("a", a.payload);
+    try std.testing.expectEqualStrings("bc", b.payload);
+    try std.testing.expect((try it.next()) == null);
+    try std.testing.expectEqual(@as(usize, 21), it.consumed());
 }
