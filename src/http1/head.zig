@@ -48,13 +48,7 @@ pub const HeaderIterator = struct {
         const line = self.remaining[0..eol];
         self.remaining = self.remaining[eol + 2 ..];
         if (line.len == 0) return null;
-        if (line[0] == ' ' or line[0] == '\t') return error.InvalidHeader;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
-        const name = line[0..colon];
-        if (!common.isToken(name)) return error.InvalidHeader;
-        const value = common.trimOws(line[colon + 1 ..]);
-        if (!common.isFieldValue(value)) return error.InvalidHeader;
-        return .{ .name = name, .value = value };
+        return try parseHeaderLine(line);
     }
 };
 
@@ -82,11 +76,19 @@ pub const ParseResult = struct {
 /// zero-copy fast path for transports that retain their read buffer while the
 /// returned `Head` is consumed. Returns `null` until CRLF CRLF is present.
 pub fn parse(mode: Mode, input: []const u8) Error!?ParseResult {
-    const consumed = headEnd(input) orelse return null;
-    return .{
-        .consumed = consumed,
-        .head = try parseHead(mode, input[0..consumed]),
-    };
+    const first_eol = std.mem.indexOf(u8, input, "\r\n") orelse return null;
+    var head = try parseStartLine(mode, input[0..first_eol]);
+    var cursor = first_eol + 2;
+    while (true) {
+        const rel = std.mem.indexOf(u8, input[cursor..], "\r\n") orelse return null;
+        const line = input[cursor .. cursor + rel];
+        cursor += rel + 2;
+        if (line.len == 0) {
+            head.headers = input[first_eol + 2 .. cursor - 2];
+            return .{ .consumed = cursor, .head = head };
+        }
+        _ = try parseHeaderLine(line);
+    }
 }
 
 pub const FramedParseResult = struct {
@@ -98,25 +100,83 @@ pub const FramedParseResult = struct {
 /// Zero-copy server fast path. Header syntax validation and request body framing
 /// are performed in the same header traversal rather than validating twice.
 pub fn parseRequest(input: []const u8) Error!?FramedParseResult {
-    const consumed = headEnd(input) orelse return null;
-    const head = try parseHeadStart(.request, input[0..consumed]);
-    return .{
-        .consumed = consumed,
-        .head = head,
-        .framing = try requestBodyFraming(head),
-    };
+    const first_eol = std.mem.indexOf(u8, input, "\r\n") orelse return null;
+    var head = try parseStartLine(.request, input[0..first_eol]);
+    var content_length: ?u64 = null;
+    var has_te = false;
+    var te: TransferEncodingState = .{};
+    var cursor = first_eol + 2;
+
+    while (true) {
+        const rel = std.mem.indexOf(u8, input[cursor..], "\r\n") orelse return null;
+        const line = input[cursor .. cursor + rel];
+        cursor += rel + 2;
+        if (line.len == 0) {
+            head.headers = input[first_eol + 2 .. cursor - 2];
+            const framing: BodyFraming = if (has_te and content_length != null)
+                return error.AmbiguousFraming
+            else if (has_te)
+                if (te.final_chunked) .chunked else return error.InvalidTransferEncoding
+            else if (content_length) |n|
+                .{ .content_length = n }
+            else
+                .none;
+            return .{ .consumed = cursor, .head = head, .framing = framing };
+        }
+
+        const h = try parseHeaderLine(line);
+        switch (framingHeaderKind(h.name)) {
+            .content_length => try mergeContentLength(&content_length, h.value),
+            .transfer_encoding => {
+                has_te = true;
+                try te.add(h.value);
+            },
+            .other => {},
+        }
+    }
 }
 
 /// Zero-copy client fast path. `request_method` supplies the HEAD/CONNECT
 /// context required to determine response body framing.
 pub fn parseResponse(input: []const u8, request_method: []const u8) Error!?FramedParseResult {
-    const consumed = headEnd(input) orelse return null;
-    const head = try parseHeadStart(.response, input[0..consumed]);
-    return .{
-        .consumed = consumed,
-        .head = head,
-        .framing = try responseBodyFraming(head, request_method),
-    };
+    const first_eol = std.mem.indexOf(u8, input, "\r\n") orelse return null;
+    var head = try parseStartLine(.response, input[0..first_eol]);
+    const status = head.start.response.status;
+    const bodyless = responseHasNoBody(status, request_method);
+    var content_length: ?u64 = null;
+    var has_te = false;
+    var te: TransferEncodingState = .{};
+    var cursor = first_eol + 2;
+
+    while (true) {
+        const rel = std.mem.indexOf(u8, input[cursor..], "\r\n") orelse return null;
+        const line = input[cursor .. cursor + rel];
+        cursor += rel + 2;
+        if (line.len == 0) {
+            head.headers = input[first_eol + 2 .. cursor - 2];
+            const framing: BodyFraming = if (bodyless)
+                .none
+            else if (has_te and content_length != null)
+                return error.AmbiguousFraming
+            else if (has_te)
+                if (te.final_chunked) .chunked else .close
+            else if (content_length) |n|
+                .{ .content_length = n }
+            else
+                .close;
+            return .{ .consumed = cursor, .head = head, .framing = framing };
+        }
+
+        const h = try parseHeaderLine(line);
+        if (!bodyless) switch (framingHeaderKind(h.name)) {
+            .content_length => try mergeContentLength(&content_length, h.value),
+            .transfer_encoding => {
+                has_te = true;
+                try te.add(h.value);
+            },
+            .other => {},
+        };
+    }
 }
 
 fn headEnd(input: []const u8) ?usize {
@@ -221,6 +281,26 @@ pub const HeadParser = struct {
     }
 };
 
+inline fn parseHeaderLine(line: []const u8) Error!common.Header {
+    if (line.len == 0 or line[0] == ' ' or line[0] == '\t') return error.InvalidHeader;
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
+    const name = line[0..colon];
+    if (!common.isToken(name)) return error.InvalidHeader;
+    const value = common.trimOws(line[colon + 1 ..]);
+    if (!common.isFieldValue(value)) return error.InvalidHeader;
+    return .{ .name = name, .value = value };
+}
+
+const FramingHeaderKind = enum { other, content_length, transfer_encoding };
+
+inline fn framingHeaderKind(name: []const u8) FramingHeaderKind {
+    return switch (name.len) {
+        14 => if (std.ascii.eqlIgnoreCase(name, "content-length")) .content_length else .other,
+        17 => if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) .transfer_encoding else .other,
+        else => .other,
+    };
+}
+
 fn parseVersion(bytes: []const u8) Error!Version {
     if (std.mem.eql(u8, bytes, "HTTP/1.1")) return .http_1_1;
     if (std.mem.eql(u8, bytes, "HTTP/1.0")) return .http_1_0;
@@ -236,11 +316,14 @@ fn parseHead(mode: Mode, bytes: []const u8) Error!Head {
 
 fn parseHeadStart(mode: Mode, bytes: []const u8) Error!Head {
     const first_eol = std.mem.indexOf(u8, bytes, "\r\n") orelse return error.InvalidStartLine;
-    const first = bytes[0..first_eol];
-    const raw_headers = bytes[first_eol + 2 .. bytes.len - 2];
+    var result = try parseStartLine(mode, bytes[0..first_eol]);
+    result.headers = bytes[first_eol + 2 .. bytes.len - 2];
+    return result;
+}
 
+inline fn parseStartLine(mode: Mode, first: []const u8) Error!Head {
     var result: Head = undefined;
-    result.headers = raw_headers;
+    result.headers = &.{};
     switch (mode) {
         .request => {
             const sp1 = std.mem.indexOfScalar(u8, first, ' ') orelse return error.InvalidStartLine;
@@ -477,4 +560,17 @@ test "bodyless response fast path still validates fields" {
         error.InvalidHeader,
         parseResponse("HTTP/1.1 204 No Content\r\nX-Test: bad\x01value\r\n\r\n", "GET"),
     );
+}
+
+test "one-pass request parser stops before body and handles incomplete heads" {
+    const wire = "POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc";
+    const parsed = (try parseRequest(wire)).?;
+    try std.testing.expectEqual(@as(u64, 3), parsed.framing.content_length);
+    try std.testing.expectEqualStrings("abc", wire[parsed.consumed..]);
+    try std.testing.expect((try parseRequest(wire[0 .. parsed.consumed - 1])) == null);
+}
+
+test "one-pass response parser preserves HEAD body semantics" {
+    const parsed = (try parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 99\r\nX-Test: ok\r\n\r\n", "HEAD")).?;
+    try std.testing.expect(parsed.framing == .none);
 }
