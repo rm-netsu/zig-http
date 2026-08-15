@@ -3,17 +3,22 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer instrumentation") orelse false;
 
     const hpack_dep = b.dependency("hpack", .{
         .target = target,
         .optimize = optimize,
     });
 
+    const hpack_mod = hpack_dep.module("hpack");
+    hpack_mod.sanitize_thread = sanitize_thread;
+
     const mod = b.addModule("http", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "hpack", .module = hpack_dep.module("hpack") }},
+        .sanitize_thread = sanitize_thread,
+        .imports = &.{.{ .name = "hpack", .module = hpack_mod }},
     });
 
     const tests = b.addTest(.{ .root_module = mod });
@@ -39,7 +44,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "http", .module = mod },
-            .{ .name = "hpack", .module = hpack_dep.module("hpack") },
+            .{ .name = "hpack", .module = hpack_mod },
         },
     });
     const real_bench_exe = b.addExecutable(.{ .name = "http-real-bench", .root_module = real_bench_mod });
@@ -72,4 +77,24 @@ pub fn build(b: *std.Build) void {
         previous_frame_run = &run.step;
     }
     frame_real_step.dependOn(previous_frame_run.?);
+
+    const stream_real_step = b.step("bench-real-streams", "Run isolated real-world HTTP/2 stream lifecycle benchmarks");
+    const stream_cases = [_][]const u8{ "raw", "managed", "raw_tracked", "managed_tracked", "raw_multiplex", "managed_multiplex" };
+    var previous_stream_run: ?*std.Build.Step = null;
+    for (stream_cases) |case| {
+        const source = b.fmt("bench/stream_real_{s}.zig", .{case});
+        const stream_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = b.fmt("http-stream-real-{s}", .{case}), .root_module = stream_mod });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        if (previous_stream_run) |previous| run.step.dependOn(previous);
+        previous_stream_run = &run.step;
+    }
+    stream_real_step.dependOn(previous_stream_run.?);
 }
