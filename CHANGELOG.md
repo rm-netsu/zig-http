@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.0
+
+- Represent each HTTP/2 stream send window as a signed adjustment relative to the peer's current `SETTINGS_INITIAL_WINDOW_SIZE`, removing the mandatory live-stream table mutation on ordinary SETTINGS changes.
+- Keep SETTINGS initial-window decreases and safe increases O(1) in connection state while preserving overflow semantics: only an increase that could exceed `2^31-1` asks caller-owned storage for an exact `maxActiveSendAdjustment()`.
+- Let stream stores implement that rare exact query by scanning, maintaining an aggregate, or coordinating shards, avoiding a core-imposed synchronization/storage strategy for multithreaded applications.
+- Add an unchecked post-write DATA credit commit used by `Session` after its preflight succeeds, so the settings-relative representation does not duplicate effective-window work on the send hot path; checked lower-level operations remain available.
+- Remove now-unnecessary peer-state dependencies from remote HEADERS/PUSH_PROMISE stream creation and expose `http2.StreamSendWindow` for consumers composing the lower-level protocol pieces directly.
+- Add `bench-real-settings`, an isolated 4096-stream scalability workload: the old eager implementation performs 4096 stream mutations per initial-window SETTINGS (~0.410 M settings/s in the pinned five-run median), while the common relative-window path performs zero store scans (~527.3 M settings/s). This is an isolated control-plane scaling benchmark, not end-to-end HTTP throughput.
+- Record the DATA-path tradeoff rather than hiding it: CPU-pinned five-run send-session medians stayed within ~0.6% for manual/lookup composition but the stable-cursor Session was ~2.8% below 0.12.0. Larger lazy-window records and encoded hybrid forms were rejected because cache footprint or Zig 0.16.0 compile-time costs were worse; the 12-byte `Tracked` layout is retained.
+- Document the concurrency model explicitly: no process-global mutable protocol state, caller-owned/shardable stream storage, independent connections freely distributable across workers, and one logical mutator for each ordered HTTP/2 connection context unless the caller provides equivalent synchronization.
+- Keep `stream.Tracked` at 12 bytes and `Session` at 128 bytes, and pass Debug, ReleaseFast, and ReleaseSafe+ThreadSanitizer test configurations on Zig 0.16.0.
+
 ## 0.12.0
 
 - Define the library boundary explicitly: HTTP-only state, scheduling, flow-control, and shutdown orchestration stay in the `http1`/`http2` core; sockets, TLS, timers, event loops, thread pools, and cross-subsystem queues belong only in optional higher-level wrappers.

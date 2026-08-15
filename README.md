@@ -10,7 +10,8 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - Zero-copy fast paths when a complete HTTP/1 head or HTTP/2 frame is already contiguous in the transport buffer.
 - Small process-wide byte-class tables and SIMD validation trade about 512 bytes of read-only data for faster field parsing without increasing per-connection state.
 - Incremental fallbacks preserve streaming operation across arbitrarily fragmented reads.
-- HTTP/2 connection state is split from caller-owned stream storage: connection-wide invariants stay allocation-free while applications choose their own stream slab/hash layout.
+- HTTP/2 connection state is split from caller-owned stream storage: connection-wide invariants stay allocation-free while applications choose their own stream slab/hash/sharded layout.
+- Protocol objects contain no process-global mutable state. Independent connections are naturally shardable across threads; one HTTP/2 connection still has ordered connection/HPACK state and therefore has one logical mutator at a time unless the caller supplies equivalent synchronization.
 - An optional 128-byte `Session` composes complete-frame parsing, HPACK decode, field semantics, stream transitions, peer SETTINGS/GOAWAY, flow accounting, and state-aware outbound control frames without owning either HPACK allocators or the stream table.
 - HTTP/1 bodies and HTTP/2 frame payloads are streamed without whole-message buffering.
 - Strict HTTP/1 framing checks reject ambiguous `Transfer-Encoding` / `Content-Length` input.
@@ -113,29 +114,55 @@ if (result.event) |event| switch (event) {
 
 `PeerState` tracks the constraints advertised by the remote endpoint: SETTINGS,
 connection send credit, and monotonic GOAWAY last-stream-id state. SETTINGS are
-surfaced as ordered effects so a caller can apply every
-`SETTINGS_INITIAL_WINDOW_SIZE` delta to its own active-stream table before
-processing the next setting. Drain the returned SETTINGS effects before
-processing any subsequent frame; SETTINGS values take effect in wire order.
-`settings.StreamDecoder` handles SETTINGS values
-that themselves cross transport reads using only seven bytes of state.
+surfaced as ordered effects and take effect in wire order. Stream send windows
+store only their signed adjustment relative to the peer's current
+`SETTINGS_INITIAL_WINDOW_SIZE`, so normal initial-window changes do not mutate
+every stream record. `settings.StreamDecoder` handles SETTINGS values that
+themselves cross transport reads using only seven bytes of state.
 
 `stream.Windows` is an 8-byte caller-owned pair of send/receive stream windows.
 This keeps the library allocation-free at the connection layer: applications can
-embed `stream.Tracked` records in a slab, hash table, intrusive map, or another
-layout appropriate for their event loop.
+embed `stream.Tracked` records in a slab, hash table, intrusive map, sharded
+store, or another layout appropriate for their runtime.
 
 Before writing an outbound frame, `PeerState.sendHeader` can enforce the peer's
 `SETTINGS_MAX_FRAME_SIZE`, server-push permission, and connection DATA send
 credit. Stream-level state and flow checks remain explicit and caller-owned.
 
+### Concurrency model
+
+The core deliberately defines protocol ownership rather than a locking model.
+Parsers, validators, frame writers, flow windows, stream records, and independent
+connection/session objects do not share mutable global state, so callers can run
+unrelated connections concurrently without library-side serialization. A single
+HTTP/2 connection has ordered SETTINGS, HPACK, connection flow-control, stream-ID,
+and GOAWAY state; mutate that ordered context from one logical owner at a time, or
+provide equivalent external synchronization when handing it between workers.
+
+The stream table remains caller-owned and may be partitioned or sharded. In
+particular, `SETTINGS_INITIAL_WINDOW_SIZE` no longer forces Session to mutate every
+live stream. Normal SETTINGS changes are O(1) in connection state. On an increase
+that could overflow an active stream, Session asks the store for
+`maxActiveSendAdjustment()`. The store may answer by scanning, using a maintained
+aggregate, or coordinating shards; core does not prescribe atomics, mutexes, or a
+storage topology.
+
+The relative-window representation is a choice made by the composed Session, not a
+restriction on lower-level composition. Consumers that know an eager per-stream
+SETTINGS update is preferable for their own storage topology can use the standalone
+`FlowWindow`, `StreamSendWindow`, `stream.Stream`, and frame/state primitives directly
+and own that policy themselves.
+
 ## HTTP/2 caller-owned stream manager
 
 `StreamManager` adds stream-ID ordering, initiator parity, concurrent-stream
 limits, per-stream state transitions, stream flow control, PUSH_PROMISE
-reservation, and GOAWAY cutoffs without owning the surrounding stream table. A
-store only needs `get(id)` and `insert(id, Tracked)` methods; slab, fixed-array,
-hash-table, or intrusive storage remains an application choice.
+reservation, and GOAWAY cutoffs without owning the surrounding stream table. Its
+low-level lookup API needs only `get(id)` and `insert(id, Tracked)`; slab,
+fixed-array, hash-table, intrusive, or sharded storage remains an application
+choice. The composed `Session` additionally asks for
+`maxActiveSendAdjustment()` only on the rare SETTINGS initial-window
+overflow-validation path.
 
 ```zig
 var manager = http.http2.StreamManager.init(.client, .{});
@@ -167,7 +194,7 @@ value has been acknowledged.
 
 ## HTTP/2 composable session layer
 
-`Session` is the optional high-level receive path for applications that want the
+`Session` is the optional composed receive path for applications that want the
 existing connection, stream, peer, HPACK, and field-validation primitives wired
 together without adopting a networking or allocation model. The session itself
 is 128 bytes on x86_64. It owns no heap memory: HPACK encoder/decoder dynamic
@@ -474,6 +501,7 @@ zig build bench-real-streams -Doptimize=ReleaseFast
 zig build bench-real-session -Doptimize=ReleaseFast
 zig build bench-real-send-session -Doptimize=ReleaseFast
 zig build bench-real-scheduler -Doptimize=ReleaseFast
+zig build bench-real-settings -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.

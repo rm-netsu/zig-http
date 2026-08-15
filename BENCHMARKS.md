@@ -10,6 +10,49 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.13.0 SETTINGS initial-window scalability
+
+HTTP/2 `SETTINGS_INITIAL_WINDOW_SIZE` used to apply its delta by mutating every
+live locally-sending stream in caller-owned storage. That keeps absolute windows
+simple, but makes one connection-level SETTINGS frame O(number of streams) and
+forces a global storage operation even when the application shards stream state.
+
+0.13.0 stores each stream's send credit as an adjustment relative to the current
+peer initial window. The benchmark uses 4096 open streams and 50,000 alternating
+initial-window SETTINGS values. Fixture creation is outside timing and a runtime
+seed prevents the SETTINGS sequence from being folded at compile time.
+
+| Implementation | SETTINGS rate | store-wide operations |
+| --- | ---: | ---: |
+| 0.12.0 eager per-stream delta | 0.410 M/s | 50,000 scans / 204.8 M stream mutations |
+| 0.13.0 relative common path | 527.309 M/s | 0 scans |
+
+This benchmark intentionally isolates the control-plane transition; the roughly
+thousand-fold rate difference must **not** be interpreted as HTTP transaction
+throughput. Its useful result is the complexity change from O(streams) to O(1)
+for the common path. A rare initial-window increase after positive stream-level
+WINDOW_UPDATE credit still requests an exact maximum adjustment so a potential
+`2^31-1` overflow is rejected correctly. Caller storage decides whether that
+exact value comes from a scan, an aggregate, or shard coordination.
+
+CPU-pinned five-run A/B medians of the existing send-session workload showed the
+tradeoff more clearly: manual composition was **0.990 vs 0.993 M tx/s** (~-0.3%),
+lookup Session was **0.967 vs 0.973 M tx/s** (~-0.6%), and the stable-cursor Session
+was **1.012 vs 1.041 M tx/s** (~-2.8%) for 0.13.0 versus 0.12.0. Wire output stayed
+identical at **13,835.6 B/tx**. The stable-cursor case exposes the extra
+relative-window arithmetic most directly because caller-store lookup is already
+removed.
+
+Several representations were tested before keeping the compact 4-byte adjustment:
+a 16-byte lazy absolute/snapshot record recovered arithmetic speed but regressed
+the full workload through larger `Tracked` cache footprint, while encoded/hybrid
+4-byte variants either lost on the full Session path or triggered pathological
+ReleaseFast compile time in Zig 0.16.0. The lower-level absolute `FlowWindow` and
+stream-state primitives remain available to consumers that deliberately prefer an
+eager SETTINGS sweep for a particular storage/runtime design. The composed Session
+chooses the scalable relative representation because it removes mandatory
+cross-store mutation and keeps `Tracked` at 12 bytes.
+
 ## 0.12.0 receive-credit and drain checks
 
 The receive-credit work was checked specifically for event-layout regressions.
