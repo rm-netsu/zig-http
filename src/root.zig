@@ -27,6 +27,9 @@ test {
     _ = http2.stream.Stream;
     _ = http2.stream.Windows;
     _ = http2.stream.Tracked;
+    _ = http2.streams.Manager;
+    _ = http2.streams.Existing;
+    _ = http2.streams.ReceiveResult;
     _ = http2.header_block.Collector;
     _ = http2.connection.State;
     _ = http2.connection.Violation;

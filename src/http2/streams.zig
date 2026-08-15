@@ -1,0 +1,646 @@
+const std = @import("std");
+const frame = @import("frame.zig");
+const peer_mod = @import("peer.zig");
+const protocol = @import("protocol.zig");
+const stream_mod = @import("stream.zig");
+
+pub const Role = peer_mod.Role;
+pub const Tracked = stream_mod.Tracked;
+pub const State = stream_mod.State;
+
+/// Limits advertised by the local endpoint and therefore enforced on streams
+/// initiated by the remote peer.
+pub const LocalLimits = struct {
+    initial_window_size: u31 = 65_535,
+    max_concurrent_streams: u32 = std.math.maxInt(u32),
+    /// Effective inbound push policy. A client that sends
+    /// SETTINGS_ENABLE_PUSH=0 should change this to false only once that
+    /// SETTINGS value has been acknowledged, matching RFC 9113 synchronization.
+    /// The value has no effect for a server because clients cannot push.
+    enable_push: bool = true,
+};
+
+pub const ReceiveResult = enum(u8) {
+    accepted,
+    connection_protocol,
+    stream_protocol,
+    stream_closed,
+    stream_flow_control,
+    refused_stream,
+    ignored_after_goaway,
+
+    pub inline fn errorCode(self: ReceiveResult) ?protocol.ErrorCode {
+        return switch (self) {
+            .accepted => null,
+            .connection_protocol, .stream_protocol => .protocol_error,
+            .stream_closed => .stream_closed,
+            .stream_flow_control => .flow_control_error,
+            .refused_stream => .refused_stream,
+            .ignored_after_goaway => null,
+        };
+    }
+
+    pub inline fn isConnectionError(self: ReceiveResult) bool {
+        return self == .connection_protocol;
+    }
+};
+
+pub const LocalError = error{
+    Protocol,
+    StreamClosed,
+    FlowControl,
+    PeerLimit,
+    StoreFull,
+    GoAway,
+};
+
+/// Short-lived zero-allocation cursor for callers that already have a stable
+/// pointer from their stream store. The pointer remains owned by the caller and
+/// must not outlive any store operation that can move or remove the record.
+pub const Existing = struct {
+    manager: *Manager,
+    stream_id: u31,
+    tracked: *Tracked,
+
+    pub inline fn receiveHeaders(self: Existing, end_stream: bool) ReceiveResult {
+        return self.manager.receiveHeadersTracked(self.stream_id, self.tracked, end_stream);
+    }
+
+    pub inline fn receiveData(self: Existing, payload_length: u32, end_stream: bool) ReceiveResult {
+        return self.manager.receiveDataTracked(self.stream_id, self.tracked, payload_length, end_stream);
+    }
+
+    pub inline fn receiveReset(self: Existing) ReceiveResult {
+        return self.manager.receiveResetTracked(self.stream_id, self.tracked);
+    }
+
+    pub inline fn receiveWindowUpdate(self: Existing, increment: u31) ReceiveResult {
+        return self.manager.receiveWindowUpdateTracked(self.stream_id, self.tracked, increment);
+    }
+
+    pub inline fn localHeaders(self: Existing, peer: *const peer_mod.State, end_stream: bool) LocalError!void {
+        try self.manager.localHeadersTracked(peer, self.stream_id, self.tracked, end_stream);
+    }
+
+    pub inline fn localData(self: Existing, payload_length: u32, end_stream: bool) LocalError!void {
+        try self.manager.localDataTracked(self.stream_id, self.tracked, payload_length, end_stream);
+    }
+
+    pub inline fn localReset(self: Existing) LocalError!void {
+        try self.manager.localResetTracked(self.stream_id, self.tracked);
+    }
+
+    /// Applies a SETTINGS_INITIAL_WINDOW_SIZE change returned by `peer.State`.
+    pub inline fn applyPeerInitialWindow(self: Existing, change: peer_mod.State.InitialWindowChange) LocalError!void {
+        self.tracked.windows.applyPeerInitialDelta(change.old, change.new) catch return error.FlowControl;
+    }
+
+    /// Records receive credit after the local endpoint emits a stream-level
+    /// WINDOW_UPDATE for this stream.
+    pub inline fn creditReceive(self: Existing, increment: u31) LocalError!void {
+        self.tracked.windows.creditReceive(increment) catch return error.FlowControl;
+    }
+};
+
+/// Stream lifecycle/accounting independent of the application's storage.
+///
+/// `store` arguments are comptime duck-typed and need only provide:
+///
+///     get(stream_id: u31) ?*http2.stream.Tracked
+///     insert(stream_id: u31, value: http2.stream.Tracked) ?*http2.stream.Tracked
+///
+/// The store may remove closed records when its application policy permits.
+/// `Manager` retains high-water stream identifiers, so skipped or removed older
+/// identifiers are never mistaken for idle streams. Retaining a recently closed
+/// record lets applications preserve the RFC 9113 race-tolerant handling of late
+/// frames after END_STREAM/RST_STREAM; removing it opts into the stricter
+/// high-water-only closed-stream behavior.
+pub const Manager = struct {
+    highest_local_stream_id: u31 = 0,
+    highest_remote_stream_id: u31 = 0,
+    local_active: u32 = 0,
+    remote_active: u32 = 0,
+    local_limits: LocalLimits = .{},
+    local_role: Role,
+    // Bit 31 cannot occur in an HTTP/2 stream identifier and therefore acts as
+    // an allocation-free "no local GOAWAY sent" sentinel.
+    local_goaway_last_stream_id: u32 = no_goaway,
+
+    const no_goaway: u32 = 0x8000_0000;
+
+    pub fn init(local_role: Role, local_limits: LocalLimits) Manager {
+        return .{ .local_role = local_role, .local_limits = local_limits };
+    }
+
+    pub inline fn localInitiated(self: Manager, stream_id: u31) bool {
+        return switch (self.local_role) {
+            .client => protocol.clientInitiated(stream_id),
+            .server => protocol.serverInitiated(stream_id),
+        };
+    }
+
+    pub inline fn remoteInitiated(self: Manager, stream_id: u31) bool {
+        return stream_id != 0 and !self.localInitiated(stream_id);
+    }
+
+    pub inline fn activeLocal(self: Manager) u32 {
+        return self.local_active;
+    }
+
+    pub inline fn activeRemote(self: Manager) u32 {
+        return self.remote_active;
+    }
+
+    /// Records the last peer-initiated stream identifier placed in a locally
+    /// sent GOAWAY. Repeated GOAWAY values may only stay equal or decrease.
+    pub fn sentGoAway(self: *Manager, last_stream_id: u31) LocalError!void {
+        if (last_stream_id != 0 and !self.remoteInitiated(last_stream_id)) return error.Protocol;
+        if (self.local_goaway_last_stream_id != no_goaway and last_stream_id > self.local_goaway_last_stream_id)
+            return error.Protocol;
+        self.local_goaway_last_stream_id = last_stream_id;
+    }
+
+    pub inline fn goAwaySent(self: Manager) bool {
+        return self.local_goaway_last_stream_id != no_goaway;
+    }
+
+    pub inline fn lastSentGoAwayStream(self: Manager) ?u31 {
+        if (!self.goAwaySent()) return null;
+        return @intCast(self.local_goaway_last_stream_id);
+    }
+
+    /// True for a locally initiated stream that the peer's received GOAWAY
+    /// proves was not processed and can therefore be retried on a new
+    /// connection according to application semantics.
+    pub inline fn unprocessedByPeer(self: Manager, peer: *const peer_mod.State, stream_id: u31) bool {
+        if (!self.localInitiated(stream_id)) return false;
+        const last = peer.lastGoAwayStream() orelse return false;
+        return stream_id > last;
+    }
+
+    /// Returns a short-lived cursor when the caller knows its store keeps the
+    /// returned pointer stable for the duration of the cursor.
+    pub inline fn existing(self: *Manager, store: anytype, stream_id: u31) ?Existing {
+        const tracked = store.get(stream_id) orelse return null;
+        return .{ .manager = self, .stream_id = stream_id, .tracked = tracked };
+    }
+
+    fn absentClosed(self: Manager, stream_id: u31) bool {
+        if (stream_id == 0) return false;
+        const highest = if (self.localInitiated(stream_id)) self.highest_local_stream_id else self.highest_remote_stream_id;
+        return stream_id <= highest;
+    }
+
+    inline fn ignoredAfterGoAway(self: Manager, stream_id: u31) bool {
+        if (self.local_goaway_last_stream_id == no_goaway or !self.remoteInitiated(stream_id)) return false;
+        return stream_id > self.local_goaway_last_stream_id;
+    }
+
+    inline fn isActive(state: State) bool {
+        return state == .open or state == .half_closed_local or state == .half_closed_remote;
+    }
+
+    fn adjustActive(self: *Manager, stream_id: u31, before: State, after: State) void {
+        const was_active = isActive(before);
+        const now_active = isActive(after);
+        if (was_active == now_active) return;
+        const counter = if (self.localInitiated(stream_id)) &self.local_active else &self.remote_active;
+        if (now_active) {
+            counter.* += 1;
+        } else {
+            std.debug.assert(counter.* != 0);
+            counter.* -= 1;
+        }
+    }
+
+    fn remoteLimitAvailable(self: Manager) bool {
+        return self.remote_active < self.local_limits.max_concurrent_streams;
+    }
+
+    fn peerLimitAvailable(self: Manager, peer: *const peer_mod.State) bool {
+        return self.local_active < peer.settings.max_concurrent_streams;
+    }
+
+    fn newTracked(self: Manager, peer: *const peer_mod.State) Tracked {
+        return Tracked.init(peer.settings.initial_window_size, self.local_limits.initial_window_size);
+    }
+
+    /// Registers a client-initiated request stream before sending its first
+    /// HEADERS frame. Servers cannot open an idle stream directly; they reserve
+    /// push streams with `reserveLocal` and later call `localHeaders`.
+    pub fn openLocal(self: *Manager, store: anytype, peer: *const peer_mod.State, stream_id: u31, end_stream: bool) LocalError!void {
+        if (self.local_role != .client or stream_id == 0 or !self.localInitiated(stream_id)) return error.Protocol;
+        if (stream_id <= self.highest_local_stream_id or store.get(stream_id) != null) return error.Protocol;
+        if (peer.goAwayReceived()) return error.GoAway;
+        if (!self.peerLimitAvailable(peer)) return error.PeerLimit;
+
+        var value = self.newTracked(peer);
+        try value.stream.localHeaders(end_stream);
+        const inserted = store.insert(stream_id, value) orelse return error.StoreFull;
+        _ = inserted;
+        self.highest_local_stream_id = stream_id;
+        self.local_active += 1;
+    }
+
+    /// Reserves a server-initiated push stream before sending PUSH_PROMISE.
+    pub fn reserveLocal(self: *Manager, store: anytype, peer: *const peer_mod.State, associated_stream_id: u31, promised_stream_id: u31) LocalError!void {
+        if (self.local_role != .server or !peer.settings.enable_push) return error.Protocol;
+        if (peer.goAwayReceived()) return error.GoAway;
+        if (associated_stream_id == 0 or !self.remoteInitiated(associated_stream_id)) return error.Protocol;
+        const associated = store.get(associated_stream_id) orelse return error.Protocol;
+        if (associated.stream.state != .open and associated.stream.state != .half_closed_remote) return error.Protocol;
+        if (promised_stream_id == 0 or !self.localInitiated(promised_stream_id) or promised_stream_id <= self.highest_local_stream_id)
+            return error.Protocol;
+        if (store.get(promised_stream_id) != null) return error.Protocol;
+
+        var value = self.newTracked(peer);
+        try value.stream.reserveLocal();
+        _ = store.insert(promised_stream_id, value) orelse return error.StoreFull;
+        self.highest_local_stream_id = promised_stream_id;
+    }
+
+    /// Applies locally sent HEADERS to an existing stream, including the
+    /// reserved(local) -> half-closed(remote) transition for server push.
+    pub fn localHeaders(self: *Manager, store: anytype, peer: *const peer_mod.State, stream_id: u31, end_stream: bool) LocalError!void {
+        const tracked = store.get(stream_id) orelse return error.StreamClosed;
+        try self.localHeadersTracked(peer, stream_id, tracked, end_stream);
+    }
+
+    pub fn localHeadersTracked(self: *Manager, peer: *const peer_mod.State, stream_id: u31, tracked: *Tracked, end_stream: bool) LocalError!void {
+        const before = tracked.stream.state;
+        if (before == .reserved_local) {
+            if (peer.goAwayReceived()) return error.GoAway;
+            if (!self.peerLimitAvailable(peer)) return error.PeerLimit;
+        }
+        tracked.stream.localHeaders(end_stream) catch |err| switch (err) {
+            error.StreamClosed => return error.StreamClosed,
+            error.Protocol => return error.Protocol,
+        };
+        self.adjustActive(stream_id, before, tracked.stream.state);
+    }
+
+    pub fn localData(self: *Manager, store: anytype, stream_id: u31, payload_length: u32, end_stream: bool) LocalError!void {
+        const tracked = store.get(stream_id) orelse return error.StreamClosed;
+        try self.localDataTracked(stream_id, tracked, payload_length, end_stream);
+    }
+
+    pub fn localDataTracked(self: *Manager, stream_id: u31, tracked: *Tracked, payload_length: u32, end_stream: bool) LocalError!void {
+        switch (tracked.stream.state) {
+            .open, .half_closed_remote => {},
+            .half_closed_local, .closed => return error.StreamClosed,
+            else => return error.Protocol,
+        }
+        tracked.windows.consumeSend(payload_length) catch return error.FlowControl;
+        const before = tracked.stream.state;
+        tracked.stream.localData(end_stream) catch |err| switch (err) {
+            error.StreamClosed => return error.StreamClosed,
+            error.Protocol => return error.Protocol,
+        };
+        self.adjustActive(stream_id, before, tracked.stream.state);
+    }
+
+    pub fn localReset(self: *Manager, store: anytype, stream_id: u31) LocalError!void {
+        const tracked = store.get(stream_id) orelse {
+            if (self.absentClosed(stream_id)) return;
+            return error.Protocol;
+        };
+        try self.localResetTracked(stream_id, tracked);
+    }
+
+    pub fn localResetTracked(self: *Manager, stream_id: u31, tracked: *Tracked) LocalError!void {
+        const before = tracked.stream.state;
+        tracked.stream.reset() catch return error.Protocol;
+        self.adjustActive(stream_id, before, tracked.stream.state);
+    }
+
+    /// Applies received HEADERS after frame/payload syntax and HPACK processing
+    /// have succeeded. A new idle stream can only be opened by a client, so an
+    /// idle server-initiated identifier received by a client is a connection
+    /// PROTOCOL_ERROR.
+    pub fn receiveHeaders(self: *Manager, store: anytype, peer: *const peer_mod.State, stream_id: u31, end_stream: bool) ReceiveResult {
+        if (stream_id == 0) return .connection_protocol;
+        if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
+        if (store.get(stream_id)) |tracked| return self.receiveHeadersTracked(stream_id, tracked, end_stream);
+
+        if (self.absentClosed(stream_id)) return .stream_closed;
+        if (!self.remoteInitiated(stream_id)) return .connection_protocol;
+        // Servers can accept client-created request streams. Clients cannot
+        // receive an unsolicited server-created HEADERS stream; server streams
+        // must first be reserved by PUSH_PROMISE.
+        if (self.local_role != .server) return .connection_protocol;
+        if (stream_id <= self.highest_remote_stream_id) return .connection_protocol;
+
+        self.highest_remote_stream_id = stream_id;
+        if (!self.remoteLimitAvailable()) return .refused_stream;
+
+        var value = self.newTracked(peer);
+        value.stream.remoteHeaders(end_stream) catch unreachable;
+        _ = store.insert(stream_id, value) orelse return .refused_stream;
+        self.remote_active += 1;
+        return .accepted;
+    }
+
+    /// Fast path for a stream record already resolved by caller-owned storage.
+    pub fn receiveHeadersTracked(self: *Manager, stream_id: u31, tracked: *Tracked, end_stream: bool) ReceiveResult {
+        const before = tracked.stream.state;
+        if (before == .reserved_remote and !self.remoteLimitAvailable()) {
+            tracked.stream.state = .closed;
+            return .refused_stream;
+        }
+        tracked.stream.remoteHeaders(end_stream) catch |err| return switch (err) {
+            error.StreamClosed => .stream_closed,
+            error.Protocol => .connection_protocol,
+        };
+        self.adjustActive(stream_id, before, tracked.stream.state);
+        return .accepted;
+    }
+
+    /// Applies a received DATA frame. `payload_length` is the complete frame
+    /// payload length, including Pad Length and padding bytes.
+    pub fn receiveData(self: *Manager, store: anytype, stream_id: u31, payload_length: u32, end_stream: bool) ReceiveResult {
+        if (stream_id == 0) return .connection_protocol;
+        if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
+        const tracked = store.get(stream_id) orelse {
+            if (self.absentClosed(stream_id)) return .stream_closed;
+            return .connection_protocol;
+        };
+        return self.receiveDataTracked(stream_id, tracked, payload_length, end_stream);
+    }
+
+    pub fn receiveDataTracked(self: *Manager, stream_id: u31, tracked: *Tracked, payload_length: u32, end_stream: bool) ReceiveResult {
+        switch (tracked.stream.state) {
+            .open, .half_closed_local => {},
+            .half_closed_remote, .closed => return .stream_closed,
+            else => return .connection_protocol,
+        }
+        tracked.windows.receiveData(payload_length) catch return .stream_flow_control;
+        const before = tracked.stream.state;
+        tracked.stream.remoteData(end_stream) catch unreachable;
+        self.adjustActive(stream_id, before, tracked.stream.state);
+        return .accepted;
+    }
+
+    pub fn receiveReset(self: *Manager, store: anytype, stream_id: u31) ReceiveResult {
+        if (stream_id == 0) return .connection_protocol;
+        if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
+        const tracked = store.get(stream_id) orelse {
+            if (self.absentClosed(stream_id)) return .accepted;
+            return .connection_protocol;
+        };
+        return self.receiveResetTracked(stream_id, tracked);
+    }
+
+    pub fn receiveResetTracked(self: *Manager, stream_id: u31, tracked: *Tracked) ReceiveResult {
+        const before = tracked.stream.state;
+        tracked.stream.reset() catch return .connection_protocol;
+        self.adjustActive(stream_id, before, tracked.stream.state);
+        return .accepted;
+    }
+
+    /// Applies a stream-level WINDOW_UPDATE. Connection-level updates belong to
+    /// `peer.State.windowUpdate()`.
+    pub fn receiveWindowUpdate(self: *Manager, store: anytype, stream_id: u31, increment: u31) ReceiveResult {
+        if (stream_id == 0) return .connection_protocol;
+        if (increment == 0) return .stream_protocol;
+        if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
+        const tracked = store.get(stream_id) orelse {
+            if (self.absentClosed(stream_id)) return .accepted;
+            return .connection_protocol;
+        };
+        return self.receiveWindowUpdateTracked(stream_id, tracked, increment);
+    }
+
+    pub fn receiveWindowUpdateTracked(self: *Manager, stream_id: u31, tracked: *Tracked, increment: u31) ReceiveResult {
+        _ = self;
+        _ = stream_id;
+        if (increment == 0) return .stream_protocol;
+        switch (tracked.stream.state) {
+            .reserved_remote => return .connection_protocol,
+            .closed => return .accepted,
+            .idle => return .connection_protocol,
+            else => {},
+        }
+        tracked.windows.peerWindowUpdate(increment) catch return .stream_flow_control;
+        return .accepted;
+    }
+
+    /// Reserves a remotely initiated server-push stream. The associated stream
+    /// may be closed because RFC 9113 permits minimal processing of frames that
+    /// raced with a locally sent RST_STREAM.
+    pub fn receivePushPromise(self: *Manager, store: anytype, peer: *const peer_mod.State, associated_stream_id: u31, promised_stream_id: u31) ReceiveResult {
+        if (self.local_role != .client or !self.local_limits.enable_push) return .connection_protocol;
+        if (associated_stream_id == 0 or !self.localInitiated(associated_stream_id)) return .connection_protocol;
+
+        if (store.get(associated_stream_id)) |associated| {
+            switch (associated.stream.state) {
+                .open, .half_closed_local, .closed => {},
+                else => return .connection_protocol,
+            }
+        } else if (!self.absentClosed(associated_stream_id)) {
+            return .connection_protocol;
+        }
+
+        if (promised_stream_id == 0 or !self.remoteInitiated(promised_stream_id) or promised_stream_id <= self.highest_remote_stream_id)
+            return .connection_protocol;
+        if (self.ignoredAfterGoAway(promised_stream_id)) return .ignored_after_goaway;
+        if (store.get(promised_stream_id) != null) return .connection_protocol;
+
+        self.highest_remote_stream_id = promised_stream_id;
+        var value = self.newTracked(peer);
+        value.stream.reserveRemote() catch unreachable;
+        _ = store.insert(promised_stream_id, value) orelse return .refused_stream;
+        return .accepted;
+    }
+};
+
+const TestStore = struct {
+    const Entry = struct {
+        id: u31 = 0,
+        used: bool = false,
+        value: Tracked = undefined,
+    };
+
+    entries: [16]Entry = [_]Entry{.{}} ** 16,
+
+    fn get(self: *TestStore, id: u31) ?*Tracked {
+        for (&self.entries) |*entry| {
+            if (entry.used and entry.id == id) return &entry.value;
+        }
+        return null;
+    }
+
+    fn insert(self: *TestStore, id: u31, value: Tracked) ?*Tracked {
+        if (self.get(id) != null) return null;
+        for (&self.entries) |*entry| {
+            if (!entry.used) {
+                entry.* = .{ .id = id, .used = true, .value = value };
+                return &entry.value;
+            }
+        }
+        return null;
+    }
+};
+
+test "client request response lifecycle uses caller-owned store" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+
+    try manager.openLocal(&store, &peer, 1, true);
+    try std.testing.expectEqual(@as(u32, 1), manager.activeLocal());
+    try std.testing.expectEqual(State.half_closed_local, store.get(1).?.stream.state);
+
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, false));
+    try std.testing.expectEqual(State.half_closed_local, store.get(1).?.stream.state);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveData(&store, 1, 1024, true));
+    try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
+    try std.testing.expectEqual(@as(u32, 0), manager.activeLocal());
+}
+
+test "server accepts monotonically increasing client streams and closes skipped ids" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.server, .{});
+    var peer = peer_mod.State.init(.server);
+
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 5, true));
+    const skipped = manager.receiveReset(&store, 3);
+    try std.testing.expectEqual(ReceiveResult.accepted, skipped);
+    const reused = manager.receiveHeaders(&store, &peer, 3, true);
+    try std.testing.expectEqual(ReceiveResult.stream_closed, reused);
+}
+
+test "server enforces local concurrent stream limit with REFUSED_STREAM" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.server, .{ .max_concurrent_streams = 1 });
+    var peer = peer_mod.State.init(.server);
+
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    const refused = manager.receiveHeaders(&store, &peer, 3, true);
+    try std.testing.expectEqual(ReceiveResult.refused_stream, refused);
+}
+
+test "stream receive flow control returns stream error" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.server, .{ .initial_window_size = 4 });
+    var peer = peer_mod.State.init(.server);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, false));
+    const result = manager.receiveData(&store, 1, 5, false);
+    try std.testing.expectEqual(ReceiveResult.stream_flow_control, result);
+}
+
+test "client accepts server push reservation and pushed response" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    try manager.openLocal(&store, &peer, 1, true);
+
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receivePushPromise(&store, &peer, 1, 2));
+    try std.testing.expectEqual(State.reserved_remote, store.get(2).?.stream.state);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 2, false));
+    try std.testing.expectEqual(State.half_closed_local, store.get(2).?.stream.state);
+}
+
+test "window update is accepted on closed stream but rejected on idle" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.server, .{});
+    var peer = peer_mod.State.init(.server);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try manager.localHeaders(&store, &peer, 1, true);
+    try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveWindowUpdate(&store, 1, 1));
+    const idle = manager.receiveWindowUpdate(&store, 3, 1);
+    try std.testing.expectEqual(ReceiveResult.connection_protocol, idle);
+}
+
+test "local server push reservation opens only when peer limit allows" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.server, .{});
+    var peer = peer_mod.State.init(.server);
+    // Client request stream 1 is peer initiated and half-closed(remote).
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try manager.reserveLocal(&store, &peer, 1, 2);
+    try std.testing.expectEqual(State.reserved_local, store.get(2).?.stream.state);
+
+    _ = try peer.applySetting(.{ .id = .max_concurrent_streams, .value = 0 });
+    try std.testing.expectError(error.PeerLimit, manager.localHeaders(&store, &peer, 2, false));
+}
+
+test "local stream creation obeys peer max concurrency and GOAWAY" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    _ = try peer.applySetting(.{ .id = .max_concurrent_streams, .value = 1 });
+    try manager.openLocal(&store, &peer, 1, true);
+    try std.testing.expectError(error.PeerLimit, manager.openLocal(&store, &peer, 3, true));
+
+    var goaway_bytes: [8]u8 = [_]u8{0} ** 8;
+    std.mem.writeInt(u32, goaway_bytes[0..4], 1, .big);
+    const goaway_header: frame.FrameHeader = .{ .length = 8, .type = .goaway, .flags = 0, .stream_id = 0 };
+    _ = try peer.goAway(goaway_header, &goaway_bytes);
+    try std.testing.expectError(error.GoAway, manager.openLocal(&store, &peer, 5, true));
+}
+
+test "tracked cursor avoids another caller-store lookup" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    try manager.openLocal(&store, &peer, 1, true);
+    const cursor = manager.existing(&store, 1).?;
+    try std.testing.expectEqual(ReceiveResult.accepted, cursor.receiveHeaders(false));
+    try std.testing.expectEqual(ReceiveResult.accepted, cursor.receiveData(1, true));
+    try std.testing.expectEqual(State.closed, cursor.tracked.stream.state);
+}
+
+
+test "tracked cursor supports local send state and settings delta" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    try manager.openLocal(&store, &peer, 1, false);
+    const cursor = manager.existing(&store, 1).?;
+
+    const effect = try peer.applySetting(.{ .id = .initial_window_size, .value = 70_000 });
+    try cursor.applyPeerInitialWindow(effect.initial_window);
+    try std.testing.expectEqual(@as(u31, 70_000), cursor.tracked.windows.send.available());
+
+    try cursor.localData(1024, true);
+    try std.testing.expectEqual(State.half_closed_local, cursor.tracked.stream.state);
+    try std.testing.expectEqual(@as(u31, 68_976), cursor.tracked.windows.send.available());
+}
+
+
+test "local GOAWAY ignores newer remote streams without creating state" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.server, .{});
+    var peer = peer_mod.State.init(.server);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try manager.sentGoAway(1);
+    try std.testing.expectEqual(@as(?u31, 1), manager.lastSentGoAwayStream());
+    try std.testing.expectEqual(ReceiveResult.ignored_after_goaway, manager.receiveHeaders(&store, &peer, 3, true));
+    try std.testing.expect(store.get(3) == null);
+    try std.testing.expectError(error.Protocol, manager.sentGoAway(2));
+}
+
+test "peer GOAWAY identifies unprocessed local streams" {
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    var bytes: [8]u8 = [_]u8{0} ** 8;
+    std.mem.writeInt(u32, bytes[0..4], 3, .big);
+    const header: frame.FrameHeader = .{ .length = 8, .type = .goaway, .flags = 0, .stream_id = 0 };
+    _ = try peer.goAway(header, &bytes);
+    try std.testing.expect(!manager.unprocessedByPeer(&peer, 3));
+    try std.testing.expect(manager.unprocessedByPeer(&peer, 5));
+    try std.testing.expect(!manager.unprocessedByPeer(&peer, 2));
+}
+
+
+test "zero window update remains an error on a closed stream" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.server, .{});
+    var peer = peer_mod.State.init(.server);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try manager.localHeaders(&store, &peer, 1, true);
+    try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
+    try std.testing.expectEqual(ReceiveResult.stream_protocol, manager.receiveWindowUpdate(&store, 1, 0));
+}
