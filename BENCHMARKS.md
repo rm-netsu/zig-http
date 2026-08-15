@@ -365,3 +365,35 @@ returned zero-copy rather than scanned byte-by-byte, so it must not be read as
 memory-copy bandwidth. Likewise, `FixedBody.take` is intentionally tiny and its
 very high transaction rate is mainly useful for detecting regressions in that
 primitive.
+
+## SIMD audit after 0.10.0
+
+A follow-up SIMD audit used Zig 0.16.0 `ReleaseFast` on the same x86_64 Linux
+host (AMD EPYC with AVX2/AVX-512). Candidate byte validators were first measured
+side-by-side in one executable over the captured corpus, then the promising
+variants were integrated and A/B tested against the unchanged 0.10.0 parser.
+
+No additional SIMD change was retained:
+
+- A common-case 8-byte SIMD classifier for lowercase HTTP/2 regular field names
+  (`a-z`, `0-9`, `-`, with a scalar RFC fallback) roughly doubled the isolated
+  name-validation loop, but a five-run integrated HTTP/2 field-validator A/B was
+  effectively flat (about -0.2% at the median).
+- A 32-byte HTTP/2 field-value path improved the isolated value validator by
+  about 8% on captured fields. Combining it with the name fast path regressed
+  the existing HTTP/2 field-validation microbenchmark by about 4% at the median,
+  so the current 8-byte blocks remain preferable in the complete validator.
+- Following `std.simd.suggestVectorLength(u8)` directly selected 64-byte vectors
+  on the AVX-512 test host. That path did not generalize: the small HTTP/2 gain
+  was accompanied by HTTP/1 and mixed-workload regressions. Native maximum width
+  is therefore not a suitable policy for these short protocol strings.
+- SIMD request-target validation was about 1.9x faster in isolation on the real
+  captured paths, but the complete HTTP/1 real-corpus head benchmarks changed by
+  only about 0-0.6%. The extra path is not justified for such a small end-to-end
+  effect.
+
+The earlier 0.4.0 choices therefore still hold: short 8-byte SIMD value blocks,
+four-byte token-table unrolling, and the standard-library search/equality
+primitives give the better whole-parser balance. Future SIMD work should be
+accepted only when it improves the real protocol corpus, not a validator-only
+probe.
