@@ -56,6 +56,8 @@ pub const LocalError = error{
 
 pub const StreamLocalError = error{ Protocol, StreamClosed, FlowControl };
 
+pub const AbsentFrame = enum(u2) { data, reset, window_update };
+
 /// Compact connection-level bookkeeping produced by stream-local operations.
 /// A detached worker can mutate only its caller-owned `Tracked` record and
 /// return this value to the ordered connection owner. No locking, atomics, or
@@ -92,6 +94,24 @@ pub const DetachedResult = struct {
     effect: StreamEffect = .{},
 };
 
+/// Stream-local outbound DATA credit captured under one ordered peer
+/// SETTINGS_INITIAL_WINDOW_SIZE value. The connection owner can combine this
+/// with its own connection window and MAX_FRAME_SIZE without reading `Tracked`.
+pub const DataSendOffer = struct {
+    stream_id: u31,
+    peer_initial_window: u31,
+    max_payload: u31,
+
+    /// Commits stream-local DATA state after the connection owner accepted this
+    /// offer and successfully wrote `amount` bytes. No PeerState is required on
+    /// the stream shard during commit.
+    pub inline fn commit(self: DataSendOffer, detached: Detached, amount: u32, end_stream: bool) StreamEffect {
+        std.debug.assert(detached.stream_id == self.stream_id);
+        std.debug.assert(amount <= self.max_payload);
+        return detached.localDataAssumeGranted(amount, end_stream);
+    }
+};
+
 /// Stream-local cursor that deliberately has no pointer to `Manager`. This is
 /// the low-level path for sharded stores: a worker can process common existing-
 /// stream frames against its own stable record, then hand the tiny `StreamEffect`
@@ -112,6 +132,17 @@ pub const Detached = struct {
         return dataSendCreditDetached(self.tracked, peer_initial_window);
     }
 
+    /// Captures stream-local credit plus the SETTINGS snapshot that made it
+    /// valid. This is the preferred handoff object when stream state and the
+    /// ordered connection send state live on different workers.
+    pub inline fn dataSendOffer(self: Detached, peer_initial_window: u31) StreamLocalError!DataSendOffer {
+        return .{
+            .stream_id = self.stream_id,
+            .peer_initial_window = peer_initial_window,
+            .max_payload = try self.dataSendCredit(peer_initial_window),
+        };
+    }
+
     /// Checked stream-local DATA transition. Prefer `localDataAssumeCredit`
     /// after a successful wire write when the same credit was already probed.
     pub inline fn localData(self: Detached, peer_initial_window: u31, payload_length: u32, end_stream: bool) StreamLocalError!StreamEffect {
@@ -124,6 +155,13 @@ pub const Detached = struct {
     /// the connection owner separately.
     pub inline fn localDataAssumeCredit(self: Detached, peer_initial_window: u31, payload_length: u32, end_stream: bool) StreamEffect {
         return localDataDetachedAssumeCredit(self.tracked, peer_initial_window, payload_length, end_stream);
+    }
+
+    /// Commit-only counterpart for an accepted `DataSendOffer`. The caller must
+    /// preserve per-stream operation order and call this only after the DATA
+    /// write succeeds. Credit validation happened before the wire mutation.
+    pub inline fn localDataAssumeGranted(self: Detached, payload_length: u32, end_stream: bool) StreamEffect {
+        return localDataDetachedCommit(self.tracked, payload_length, end_stream);
     }
 
     pub inline fn localReset(self: Detached) error{Protocol}!StreamEffect {
@@ -189,8 +227,16 @@ inline fn localDataDetachedAssumeCredit(
     payload_length: u32,
     end_stream: bool,
 ) StreamEffect {
-    std.debug.assert(tracked.stream.state == .open or tracked.stream.state == .half_closed_remote);
     std.debug.assert(tracked.windows.send.available(peer_initial_window) >= payload_length);
+    return localDataDetachedCommit(tracked, payload_length, end_stream);
+}
+
+inline fn localDataDetachedCommit(
+    tracked: *Tracked,
+    payload_length: u32,
+    end_stream: bool,
+) StreamEffect {
+    std.debug.assert(tracked.stream.state == .open or tracked.stream.state == .half_closed_remote);
     tracked.windows.consumeSendAssumeAvailable(payload_length);
     const before = tracked.stream.state;
     tracked.stream.localData(end_stream) catch unreachable;
@@ -425,6 +471,20 @@ pub const Manager = struct {
         return stream_id <= highest;
     }
 
+    /// Classifies an already-confirmed missing stream record without touching
+    /// caller-owned storage. This is the routing counterpart to `Detached`: a
+    /// shard can report a miss and let the ordered connection owner resolve the
+    /// RFC high-water/GOAWAY semantics without repeating the store lookup.
+    pub inline fn receiveAbsent(self: Manager, kind: AbsentFrame, stream_id: u31) ReceiveResult {
+        if (stream_id == 0) return .connection_protocol;
+        if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
+        if (!self.absentClosed(stream_id)) return .connection_protocol;
+        return switch (kind) {
+            .data => .stream_closed,
+            .reset, .window_update => .accepted,
+        };
+    }
+
     inline fn ignoredAfterGoAway(self: Manager, stream_id: u31) bool {
         if (self.local_goaway_last_stream_id == no_goaway or !self.remoteInitiated(stream_id)) return false;
         return stream_id > self.local_goaway_last_stream_id;
@@ -632,10 +692,7 @@ pub const Manager = struct {
     pub fn receiveData(self: *Manager, store: anytype, stream_id: u31, payload_length: u32, end_stream: bool) ReceiveResult {
         if (stream_id == 0) return .connection_protocol;
         if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
-        const tracked = store.get(stream_id) orelse {
-            if (self.absentClosed(stream_id)) return .stream_closed;
-            return .connection_protocol;
-        };
+        const tracked = store.get(stream_id) orelse return self.receiveAbsent(.data, stream_id);
         return self.receiveDataTracked(stream_id, tracked, payload_length, end_stream);
     }
 
@@ -655,10 +712,7 @@ pub const Manager = struct {
     pub fn receiveReset(self: *Manager, store: anytype, stream_id: u31) ReceiveResult {
         if (stream_id == 0) return .connection_protocol;
         if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
-        const tracked = store.get(stream_id) orelse {
-            if (self.absentClosed(stream_id)) return .accepted;
-            return .connection_protocol;
-        };
+        const tracked = store.get(stream_id) orelse return self.receiveAbsent(.reset, stream_id);
         return self.receiveResetTracked(stream_id, tracked);
     }
 
@@ -675,10 +729,7 @@ pub const Manager = struct {
         if (stream_id == 0) return .connection_protocol;
         if (increment == 0) return .stream_protocol;
         if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
-        const tracked = store.get(stream_id) orelse {
-            if (self.absentClosed(stream_id)) return .accepted;
-            return .connection_protocol;
-        };
+        const tracked = store.get(stream_id) orelse return self.receiveAbsent(.window_update, stream_id);
         return self.receiveWindowUpdateTracked(peer, stream_id, tracked, increment);
     }
 
@@ -1034,4 +1085,26 @@ test "zero window update remains an error on a closed stream" {
     try manager.localHeaders(&store, &peer, 1, true);
     try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
     try std.testing.expectEqual(ReceiveResult.stream_protocol, manager.receiveWindowUpdate(&store, &peer, 1, 0));
+}
+
+test "missing stream classification is reusable without store lookup" {
+    var manager = Manager.init(.client, .{});
+    manager.highest_local_bits = 5;
+    try std.testing.expectEqual(ReceiveResult.stream_closed, manager.receiveAbsent(.data, 3));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveAbsent(.reset, 3));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveAbsent(.window_update, 3));
+    try std.testing.expectEqual(ReceiveResult.connection_protocol, manager.receiveAbsent(.data, 7));
+}
+
+test "detached DATA offer commits without PeerState on shard" {
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(DataSendOffer));
+    var tracked = Tracked.init(65_535);
+    try tracked.stream.localHeaders(false);
+    try tracked.stream.remoteHeaders(true);
+    const detached: Detached = .{ .stream_id = 1, .tracked = &tracked };
+    const offer = try detached.dataSendOffer(65_535);
+    try std.testing.expectEqual(@as(u31, 65_535), offer.max_payload);
+    const effect = offer.commit(detached, 1024, true);
+    try std.testing.expectEqual(StreamEffect.Activity.deactivated, effect.activity);
+    try std.testing.expectEqual(@as(u31, 64_511), tracked.windows.send.available(65_535));
 }

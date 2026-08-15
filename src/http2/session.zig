@@ -2,6 +2,7 @@ const std = @import("std");
 const hpack = @import("hpack");
 const common = @import("../common.zig");
 const connection = @import("connection.zig");
+const dispatch = @import("dispatch.zig");
 const fields = @import("fields.zig");
 const frame = @import("frame.zig");
 const flow = @import("flow.zig");
@@ -34,23 +35,7 @@ pub const PushPromise = struct {
     field_count: u32,
 };
 
-pub const Data = struct {
-    stream_id: u31,
-    end_stream: bool,
-    // DATA frame length is 24-bit on the wire. Keeping the charge in the three
-    // bytes that were previously padding preserves Data=24 B / Event=32 B.
-    _flow_charge: [3]u8,
-    bytes: []const u8,
-
-    /// Complete DATA frame payload length charged to HTTP/2 flow control. This
-    /// can exceed `bytes.len` when padding is present and is the amount callers
-    /// should release back to receive-credit accounting.
-    pub inline fn flowControlledBytes(self: Data) u32 {
-        return (@as(u32, self._flow_charge[0]) << 16) |
-            (@as(u32, self._flow_charge[1]) << 8) |
-            @as(u32, self._flow_charge[2]);
-    }
-};
+pub const Data = dispatch.Data;
 
 pub const SettingsTicket = u32;
 
@@ -828,7 +813,21 @@ pub const Session = struct {
             .protocol => return .{ .fault = .{ .connection = .protocol_error } },
             .flow_control => return .{ .fault = .{ .connection = .flow_control_error } },
         }
+        return self.receiveCompleteAssumeConnectionChecked(store, complete, scratch, sink);
+    }
 
+    /// Processes a frame after the caller has already committed
+    /// `connection.State.check()` for this exact wire position. This is the
+    /// composed counterpart to `http2.dispatch.prepare()`: ordered frames can
+    /// stay on Session while DATA/RST_STREAM/stream WINDOW_UPDATE are routed to
+    /// detached stream owners without observing connection state twice.
+    pub inline fn receiveCompleteAssumeConnectionChecked(
+        self: *Session,
+        store: anytype,
+        complete: frame.CompleteFrame,
+        scratch: []u8,
+        sink: anytype,
+    ) (hpack.codec.Error || error{HeaderBlockTooLarge})!Event {
         return switch (complete.header.type) {
             .data => self.receiveData(store, complete),
             .headers => try self.receiveHeaders(store, complete, scratch, sink),
@@ -2037,4 +2036,54 @@ test "graceful GOAWAY helper is server-only and owns no timing policy" {
     try std.testing.expectError(error.Protocol, drain.announce(&session, &wire, ""));
     try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
     try std.testing.expectEqual(GracefulGoAway.Phase.open, drain.phase);
+}
+
+test "session reports zero stream WINDOW_UPDATE as stream protocol error" {
+    var decoder = hpack.Decoder.init(std.testing.allocator, 4096);
+    defer decoder.deinit();
+    var encoder = hpack.Encoder.init(std.testing.allocator, 4096);
+    defer encoder.deinit();
+    var continuation_storage: [256]u8 = undefined;
+    var session = Session.init(.client, .{}, &decoder, &encoder, &continuation_storage);
+    var store: TestStore = .{};
+
+    var tracked = stream_mod.Tracked.init(65_535);
+    try tracked.stream.localHeaders(false);
+    _ = store.insert(1, tracked).?;
+    session.streams.local_active = 1;
+
+    const zero = [_]u8{ 0, 0, 0, 0 };
+    const complete: frame.CompleteFrame = .{
+        .header = .{ .length = 4, .type = .window_update, .flags = 0, .stream_id = 1 },
+        .payload = &zero,
+    };
+    const event = try session.receiveComplete(&store, complete, &.{}, &NullSink{});
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, event.fault.stream.code);
+    try std.testing.expectEqual(@as(u31, 1), event.fault.stream.stream_id);
+}
+
+test "prechecked Session path does not double-charge connection DATA window" {
+    var decoder = hpack.Decoder.init(std.testing.allocator, 4096);
+    defer decoder.deinit();
+    var encoder = hpack.Encoder.init(std.testing.allocator, 4096);
+    defer encoder.deinit();
+    var continuation_storage: [256]u8 = undefined;
+    var session = Session.init(.client, .{}, &decoder, &encoder, &continuation_storage);
+    var store: TestStore = .{};
+
+    var tracked = stream_mod.Tracked.init(65_535);
+    try tracked.stream.localHeaders(true);
+    try tracked.stream.remoteHeaders(false);
+    _ = store.insert(1, tracked).?;
+    session.streams.local_active = 1;
+
+    const complete: frame.CompleteFrame = .{
+        .header = .{ .length = 3, .type = .data, .flags = 1, .stream_id = 1 },
+        .payload = "abc",
+    };
+    try std.testing.expectEqual(connection.Violation.none, session.connection.check(complete.header));
+    try std.testing.expectEqual(@as(u31, 65_532), session.connection.receive_window.available());
+    const event = try session.receiveCompleteAssumeConnectionChecked(&store, complete, &.{}, &NullSink{});
+    try std.testing.expectEqualStrings("abc", event.data.bytes);
+    try std.testing.expectEqual(@as(u31, 65_532), session.connection.receive_window.available());
 }

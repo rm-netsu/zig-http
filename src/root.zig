@@ -41,5 +41,7 @@ test {
     _ = http2.session.Session;
     _ = http2.session.Event;
     _ = http2.session.GracefulGoAway;
+    _ = http2.dispatch.Prepared;
+    _ = http2.dispatch.StreamWork;
     _ = http2.send.HeaderFramer;
 }

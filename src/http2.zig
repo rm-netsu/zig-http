@@ -14,6 +14,7 @@ pub const peer = @import("http2/peer.zig");
 pub const session = @import("http2/session.zig");
 pub const send = @import("http2/send.zig");
 pub const scheduler = @import("http2/scheduler.zig");
+pub const dispatch = @import("http2/dispatch.zig");
 pub const hpack = @import("hpack");
 
 pub const FrameHeader = frame.FrameHeader;
@@ -33,6 +34,8 @@ pub const DetachedStreamResult = streams.DetachedResult;
 pub const StreamEffect = streams.StreamEffect;
 pub const StreamLocalError = streams.StreamLocalError;
 pub const StreamReceiveResult = streams.ReceiveResult;
+pub const StreamAbsentFrame = streams.AbsentFrame;
+pub const StreamDataSendOffer = streams.DataSendOffer;
 pub const ConnectionViolation = connection.Violation;
 pub const PeerState = peer.State;
 pub const Role = peer.Role;
@@ -49,5 +52,8 @@ pub const GracefulGoAway = session.GracefulGoAway;
 pub const DataScheduler = scheduler.RoundRobin;
 pub const DataSchedulerCandidate = scheduler.Candidate;
 pub const DataSchedulerDecision = scheduler.Decision;
+pub const DispatchPrepared = dispatch.Prepared;
+pub const DispatchStreamWork = dispatch.StreamWork;
+pub const DispatchDataSendGrant = dispatch.DataSendGrant;
 
 pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

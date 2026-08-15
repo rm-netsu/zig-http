@@ -121,11 +121,14 @@ pub const State = struct {
     pub fn windowUpdate(self: *State, header: frame.FrameHeader, bytes: []const u8) error{ FrameSize, Protocol, FlowControl }!?StreamWindowUpdate {
         if (header.type != .window_update) return error.Protocol;
         if (bytes.len != header.length) return error.FrameSize;
-        const increment = try payload.windowIncrement(bytes);
+        const increment = try payload.windowIncrementValue(bytes);
         if (header.stream_id == 0) {
+            if (increment == 0) return error.Protocol;
             try self.send_window.update(increment);
             return null;
         }
+        // Zero is returned to the stream layer because RFC 9113 classifies it
+        // as a stream PROTOCOL_ERROR rather than a connection error.
         return .{ .stream_id = header.stream_id, .increment = increment };
     }
 
@@ -261,4 +264,20 @@ test "outbound peer constraints cover frame size push and DATA credit" {
 
     var client = State.init(.client);
     try std.testing.expectError(error.Protocol, client.sendHeader(.{ .length = 4, .type = .push_promise, .flags = 4, .stream_id = 1 }));
+}
+
+test "stream WINDOW_UPDATE zero is returned for stream-level classification" {
+    var peer = State.init(.server);
+    const bytes = [_]u8{ 0, 0, 0, 0 };
+    const header: frame.FrameHeader = .{ .length = 4, .type = .window_update, .flags = 0, .stream_id = 3 };
+    const update = (try peer.windowUpdate(header, &bytes)).?;
+    try std.testing.expectEqual(@as(u31, 3), update.stream_id);
+    try std.testing.expectEqual(@as(u31, 0), update.increment);
+}
+
+test "connection WINDOW_UPDATE zero remains connection protocol error" {
+    var peer = State.init(.server);
+    const bytes = [_]u8{ 0, 0, 0, 0 };
+    const header: frame.FrameHeader = .{ .length = 4, .type = .window_update, .flags = 0, .stream_id = 0 };
+    try std.testing.expectError(error.Protocol, peer.windowUpdate(header, &bytes));
 }
