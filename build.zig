@@ -47,4 +47,29 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_real_bench.addArgs(args);
     const real_bench_step = b.step("bench-real", "Run real-world HTTP protocol benchmarks");
     real_bench_step.dependOn(&run_real_bench.step);
+
+    const frame_real_step = b.step("bench-real-frames", "Run isolated real-world HTTP/2 frame benchmarks");
+    const frame_cases = [_][]const u8{
+        "raw_complete",
+        "connection_complete",
+        "raw_fragmented",
+        "connection_fragmented",
+    };
+    var previous_frame_run: ?*std.Build.Step = null;
+    for (frame_cases) |case| {
+        const source = b.fmt("bench/frame_real_{s}.zig", .{case});
+        const frame_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = b.fmt("http-frame-real-{s}", .{case}), .root_module = frame_mod });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        if (previous_frame_run) |previous| run.step.dependOn(previous);
+        previous_frame_run = &run.step;
+    }
+    frame_real_step.dependOn(previous_frame_run.?);
 }

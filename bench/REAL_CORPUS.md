@@ -71,3 +71,19 @@ The HTTP/2 complete-frame trace is measured twice over the exact same bytes:
 once with a direct `parseCompleteFrame` loop and once with
 `CompleteFrameIterator`. This prevents iterator-specific optimizations from being
 credited unless they beat the simpler complete-frame API on the real trace.
+
+
+## Isolated HTTP/2 frame projection
+
+`zig build bench-real-frames -Doptimize=ReleaseFast` snapshots the 41 HTTP/2
+HEADERS/DATA frame lengths, flags, stream identifiers, and the eight connection
+boundaries produced by this corpus with hpack 0.4.1. Payload bytes are replaced
+with deterministic noise because the isolated benchmark measures frame and
+connection-state overhead rather than HPACK or application-body processing.
+
+The four measured cases (raw/connection state x complete/fragmented) are compiled
+as separate executables. This is intentional: Zig 0.16 aggressively inlines the
+small frame decoder, and placing unrelated benchmark cases in one executable was
+observed to change instruction layout enough to move measured throughput despite
+identical library source. Separate executables make A/B decisions substantially
+more stable.
