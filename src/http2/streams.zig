@@ -54,6 +54,190 @@ pub const LocalError = error{
     GoAway,
 };
 
+pub const StreamLocalError = error{ Protocol, StreamClosed, FlowControl };
+
+/// Compact connection-level bookkeeping produced by stream-local operations.
+/// A detached worker can mutate only its caller-owned `Tracked` record and
+/// return this value to the ordered connection owner. No locking, atomics, or
+/// queueing policy is implied by core.
+pub const StreamEffect = packed struct(u8) {
+    activity: Activity = .none,
+    positive_send_adjustment: bool = false,
+    _reserved: u5 = 0,
+
+    pub const Activity = enum(u2) { none, activated, deactivated };
+
+    pub inline fn empty(self: StreamEffect) bool {
+        return self.activity == .none and !self.positive_send_adjustment;
+    }
+
+    /// Activity changes affect SETTINGS_MAX_CONCURRENT_STREAMS enforcement and
+    /// should be committed before the connection owner makes a decision that
+    /// requires an exact active-stream count. Delaying a deactivation is safe
+    /// but can conservatively refuse otherwise admissible new work.
+    pub inline fn ordersConcurrency(self: StreamEffect) bool {
+        return self.activity != .none;
+    }
+
+    /// Positive send-window effects participate in validation of later
+    /// SETTINGS_INITIAL_WINDOW_SIZE increases and therefore must reach the
+    /// ordered connection owner before such a SETTINGS transition is applied.
+    pub inline fn ordersSettings(self: StreamEffect) bool {
+        return self.positive_send_adjustment;
+    }
+};
+
+pub const DetachedResult = struct {
+    result: ReceiveResult,
+    effect: StreamEffect = .{},
+};
+
+/// Stream-local cursor that deliberately has no pointer to `Manager`. This is
+/// the low-level path for sharded stores: a worker can process common existing-
+/// stream frames against its own stable record, then hand the tiny `StreamEffect`
+/// back to the connection owner for aggregate accounting.
+///
+/// The caller must already have resolved HTTP/2 routing invariants that depend
+/// on Manager (stream-id validity, GOAWAY cutoff, missing-record semantics).
+/// Lookup-based `Manager` methods remain the fully routed convenience path; an
+/// `Existing` cursor keeps aggregate Manager commits fused to a stable record.
+pub const Detached = struct {
+    stream_id: u31,
+    tracked: *Tracked,
+
+    /// Probes only stream-local DATA credit/state. The connection owner can
+    /// combine this with connection credit and SETTINGS_MAX_FRAME_SIZE without
+    /// sharing `Manager` or the whole `PeerState` with this worker.
+    pub inline fn dataSendCredit(self: Detached, peer_initial_window: u31) StreamLocalError!u31 {
+        return dataSendCreditDetached(self.tracked, peer_initial_window);
+    }
+
+    /// Checked stream-local DATA transition. Prefer `localDataAssumeCredit`
+    /// after a successful wire write when the same credit was already probed.
+    pub inline fn localData(self: Detached, peer_initial_window: u31, payload_length: u32, end_stream: bool) StreamLocalError!StreamEffect {
+        return localDataDetached(self.tracked, peer_initial_window, payload_length, end_stream);
+    }
+
+    /// Commit half of a two-phase send: caller first probes stream/connection
+    /// credit, writes DATA, then commits the stream-local state only after the
+    /// writer succeeds. Returned aggregate bookkeeping can be handed back to
+    /// the connection owner separately.
+    pub inline fn localDataAssumeCredit(self: Detached, peer_initial_window: u31, payload_length: u32, end_stream: bool) StreamEffect {
+        return localDataDetachedAssumeCredit(self.tracked, peer_initial_window, payload_length, end_stream);
+    }
+
+    pub inline fn localReset(self: Detached) error{Protocol}!StreamEffect {
+        return localResetDetached(self.tracked);
+    }
+
+    pub inline fn receiveData(self: Detached, payload_length: u32, end_stream: bool) DetachedResult {
+        return receiveDataDetached(self.tracked, payload_length, end_stream);
+    }
+
+    pub inline fn receiveReset(self: Detached) DetachedResult {
+        return receiveResetDetached(self.tracked);
+    }
+
+    /// `peer_initial_window` must be the SETTINGS value ordered before this
+    /// WINDOW_UPDATE frame. Passing it explicitly makes the dependency visible
+    /// without sharing the entire connection/PeerState with the stream worker.
+    pub inline fn receiveWindowUpdate(self: Detached, peer_initial_window: u31, increment: u31) DetachedResult {
+        return receiveWindowUpdateDetached(self.tracked, peer_initial_window, increment);
+    }
+};
+
+inline fn streamEffect(before: State, after: State) StreamEffect {
+    const was_active = Manager.isActive(before);
+    const now_active = Manager.isActive(after);
+    return .{ .activity = if (was_active == now_active)
+        .none
+    else if (now_active)
+        .activated
+    else
+        .deactivated };
+}
+
+inline fn dataSendCreditDetached(tracked: *const Tracked, peer_initial_window: u31) StreamLocalError!u31 {
+    switch (tracked.stream.state) {
+        .open, .half_closed_remote => {},
+        .half_closed_local, .closed => return error.StreamClosed,
+        else => return error.Protocol,
+    }
+    return tracked.windows.send.available(peer_initial_window);
+}
+
+inline fn localDataDetached(
+    tracked: *Tracked,
+    peer_initial_window: u31,
+    payload_length: u32,
+    end_stream: bool,
+) StreamLocalError!StreamEffect {
+    switch (tracked.stream.state) {
+        .open, .half_closed_remote => {},
+        .half_closed_local, .closed => return error.StreamClosed,
+        else => return error.Protocol,
+    }
+    tracked.windows.consumeSend(peer_initial_window, payload_length) catch return error.FlowControl;
+    const before = tracked.stream.state;
+    tracked.stream.localData(end_stream) catch unreachable;
+    return streamEffect(before, tracked.stream.state);
+}
+
+inline fn localDataDetachedAssumeCredit(
+    tracked: *Tracked,
+    peer_initial_window: u31,
+    payload_length: u32,
+    end_stream: bool,
+) StreamEffect {
+    std.debug.assert(tracked.stream.state == .open or tracked.stream.state == .half_closed_remote);
+    std.debug.assert(tracked.windows.send.available(peer_initial_window) >= payload_length);
+    tracked.windows.consumeSendAssumeAvailable(payload_length);
+    const before = tracked.stream.state;
+    tracked.stream.localData(end_stream) catch unreachable;
+    return streamEffect(before, tracked.stream.state);
+}
+
+inline fn localResetDetached(tracked: *Tracked) error{Protocol}!StreamEffect {
+    const before = tracked.stream.state;
+    tracked.stream.reset() catch return error.Protocol;
+    return streamEffect(before, tracked.stream.state);
+}
+
+inline fn receiveDataDetached(tracked: *Tracked, payload_length: u32, end_stream: bool) DetachedResult {
+    switch (tracked.stream.state) {
+        .open, .half_closed_local => {},
+        .half_closed_remote, .closed => return .{ .result = .stream_closed },
+        else => return .{ .result = .connection_protocol },
+    }
+    tracked.windows.receiveData(payload_length) catch return .{ .result = .stream_flow_control };
+    const before = tracked.stream.state;
+    tracked.stream.remoteData(end_stream) catch unreachable;
+    return .{ .result = .accepted, .effect = streamEffect(before, tracked.stream.state) };
+}
+
+inline fn receiveResetDetached(tracked: *Tracked) DetachedResult {
+    const before = tracked.stream.state;
+    tracked.stream.reset() catch return .{ .result = .connection_protocol };
+    return .{ .result = .accepted, .effect = streamEffect(before, tracked.stream.state) };
+}
+
+inline fn receiveWindowUpdateDetached(tracked: *Tracked, peer_initial_window: u31, increment: u31) DetachedResult {
+    if (increment == 0) return .{ .result = .stream_protocol };
+    switch (tracked.stream.state) {
+        .reserved_remote => return .{ .result = .connection_protocol },
+        .closed => return .{ .result = .accepted },
+        .idle => return .{ .result = .connection_protocol },
+        else => {},
+    }
+    tracked.windows.peerWindowUpdate(peer_initial_window, increment) catch
+        return .{ .result = .stream_flow_control };
+    return .{
+        .result = .accepted,
+        .effect = .{ .positive_send_adjustment = (tracked.stream.state == .open or tracked.stream.state == .half_closed_remote) and
+            tracked.windows.send.adjustment > 0 },
+    };
+}
+
 /// Short-lived zero-allocation cursor for callers that already have a stable
 /// pointer from their stream store. The pointer remains owned by the caller and
 /// must not outlive any store operation that can move or remove the record.
@@ -61,6 +245,12 @@ pub const Existing = struct {
     manager: *Manager,
     stream_id: u31,
     tracked: *Tracked,
+
+    /// Drops the Manager reference for stream-local work. Effects returned by
+    /// the detached cursor can later be committed with `Manager.commitStreamEffect`.
+    pub inline fn detached(self: Existing) Detached {
+        return .{ .stream_id = self.stream_id, .tracked = self.tracked };
+    }
 
     pub inline fn receiveHeaders(self: Existing, end_stream: bool) ReceiveResult {
         return self.manager.receiveHeadersTracked(self.stream_id, self.tracked, end_stream);
@@ -242,6 +432,24 @@ pub const Manager = struct {
 
     inline fn isActive(state: State) bool {
         return state == .open or state == .half_closed_local or state == .half_closed_remote;
+    }
+
+    /// Applies aggregate bookkeeping returned by a detached stream-local
+    /// operation. Effects are tiny values, so runtimes can return them through
+    /// their existing handoff mechanism without exposing stream storage to the
+    /// connection owner.
+    pub inline fn commitStreamEffect(self: *Manager, stream_id: u31, effect: StreamEffect) void {
+        std.debug.assert(stream_id != 0);
+        const counter = if (self.localInitiated(stream_id)) &self.local_active else &self.remote_active;
+        switch (effect.activity) {
+            .none => {},
+            .activated => counter.* += 1,
+            .deactivated => {
+                std.debug.assert(counter.* != 0);
+                counter.* -= 1;
+            },
+        }
+        if (effect.positive_send_adjustment) self.notePositiveSendAdjustment();
     }
 
     fn adjustActive(self: *Manager, stream_id: u31, before: State, after: State) void {
@@ -519,6 +727,79 @@ pub const Manager = struct {
     }
 };
 
+test "detached send probe and commit keep Manager separate" {
+    var manager = Manager.init(.client, .{});
+    var tracked = Tracked.init(65_535);
+    try tracked.stream.localHeaders(false);
+    try tracked.stream.remoteHeaders(true);
+    manager.local_active = 1;
+    const detached: Detached = .{ .stream_id = 1, .tracked = &tracked };
+
+    try std.testing.expectEqual(@as(u31, 65_535), try detached.dataSendCredit(65_535));
+    const effect = detached.localDataAssumeCredit(65_535, 100, true);
+    try std.testing.expectEqual(StreamEffect.Activity.deactivated, effect.activity);
+    try std.testing.expectEqual(@as(u31, 65_435), tracked.windows.send.available(65_535));
+    try std.testing.expectEqual(@as(u32, 1), manager.local_active);
+    manager.commitStreamEffect(1, effect);
+    try std.testing.expectEqual(@as(u32, 0), manager.local_active);
+}
+
+test "detached checked local DATA reports flow control" {
+    var tracked = Tracked.init(65_535);
+    try tracked.stream.localHeaders(false);
+    const detached: Detached = .{ .stream_id = 1, .tracked = &tracked };
+    try tracked.windows.consumeSend(65_535, 65_535);
+    try std.testing.expectError(error.FlowControl, detached.localData(65_535, 1, false));
+    try std.testing.expectEqual(State.open, tracked.stream.state);
+}
+
+test "detached DATA returns aggregate deactivation effect" {
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(StreamEffect));
+    var manager = Manager.init(.client, .{});
+    var tracked = Tracked.init(65_535);
+    try tracked.stream.localHeaders(true);
+    try tracked.stream.remoteHeaders(false);
+    manager.local_active = 1;
+
+    const detached: Detached = .{ .stream_id = 1, .tracked = &tracked };
+    const first = detached.receiveData(10, false);
+    try std.testing.expectEqual(ReceiveResult.accepted, first.result);
+    try std.testing.expect(first.effect.empty());
+    try std.testing.expectEqual(@as(u32, 1), manager.local_active);
+
+    const last = detached.receiveData(10, true);
+    try std.testing.expectEqual(ReceiveResult.accepted, last.result);
+    try std.testing.expectEqual(StreamEffect.Activity.deactivated, last.effect.activity);
+    try std.testing.expectEqual(@as(u32, 1), manager.local_active);
+    manager.commitStreamEffect(1, last.effect);
+    try std.testing.expectEqual(@as(u32, 0), manager.local_active);
+}
+
+test "detached WINDOW_UPDATE exposes SETTINGS ordering effect" {
+    var tracked = Tracked.init(65_535);
+    try tracked.stream.localHeaders(false);
+    const detached: Detached = .{ .stream_id = 1, .tracked = &tracked };
+    const update = detached.receiveWindowUpdate(65_535, 70_000);
+    try std.testing.expectEqual(ReceiveResult.accepted, update.result);
+    try std.testing.expect(update.effect.positive_send_adjustment);
+    try std.testing.expect(update.effect.ordersSettings());
+
+    var manager = Manager.init(.client, .{});
+    manager.local_active = 1;
+    manager.commitStreamEffect(1, update.effect);
+    try std.testing.expect(manager.positiveSendAdjustmentSeen());
+}
+
+test "fused tracked receive path commits detached effects" {
+    var manager = Manager.init(.client, .{});
+    var tracked = Tracked.init(65_535);
+    try tracked.stream.localHeaders(true);
+    try tracked.stream.remoteHeaders(false);
+    manager.local_active = 1;
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveDataTracked(1, &tracked, 1, true));
+    try std.testing.expectEqual(@as(u32, 0), manager.local_active);
+}
+
 const TestStore = struct {
     const Entry = struct {
         id: u31 = 0,
@@ -699,8 +980,10 @@ test "zero-length local DATA can end a stream with negative send window" {
     try std.testing.expectEqual(State.half_closed_local, store.get(1).?.stream.state);
 }
 
-test "stream manager remains compact" {
+test "stream manager and detached effects remain compact" {
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Manager));
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(StreamEffect));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Detached));
 }
 
 test "peer initial window increase detects active stream overflow exactly" {

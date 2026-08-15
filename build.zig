@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     frame_real_step.dependOn(previous_frame_run.?);
 
     const stream_real_step = b.step("bench-real-streams", "Run isolated real-world HTTP/2 stream lifecycle benchmarks");
-    const stream_cases = [_][]const u8{ "raw", "managed", "raw_tracked", "managed_tracked", "raw_multiplex", "managed_multiplex" };
+    const stream_cases = [_][]const u8{ "raw", "managed", "raw_tracked", "managed_tracked", "detached_tracked", "raw_multiplex", "managed_multiplex" };
     var previous_stream_run: ?*std.Build.Step = null;
     for (stream_cases) |case| {
         const source = b.fmt("bench/stream_real_{s}.zig", .{case});
