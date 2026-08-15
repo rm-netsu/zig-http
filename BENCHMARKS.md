@@ -10,6 +10,31 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.12.0 receive-credit and drain checks
+
+The receive-credit work was checked specifically for event-layout regressions.
+A first implementation stored the full DATA flow charge as a new `u32`, which
+increased `session.Data` from 24 B to 32 B and the `Event` union from 32 B to
+40 B; the managed receive Session then measured about 1% below the adjacent
+0.11.0 runs. That version was discarded. The final implementation stores the
+24-bit HTTP/2 DATA frame length in the three bytes that were already structure
+padding, keeping `Data=24 B`, `Event=32 B`, `Session=128 B`, and
+`stream.Tracked=12 B`. `ReceiveCredit` itself is caller-owned and 12 B.
+
+Three alternating 50k-transaction ReleaseFast runs of the tagged 0.11.0
+baseline and the compact 0.12.0 tree produced managed receive medians of about
+**0.657 M tx/s** and **0.673 M tx/s**, respectively. Manual-composition medians
+were about **0.708 M tx/s** and **0.696 M tx/s**; the movement in both directions
+is treated as normal code-layout/host variance rather than an optimization
+claim. A separate current send-session run remained in the established range at
+**1.027 M tx/s manual**, **0.988 M tx/s lookup Session**, and **1.036 M tx/s
+stable-cursor Session**, all with the unchanged **13,835.6 B/tx**.
+
+Receive-credit proposal/commit and graceful GOAWAY are control-plane operations,
+so no synthetic operations-per-second claim is attached to them; correctness,
+transactional state mutation, and unchanged existing hot-path layout are the
+regression criteria.
+
 ## 0.11.0 outbound control-plane and scheduler checks
 
 The 0.11.0 work completes the high-level outbound control plane with

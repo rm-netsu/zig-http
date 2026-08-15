@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0
+
+- Define the library boundary explicitly: HTTP-only state, scheduling, flow-control, and shutdown orchestration stay in the `http1`/`http2` core; sockets, TLS, timers, event loops, thread pools, and cross-subsystem queues belong only in optional higher-level wrappers.
+- Add a 12-byte caller-owned `http2.ReceiveCredit` low-watermark policy with two-phase proposal/commit semantics so freed receive capacity is never lost when WINDOW_UPDATE serialization fails.
+- Add `Session.replenishConnectionReceive()`, `replenishStreamReceive()`, and stable-cursor replenishment without growing the 128-byte Session or 12-byte `stream.Tracked`.
+- Expose the complete 24-bit flow-controlled DATA payload charge through `Data.flowControlledBytes()`, including padding, while packing it into existing event padding so `Data` remains 24 bytes and `Event` remains 32 bytes.
+- Add caller-owned `GracefulGoAway` for the RFC 9113 two-phase server shutdown sequence; timing and the final application-processed stream cutoff remain explicit caller decisions.
+- Re-run isolated receive/send Session benchmarks against 0.11.0 after the layout-sensitive additions; compact DATA accounting avoids the regression seen with an initially tested 32-byte Data event and keeps both hot paths in their established range.
+
 ## 0.11.0
 
 - Add streaming outbound HTTP/2 `PUSH_PROMISE` support to Session, including bounded first-frame prefix handling, CONTINUATION framing, server/push-policy preflight, and reserved(local) promised-stream state.

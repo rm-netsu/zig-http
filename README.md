@@ -4,7 +4,8 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 
 ## Design
 
-- Transport-agnostic: sockets, TLS and event loops stay outside the protocol core.
+- Protocol-core boundary: anything whose state and decisions are purely HTTP remains under `http1` / `http2`, including optional HTTP flow-control and scheduling helpers. Sockets, TLS, DNS, timers, event loops, thread pools, and cross-subsystem queues stay outside the core.
+- A future `high_level` layer is reserved for concrete integration wrappers that cross that boundary; the core APIs remain usable independently and never require those wrappers.
 - Slice-oriented parsers with caller-owned bounded storage.
 - Zero-copy fast paths when a complete HTTP/1 head or HTTP/2 frame is already contiguous in the transport buffer.
 - Small process-wide byte-class tables and SIMD validation trade about 512 bytes of read-only data for faster field parsing without increasing per-connection state.
@@ -348,6 +349,59 @@ This keeps transport receive limits, stream-store policy, and SETTINGS snapshot
 storage outside Session while still giving ACKs an unambiguous FIFO ticket. A
 failed preflight or writer call does not register a ticket.
 
+### Caller-driven receive credit
+
+HTTP/2 receive-window replenishment is also available as a protocol-only helper.
+`ReceiveCredit` owns only a target window, a low watermark, and the number of
+flow-controlled bytes whose receive capacity the caller has released. It never
+assumes when application buffers are reusable. `proposal()` is non-mutating and
+Session commits both the WINDOW_UPDATE and the accumulator only after a
+successful writer call:
+
+```zig
+var connection_credit = try http.http2.ReceiveCredit.init(65_535, 32_767);
+var stream_credit = try http.http2.ReceiveCredit.init(65_535, 32_767);
+
+// After the application has consumed/copied/discarded this DATA event:
+connection_credit.release(data.flowControlledBytes());
+stream_credit.release(data.flowControlledBytes());
+
+_ = try session.replenishConnectionReceive(transport_writer, &connection_credit);
+_ = try session.replenishStreamReceive(
+    &store,
+    transport_writer,
+    data.stream_id,
+    &stream_credit,
+);
+```
+
+For padded DATA, `flowControlledBytes()` intentionally returns the complete DATA
+payload length rather than `data.bytes.len`, because HTTP/2 flow control charges
+pad length and padding as well. Separate caller-owned connection and stream
+accumulators allow different memory/capacity policies without growing `Session`
+or `stream.Tracked`. `ReceiveCredit` is 12 bytes on x86_64.
+
+### Graceful GOAWAY without timer ownership
+
+`GracefulGoAway` implements only the HTTP/2 two-phase server drain. The first
+call sends `GOAWAY(2^31-1, NO_ERROR)`; after a grace interval chosen by the
+caller, `finish()` sends the final non-increasing last-stream-id. The helper does
+not start a timer and deliberately does not infer "processed" from frame receipt,
+because that depends on whether data reached a higher application layer:
+
+```zig
+var drain: http.http2.GracefulGoAway = .{};
+try drain.announce(&session, transport_writer, "maintenance");
+
+// Caller waits according to its own runtime/RTT policy, then supplies the
+// highest peer-initiated stream that might actually have been processed.
+try drain.finish(&session, transport_writer, last_processed_stream_id, "");
+```
+
+If an implementation needs socket shutdown, timer registration, event-loop
+wakeups, or task-queue coordination around these calls, that integration belongs
+above the protocol core rather than in `http2`.
+
 ### Caller-driven DATA scheduler
 
 `DataScheduler` is an optional one-word round-robin selector over a caller-owned
@@ -394,7 +448,7 @@ advanced.
 - `http2/frame.zig` — contiguous, batched, and incremental zero-copy frame parsing plus frame serialization.
 - `http2/connection.zig` — allocation-free connection receive state and complete/fragmented frame integration.
 - `http2/peer.zig` — peer SETTINGS, send-window, outbound constraints, and GOAWAY state.
-- `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS and caller-owned flow/stream state primitives.
+- `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS, caller-owned flow/stream state, and optional receive-credit policy primitives.
 - `http2/streams.zig` — allocation-free stream-ID/concurrency/lifecycle manager over caller-owned storage.
 - `http2/session.zig` — optional 128-byte receive/send session composition with HPACK/field/stream/control dispatch over caller-owned storage.
 - `http2/scheduler.zig` — one-word caller-driven round-robin DATA selector over Session flow credit.
@@ -426,4 +480,4 @@ The package exports module `http`. Benchmark methodology and current results are
 
 ## Scope
 
-This package is the protocol engine rather than a batteries-included HTTP client/server. It intentionally does not own TCP/TLS connections, DNS, thread pools, an event loop, or application routing. Those layers can be built on top without forcing an I/O architecture on users of the parsers.
+This package is the protocol engine rather than a batteries-included HTTP client/server. HTTP-only composition remains part of the core even when it is more convenient than raw wire primitives. The core intentionally does not own TCP/TLS connections, DNS, timers, thread pools, event loops, socket lifetimes, or application routing/work queues. Concrete adapters that coordinate those external layers belong in an optional `high_level` namespace/package and must remain wrappers over independently usable core APIs.
