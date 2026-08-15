@@ -141,6 +141,18 @@ pub fn build(b: *std.Build) void {
     }
     scheduler_step.dependOn(previous_scheduler_run.?);
 
+    const settings_mod = b.createModule(.{
+        .root_source_file = b.path("bench/settings_real.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "http", .module = mod }},
+    });
+    const settings_exe = b.addExecutable(.{ .name = "http-settings-real", .root_module = settings_mod });
+    const run_settings = b.addRunArtifact(settings_exe);
+    run_settings.stdio = .inherit;
+    const settings_step = b.step("bench-real-settings", "Run HTTP/2 SETTINGS stream-window scalability benchmark");
+    settings_step.dependOn(&run_settings.step);
+
     const send_session_step = b.step("bench-real-send-session", "Run isolated real-world HTTP/2 send-session benchmarks");
     const send_session_cases = [_][]const u8{ "manual", "managed", "managed_tracked" };
     var previous_send_session_run: ?*std.Build.Step = null;
