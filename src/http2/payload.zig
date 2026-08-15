@@ -66,10 +66,10 @@ pub fn pushPromise(header: frame.FrameHeader, payload: []const u8) error{ FrameS
     return .{ .promised_stream_id = promised, .fragment = payload[start .. payload.len - pad] };
 }
 
-pub fn windowIncrement(payload: []const u8) error{ FrameSize, FlowControl }!u31 {
+pub fn windowIncrement(payload: []const u8) error{ FrameSize, Protocol }!u31 {
     if (payload.len != 4) return error.FrameSize;
     const value: u31 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
-    if (value == 0) return error.FlowControl;
+    if (value == 0) return error.Protocol;
     return value;
 }
 
@@ -93,4 +93,9 @@ test "strip padded data" {
     const h: frame.FrameHeader = .{ .length = 6, .type = .data, .flags = 0x08, .stream_id = 1 };
     const payload = [_]u8{ 2, 'a', 'b', 'c', 0, 0 };
     try std.testing.expectEqualStrings("abc", try data(h, &payload));
+}
+
+test "window update rejects zero increment" {
+    const bytes = [_]u8{ 0, 0, 0, 0 };
+    try std.testing.expectError(error.Protocol, windowIncrement(&bytes));
 }
