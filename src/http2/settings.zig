@@ -13,6 +13,13 @@ pub const Id = enum(u16) {
 
 pub const Setting = struct { id: Id, value: u32 };
 
+pub inline fn parse(bytes: *const [6]u8) Setting {
+    return .{
+        .id = @enumFromInt(std.mem.readInt(u16, bytes[0..2], .big)),
+        .value = std.mem.readInt(u32, bytes[2..6], .big),
+    };
+}
+
 pub const Iterator = struct {
     payload: []const u8,
     offset: usize = 0,
@@ -24,12 +31,45 @@ pub const Iterator = struct {
 
     pub fn next(self: *Iterator) ?Setting {
         if (self.offset == self.payload.len) return null;
-        const p = self.payload[self.offset..][0..6];
+        const p: *const [6]u8 = self.payload[self.offset..][0..6];
         self.offset += 6;
-        return .{
-            .id = @enumFromInt(std.mem.readInt(u16, p[0..2], .big)),
-            .value = std.mem.readInt(u32, p[2..6], .big),
-        };
+        return parse(p);
+    }
+};
+
+/// Incremental SETTINGS payload decoder. It emits one six-byte setting at a
+/// time and copies only a setting that itself crosses a transport boundary.
+pub const StreamDecoder = struct {
+    scratch: [6]u8 = undefined,
+    used: u3 = 0,
+
+    pub const Result = struct {
+        consumed: usize,
+        setting: ?Setting = null,
+    };
+
+    pub fn reset(self: *StreamDecoder) void {
+        self.used = 0;
+    }
+
+    pub inline fn feed(self: *StreamDecoder, input: []const u8) Result {
+        if (self.used == 0 and input.len >= 6) {
+            const p: *const [6]u8 = input[0..6];
+            return .{ .consumed = 6, .setting = parse(p) };
+        }
+        if (input.len == 0) return .{ .consumed = 0 };
+
+        const n = @min(input.len, 6 - @as(usize, self.used));
+        @memcpy(self.scratch[self.used..][0..n], input[0..n]);
+        self.used += @intCast(n);
+        if (self.used != 6) return .{ .consumed = n };
+
+        self.used = 0;
+        return .{ .consumed = n, .setting = parse(&self.scratch) };
+    }
+
+    pub fn finish(self: StreamDecoder) error{FrameSize}!void {
+        if (self.used != 0) return error.FrameSize;
     }
 };
 
@@ -74,4 +114,24 @@ test "settings validation" {
     try s.apply(.{ .id = .max_frame_size, .value = 32768 });
     try std.testing.expectEqual(@as(u32, 32768), s.max_frame_size);
     try std.testing.expectError(error.Protocol, s.apply(.{ .id = .enable_push, .value = 2 }));
+}
+
+test "streaming settings decoder handles split setting" {
+    var bytes: [6]u8 = undefined;
+    encode(&bytes, .{ .id = .max_frame_size, .value = 32768 });
+    var d: StreamDecoder = .{};
+    var r = d.feed(bytes[0..2]);
+    try std.testing.expect(r.setting == null);
+    r = d.feed(bytes[2..5]);
+    try std.testing.expect(r.setting == null);
+    r = d.feed(bytes[5..]);
+    try std.testing.expectEqual(Id.max_frame_size, r.setting.?.id);
+    try std.testing.expectEqual(@as(u32, 32768), r.setting.?.value);
+    try d.finish();
+}
+
+test "streaming settings decoder rejects partial finish" {
+    var d: StreamDecoder = .{};
+    _ = d.feed("abc");
+    try std.testing.expectError(error.FrameSize, d.finish());
 }

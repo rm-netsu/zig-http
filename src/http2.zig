@@ -8,6 +8,8 @@ pub const preface = @import("http2/preface.zig");
 pub const protocol = @import("http2/protocol.zig");
 pub const stream = @import("http2/stream.zig");
 pub const header_block = @import("http2/header_block.zig");
+pub const connection = @import("http2/connection.zig");
+pub const peer = @import("http2/peer.zig");
 pub const hpack = @import("hpack");
 
 pub const FrameHeader = frame.FrameHeader;
@@ -17,5 +19,11 @@ pub const CompleteFrameIterator = frame.CompleteIterator;
 pub const parseCompleteFrame = frame.parseComplete;
 pub const Settings = settings.Settings;
 pub const FlowWindow = flow.FlowWindow;
+pub const ConnectionState = connection.State;
+pub const ConnectionViolation = connection.Violation;
+pub const PeerState = peer.State;
+pub const Role = peer.Role;
+pub const ConnectionDecoder = connection.Decoder;
+pub const ConnectionCompleteIterator = connection.CompleteIterator;
 
 pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

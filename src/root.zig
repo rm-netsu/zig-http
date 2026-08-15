@@ -17,6 +17,7 @@ test {
 
     _ = http2.frame.FrameDecoder;
     _ = http2.settings.Settings;
+    _ = http2.settings.StreamDecoder;
     _ = http2.flow.FlowWindow;
     _ = http2.fields.Validator;
     _ = http2.payload.HeadersPayload;
@@ -24,5 +25,12 @@ test {
     _ = http2.preface.Parser;
     _ = http2.protocol.ErrorCode;
     _ = http2.stream.Stream;
+    _ = http2.stream.Windows;
+    _ = http2.stream.Tracked;
     _ = http2.header_block.Collector;
+    _ = http2.connection.State;
+    _ = http2.connection.Violation;
+    _ = http2.peer.State;
+    _ = http2.connection.Decoder;
+    _ = http2.connection.CompleteIterator;
 }
