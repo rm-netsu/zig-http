@@ -97,4 +97,24 @@ pub fn build(b: *std.Build) void {
         previous_stream_run = &run.step;
     }
     stream_real_step.dependOn(previous_stream_run.?);
+
+    const session_real_step = b.step("bench-real-session", "Run isolated real-world HTTP/2 session composition benchmarks");
+    const session_cases = [_][]const u8{ "manual", "managed" };
+    var previous_session_run: ?*std.Build.Step = null;
+    for (session_cases) |case| {
+        const source = b.fmt("bench/session_real_{s}.zig", .{case});
+        const session_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = b.fmt("http-session-real-{s}", .{case}), .root_module = session_mod });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        if (previous_session_run) |previous| run.step.dependOn(previous);
+        previous_session_run = &run.step;
+    }
+    session_real_step.dependOn(previous_session_run.?);
 }
