@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0
+
+- Add a 128-byte allocation-free `Session` that composes complete-frame receive handling with connection rules, HPACK decoding, HTTP/2 field semantics, caller-owned stream transitions, peer SETTINGS/GOAWAY state, and DATA/window accounting.
+- Add `Session.receiveBytes()` for validated zero-copy parse-and-dispatch from a contiguous transport buffer and `receiveComplete()` for callers that already parsed a complete frame.
+- Track incoming request/response/trailer phase inside existing `stream.Tracked` padding, keeping the per-stream record at 12 bytes while supporting repeated informational responses, final responses, and trailers.
+- Drain semantically malformed field sections through HPACK before returning a stream protocol fault, preserving connection compression state; drain HPACK header-list-limit failures through the supported iterator finish path as well.
+- Apply peer SETTINGS in wire order through the session, including outbound HPACK table limits and caller-store `SETTINGS_INITIAL_WINDOW_SIZE` propagation.
+- Remove the continuation-storage size requirement for single-frame HEADERS/PUSH_PROMISE blocks; caller storage is now required only when CONTINUATION assembly is actually needed.
+- Add isolated `bench-real-session` manual-versus-managed composition cases over real response fields/body sizes; the 128-byte session is about 2.7% below equivalent manual composition in the pinned median.
+
 ## 0.7.0
 
 - Add allocation-free `StreamManager` over caller-owned stream storage, enforcing stream initiator parity, monotonically increasing stream IDs, concurrent-stream limits, stream state transitions, and per-stream flow control.

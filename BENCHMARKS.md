@@ -10,6 +10,51 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.8.0 session-composition results
+
+The optional `Session` layer is measured separately so its generic dispatch does
+not perturb the existing frame/stream executables:
+
+```sh
+zig build bench-real-session -Doptimize=ReleaseFast
+```
+
+Both cases process the same normalized real response field blocks and captured
+response body sizes. HEADERS are HPACK/Huffman encoded before timing; the timed
+path decodes and validates those real values, applies connection and stream
+state, consumes DATA in <=16 KiB chunks, and returns receive credit. Dynamic
+indexing is intentionally disabled for this orchestration benchmark so the same
+wire blocks can be replayed without resetting HPACK connection state; the
+standalone HPACK real-world suite remains the source of truth for dynamic-table
+performance.
+
+The two benchmark cases are separate executables. Seven direct runs pinned to
+CPU 0 produced these medians:
+
+| Session composition | Median throughput | Field decode rate |
+| --- | ---: | ---: |
+| Manual `ConnectionState + Decoder + Validator + StreamManager` | 0.672 M tx/s | 10.616 M fields/s |
+| `Session.receiveComplete()` | 0.654 M tx/s | 10.325 M fields/s |
+
+The high-level layer is therefore about 2.7% below the equivalent manual
+composition on this fixture while also handling CONTINUATION, request/response/
+trailer phase, SETTINGS effects, WINDOW_UPDATE routing, RST_STREAM, GOAWAY, and
+PUSH_PROMISE. The manual primitives remain available for applications that want
+the last few percent or a different dispatch policy.
+
+State sizes on x86_64:
+
+| Type | Size |
+| --- | ---: |
+| `http2.Session` | 128 B per connection |
+| `http2.stream.Tracked` | 12 B per stored stream |
+| caller continuation storage | configurable |
+
+`Tracked` does not grow in 0.8.0: the incoming field-section phase occupies
+previous alignment padding. `header_block.Collector` also no longer requires a
+complete single-frame field block to fit continuation storage; storage capacity
+limits only blocks that actually span CONTINUATION frames.
+
 ## 0.7.0 stream-manager results
 
 The stream layer has its own isolated target because frame-parser measurements

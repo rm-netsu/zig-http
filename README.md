@@ -10,6 +10,7 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - Small process-wide byte-class tables and SIMD validation trade about 512 bytes of read-only data for faster field parsing without increasing per-connection state.
 - Incremental fallbacks preserve streaming operation across arbitrarily fragmented reads.
 - HTTP/2 connection state is split from caller-owned stream storage: connection-wide invariants stay allocation-free while applications choose their own stream slab/hash layout.
+- An optional 128-byte `Session` composes complete-frame parsing, HPACK decode, field semantics, stream transitions, peer SETTINGS/GOAWAY, and flow accounting without owning either HPACK allocators or the stream table.
 - HTTP/1 bodies and HTTP/2 frame payloads are streamed without whole-message buffering.
 - Strict HTTP/1 framing checks reject ambiguous `Transfer-Encoding` / `Content-Length` input.
 - HPACK is provided by the standalone `hpack` package, with explicit memory and decode limits.
@@ -163,6 +164,79 @@ whether its request semantics permit retry.
 sends `SETTINGS_ENABLE_PUSH=0` should switch this flag only after that SETTINGS
 value has been acknowledged.
 
+## HTTP/2 composable session layer
+
+`Session` is the optional high-level receive path for applications that want the
+existing connection, stream, peer, HPACK, and field-validation primitives wired
+together without adopting a networking or allocation model. The session itself
+is 128 bytes on x86_64. It owns no heap memory: HPACK encoder/decoder dynamic
+tables and the continuation buffer remain caller-owned.
+
+```zig
+var decoder = http.http2.hpack.Decoder.init(allocator, 4096);
+defer decoder.deinit();
+var encoder = http.http2.hpack.Encoder.init(allocator, 4096);
+defer encoder.deinit();
+var continuation_storage: [16 * 1024]u8 = undefined;
+
+var session = http.http2.Session.init(
+    .client,
+    .{},
+    &decoder,
+    &encoder,
+    &continuation_storage,
+);
+
+if (try session.receiveBytes(
+    &store,
+    input,
+    http.http2.frame.default_max_frame_size,
+    scratch,
+    &field_sink,
+)) |received| {
+    input = input[received.consumed..];
+    switch (received.event) {
+        .headers => |section| _ = section,
+        .data => |data| _ = data.bytes, // aliases input
+        .fault => |fault| _ = fault,
+        else => {},
+    }
+}
+```
+
+For callers that already parsed a frame, `receiveComplete()` skips the frame
+parser and accepts an already validated `CompleteFrame` directly. Single-frame
+HEADERS/PUSH_PROMISE blocks are decoded zero-copy and no longer need to fit the
+continuation scratch; the scratch storage is touched only when CONTINUATION
+assembly is actually required. Configure `Decoder.max_encoded_block_size` when
+a hard compressed-field-section limit is required; continuation storage is no
+longer that limit for contiguous blocks.
+
+The session tracks request/response/trailer phase inside existing padding in
+`stream.Tracked`, so the record stays 12 bytes. It supports repeated 1xx response
+sections, rejects HTTP/2 status 101, requires `END_STREAM` on trailers, and drains
+a malformed field section through the HPACK decoder before returning a stream
+protocol fault so the connection compression context remains synchronized.
+Once Session is used for a stream, keep inbound field-section transitions on
+that path rather than mixing manual `StreamManager` HEADERS transitions with
+Session on the same stream.
+
+The field sink is synchronous because HPACK field slices may be invalidated by
+the next decoder step. Treat sink callbacks as provisional and commit application
+side effects only after `receiveComplete()` / `receiveBytes()` returns a successful
+`.headers` or `.push_promise` event. HPACK codec failures are returned directly.
+Except for header-list overflow, which Session drains through `Iterator.finish()`,
+callers should treat an undecodable HPACK block as connection-fatal because the
+compression context cannot in general be resumed safely.
+
+A Session store uses the same caller-owned `get`/`insert` contract as
+`StreamManager` and additionally provides
+`applyPeerInitialWindow(change) bool`. That operation applies ordered peer
+`SETTINGS_INITIAL_WINDOW_SIZE` changes to live stream send windows; returning
+false is surfaced as a connection flow-control fault. Received
+`SETTINGS_HEADER_TABLE_SIZE` updates the caller-owned outbound HPACK encoder's
+allowed table size automatically.
+
 ## Modules
 
 - `http1/head.zig` — contiguous and incremental request/response head parsing with body framing.
@@ -173,6 +247,7 @@ value has been acknowledged.
 - `http2/peer.zig` — peer SETTINGS, send-window, outbound constraints, and GOAWAY state.
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS and caller-owned flow/stream state primitives.
 - `http2/streams.zig` — allocation-free stream-ID/concurrency/lifecycle manager over caller-owned storage.
+- `http2/session.zig` — optional 128-byte complete-frame session composition with HPACK/field/stream/control dispatch over caller-owned storage.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
 - `hpack` 0.4.1 dependency — standalone RFC 7541 codec with real-world-benchmarked encoder lookup and short-literal Huffman fast paths plus bounded decoding.
@@ -191,6 +266,7 @@ zig build bench -Doptimize=ReleaseFast
 zig build bench-real -Doptimize=ReleaseFast
 zig build bench-real-frames -Doptimize=ReleaseFast
 zig build bench-real-streams -Doptimize=ReleaseFast
+zig build bench-real-session -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.
