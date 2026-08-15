@@ -10,6 +10,53 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.15.0 ordered dispatch and cross-owner DATA credit
+
+0.15.0 extends the detached stream model one step toward a sharded runtime. The
+connection owner can commit only the state that is intrinsically ordered across
+the HTTP/2 connection, then materialize DATA, RST_STREAM, or stream
+WINDOW_UPDATE as a temporary work item for the owner of one `Tracked` record.
+The work item does not contain a `StreamManager`, allocator, queue, or runtime
+synchronization primitive. DATA slices continue to alias the caller-owned frame
+payload, so a real cross-thread queue must retain the backing transport buffer
+until that work item is consumed.
+
+The dispatch benchmark uses 64 multiplexed streams, captured real response body
+sizes, 16 KiB DATA chunks, immediate receive-credit restoration, and a stable
+caller-owned stream record. Each executable gets the same protocol shape but is
+built separately to keep the manual and helper loops independently optimizable.
+Seven alternating direct runs on the same host gave these medians:
+
+| DATA path | Median throughput |
+| --- | ---: |
+| Manual 24-byte handoff record | 149.927 M frames/s |
+| Prechecked typed `dispatch.Data` | 140.088 M frames/s |
+| Generic flat `dispatch.prepare()` | 117.678 M frames/s |
+
+The typed path is about 6.6% below an equivalent manually materialized handoff
+record in this intentionally tiny loop. The generic API is about 21.5% below
+because it additionally preserves a runtime frame-kind tag. These rates are
+still only roughly 7-9 ns per DATA state transition and should not be confused
+with network throughput. Applications that already use `ConnectionCompleteIterator`
+or `ConnectionDecoder` can call `prepareDataAssumeConnectionChecked()` (and the
+corresponding RST_STREAM/WINDOW_UPDATE functions) to avoid duplicated ordered
+connection work; fully manual component composition remains available.
+
+Outbound sharding is measured separately. A 12-byte `DataSendOffer` captures
+stream credit plus the peer initial-window snapshot; `grantDataSend()` combines
+it with ordered connection credit and MAX_FRAME_SIZE, and the stream owner
+commits only after a successful write. Seven alternating runs measured
+**128.305 M chunks/s** for the equivalent manual split and **125.692 M chunks/s**
+for offer/grant, roughly **-2.0%**. The protocol benefit is that a SETTINGS
+initial-window decrease can invalidate stale work explicitly without sharing
+`PeerState` with the stream shard.
+
+The fused Session paths remain specialized rather than routing through these
+handoff values. Alternating A/B checks against 0.14.0 kept managed receive and
+stable-cursor send within normal host/code-layout variance; outbound wire volume
+remained **13,835.6 B/transaction**. Persistent layouts remain
+`Tracked=12 B`, `StreamManager=36 B`, and `Session=128 B`.
+
 ## 0.14.0 detached stream-local composition
 
 0.14.0 adds a low-level detached stream cursor for runtimes that keep HTTP/2

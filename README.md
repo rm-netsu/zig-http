@@ -11,6 +11,7 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - Small process-wide byte-class tables and SIMD validation trade about 512 bytes of read-only data for faster field parsing without increasing per-connection state.
 - Incremental fallbacks preserve streaming operation across arbitrarily fragmented reads.
 - HTTP/2 connection state is split from caller-owned stream storage: connection-wide invariants stay allocation-free while applications choose their own stream slab/hash/sharded layout.
+- HTTP/2 ordered dispatch can materialize DATA/RST_STREAM/stream WINDOW_UPDATE as temporary caller-routable work after connection-wide invariants are committed, so stream shards do not need the full connection/session object.
 - Protocol objects contain no process-global mutable state. Independent connections are naturally shardable across threads; one HTTP/2 connection still has ordered connection/HPACK state and therefore has one logical mutator at a time unless the caller supplies equivalent synchronization.
 - An optional 128-byte `Session` composes complete-frame parsing, HPACK decode, field semantics, stream transitions, peer SETTINGS/GOAWAY, flow accounting, and state-aware outbound control frames without owning either HPACK allocators or the stream table.
 - HTTP/1 bodies and HTTP/2 frame payloads are streamed without whole-message buffering.
@@ -153,6 +154,69 @@ SETTINGS update is preferable for their own storage topology can use the standal
 `FlowWindow`, `StreamSendWindow`, `stream.Stream`, and frame/state primitives directly
 and own that policy themselves.
 
+## HTTP/2 ordered dispatch and shard handoff
+
+`http2.dispatch` exposes the receive-side ownership boundary explicitly. A
+connection owner first commits only connection-wide HTTP/2 state (CONTINUATION
+adjacency and the connection receive window), then DATA, RST_STREAM, and stream
+WINDOW_UPDATE can be handed to the owner of one `Tracked` record. HEADERS/HPACK,
+SETTINGS, GOAWAY, connection WINDOW_UPDATE, PING, and extension handling remain
+on the ordered path. No worker queue or synchronization primitive is part of
+core.
+
+When `ConnectionCompleteIterator` or `ConnectionDecoder` already observed the
+frame header, use `prepareAssumeConnectionChecked()` or the typed
+`prepareDataAssumeConnectionChecked()` / `prepareResetAssumeConnectionChecked()` /
+`prepareStreamWindowUpdateAssumeConnectionChecked()` paths. This avoids checking
+connection state twice:
+
+```zig
+var frames = http.http2.ConnectionCompleteIterator.init(
+    &session.connection,
+    input,
+    receiver_max_frame_size,
+);
+
+while (try frames.next()) |complete| {
+    const prepared = http.http2.dispatch.prepareAssumeConnectionChecked(
+        session.peer.settings.initial_window_size,
+        complete,
+    );
+    switch (prepared) {
+        .data, .reset, .window_update => {
+            // Convert only when the runtime really needs a tagged queue item.
+            const work = prepared.streamWork().?;
+            enqueueStreamWork(work.streamId(), work);
+        },
+        .ordered => {
+            const event = try session.receiveCompleteAssumeConnectionChecked(
+                &store,
+                complete,
+                scratch,
+                &field_sink,
+            );
+            _ = event;
+        },
+        .ignored => {},
+        .fault => |code| return connectionError(code),
+    }
+}
+```
+
+`Prepared` is 32 bytes and flat (there is no nested stream-work union).
+`StreamWork` is also 32 bytes when a generic queue item is actually required;
+typed DATA work is 24 bytes. Stream WINDOW_UPDATE work captures the exact peer
+`SETTINGS_INITIAL_WINDOW_SIZE` ordered before that frame, so a delayed shard does
+not read a newer connection setting accidentally. If the target shard reports
+that the stream record is absent, `StreamWork.absent()` /
+`StreamManager.receiveAbsent()` resolve the high-water and GOAWAY semantics
+without repeating the caller-store lookup.
+
+DATA work keeps a zero-copy slice into the original frame payload. A runtime that
+queues it across threads must therefore keep the backing transport/read buffer
+alive until the work item is consumed. The core deliberately does not choose a
+buffer ownership or reference-counting scheme.
+
 ## HTTP/2 caller-owned stream manager
 
 `StreamManager` adds stream-ID ordering, initiator parity, concurrent-stream
@@ -216,15 +280,36 @@ effect that must be visible before a later `SETTINGS_INITIAL_WINDOW_SIZE`
 increase is validated. These ordering hints expose the HTTP/2 dependency without
 requiring a particular queue, lock, or worker topology.
 
-The same split is available on the send side. A stream owner can call
-`DetachedStreamCursor.dataSendCredit(peer_initial_window)`, the connection owner
-can combine that value with connection send credit and peer MAX_FRAME_SIZE and
-write DATA, then the stream owner can call `localDataAssumeCredit()` only after
-the write succeeds. This preserves the existing Session preflight/write/commit
-semantics while allowing a lower-level runtime to keep stream storage on a
-separate shard. The ordinary `Session` and `StreamCursor` APIs remain fused for
-convenience and use specialized hot paths rather than paying detached-effect
-overhead internally.
+The same split is available on the send side. The fully manual
+`dataSendCredit()` / `localDataAssumeCredit()` pair remains available, while a
+sharded runtime can instead capture a 12-byte `DataSendOffer`:
+
+```zig
+// Stream owner / shard:
+const offer = try detached.dataSendOffer(peer_initial_window_snapshot);
+
+// Ordered connection owner:
+const grant = try http.http2.dispatch.grantDataSend(&peer, offer);
+const amount = @min(bytes.len, grant.max_payload);
+// Write DATA here. Only after the wire write succeeds:
+try peer.consumeSend(@intCast(amount));
+
+// Stream owner / shard:
+const effect = offer.commit(detached, @intCast(amount), end_stream);
+```
+
+`grantDataSend()` combines stream credit with the current connection send window
+and peer MAX_FRAME_SIZE. If `SETTINGS_INITIAL_WINDOW_SIZE` decreased after the
+offer was made, it returns `error.StaleStreamCredit` so the shard can probe again;
+a later increase leaves the older offer conservatively valid. The post-write
+commit needs no `PeerState`. Per-stream work must still remain ordered by the
+caller, and the connection owner must not reorder a SETTINGS transition between
+accepting a grant and the corresponding wire write.
+
+This preserves the existing Session preflight/write/commit semantics while
+allowing a lower-level runtime to keep stream storage on a separate shard. The
+ordinary `Session` and `StreamCursor` APIs remain fused for convenience and use
+specialized hot paths rather than paying handoff-token overhead internally.
 
 After a locally sent GOAWAY, peer-initiated stream IDs above its last-stream-id
 return `.ignored_after_goaway`. HPACK and connection-level flow-control minimal
@@ -525,6 +610,7 @@ advanced.
 - `http2/streams.zig` — allocation-free stream-ID/concurrency/lifecycle manager over caller-owned storage.
 - `http2/session.zig` — optional 128-byte receive/send session composition with HPACK/field/stream/control dispatch over caller-owned storage.
 - `http2/scheduler.zig` — one-word caller-driven round-robin DATA selector over Session flow credit.
+- `http2/dispatch.zig` — ordered receive-to-stream handoff plus cross-owner DATA credit snapshots, with typed fast paths for already classified frames.
 - `http2/send.zig` — bounded streaming HPACK field-block framing plus allocation-free SETTINGS/PING/RST_STREAM/WINDOW_UPDATE/GOAWAY serialization.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
@@ -548,6 +634,8 @@ zig build bench-real-session -Doptimize=ReleaseFast
 zig build bench-real-send-session -Doptimize=ReleaseFast
 zig build bench-real-scheduler -Doptimize=ReleaseFast
 zig build bench-real-settings -Doptimize=ReleaseFast
+zig build bench-real-dispatch -Doptimize=ReleaseFast
+zig build bench-real-send-offer -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.

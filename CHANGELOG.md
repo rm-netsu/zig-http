@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.0
+
+- Add `http2.dispatch`, a connection-ordered receive front-end that commits CONTINUATION adjacency and connection DATA flow control before extracting DATA, RST_STREAM, and stream WINDOW_UPDATE as caller-routable stream-local work; HPACK/HEADERS, SETTINGS, GOAWAY, connection WINDOW_UPDATE, PING, and extensions remain on the ordered path.
+- Add flat 32-byte `DispatchPrepared` and queue-oriented 32-byte `DispatchStreamWork` values plus typed DATA/RST_STREAM/WINDOW_UPDATE preparation APIs. `prepare*AssumeConnectionChecked()` integrates directly with `ConnectionCompleteIterator`/`ConnectionDecoder` so high-performance runtimes do not repeat connection-state checks.
+- Add `StreamManager.receiveAbsent()` so a stream shard can report a lookup miss and let the ordered owner resolve high-water/GOAWAY RFC semantics without a second caller-store lookup. Existing fused receive methods use the same missing-stream classifier.
+- Add a 12-byte `DataSendOffer` and connection-side `grantDataSend()` for sharded outbound DATA. The offer captures the peer initial-window value used by the stream probe; a later SETTINGS increase stays conservatively valid while an unsafe decrease returns `error.StaleStreamCredit`. Post-write stream commit no longer needs `PeerState`.
+- Add `Session.receiveCompleteAssumeConnectionChecked()` for mixed composed/detached receive loops that already committed connection-wide state before deciding whether a frame remains on Session or is handed to a stream owner.
+- Correct WINDOW_UPDATE error classification: an increment of zero on stream 0 remains a connection `PROTOCOL_ERROR`, while a non-zero stream now reaches stream-level handling and produces a stream `PROTOCOL_ERROR` as required by HTTP/2.
+- Add real-corpus dispatch and send-offer benchmarks. Seven alternating runs measured a 24-byte manual handoff at 149.927 M DATA frames/s versus 140.088 M/s for the prechecked typed dispatch path (~-6.6%) and 117.678 M/s for the fully generic flat dispatch (~-21.5%); the offer/grant send split measured 125.692 M chunks/s versus 128.305 M/s manual (~-2.0%). These are deliberately tiny state-machine loops; fused Session paths remain specialized and do not pay these handoff costs.
+- Re-check the existing composed hot paths against 0.14.0: alternating managed receive and stable-cursor send runs stayed in the same run-to-run range, with unchanged 13,835.6 outbound wire bytes/transaction. Persistent sizes remain `Tracked=12 B`, `StreamManager=36 B`, and `Session=128 B`.
+
 ## 0.14.0
 
 - Add a 16-byte `DetachedStreamCursor` for runtimes that keep caller-owned HTTP/2 stream records on separate shards and do not want the ordered connection owner to hold a `StreamManager` pointer while applying common stream-local transitions.
