@@ -141,6 +141,26 @@ pub fn build(b: *std.Build) void {
     }
     scheduler_step.dependOn(previous_scheduler_run.?);
 
+    const dispatch_step = b.step("bench-real-dispatch", "Run HTTP/2 ordered-dispatch stream handoff benchmarks");
+    const dispatch_cases = [_][]const u8{ "manual", "handoff", "managed", "typed", "prechecked" };
+    var previous_dispatch_run: ?*std.Build.Step = null;
+    for (dispatch_cases) |case| {
+        const source = b.fmt("bench/dispatch_real_{s}.zig", .{case});
+        const dispatch_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = b.fmt("http-dispatch-real-{s}", .{case}), .root_module = dispatch_mod });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        if (previous_dispatch_run) |previous| run.step.dependOn(previous);
+        previous_dispatch_run = &run.step;
+    }
+    dispatch_step.dependOn(previous_dispatch_run.?);
+
     const settings_mod = b.createModule(.{
         .root_source_file = b.path("bench/settings_real.zig"),
         .target = target,
@@ -152,6 +172,26 @@ pub fn build(b: *std.Build) void {
     run_settings.stdio = .inherit;
     const settings_step = b.step("bench-real-settings", "Run HTTP/2 SETTINGS stream-window scalability benchmark");
     settings_step.dependOn(&run_settings.step);
+
+    const send_offer_step = b.step("bench-real-send-offer", "Run sharded HTTP/2 DATA offer/grant benchmarks");
+    const send_offer_cases = [_][]const u8{ "manual", "managed" };
+    var previous_send_offer_run: ?*std.Build.Step = null;
+    for (send_offer_cases) |case| {
+        const source = b.fmt("bench/send_offer_real_{s}.zig", .{case});
+        const send_offer_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = b.fmt("http-send-offer-real-{s}", .{case}), .root_module = send_offer_mod });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        if (previous_send_offer_run) |previous| run.step.dependOn(previous);
+        previous_send_offer_run = &run.step;
+    }
+    send_offer_step.dependOn(previous_send_offer_run.?);
 
     const send_session_step = b.step("bench-real-send-session", "Run isolated real-world HTTP/2 send-session benchmarks");
     const send_session_cases = [_][]const u8{ "manual", "managed", "managed_tracked" };
