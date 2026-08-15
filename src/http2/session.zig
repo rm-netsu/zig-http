@@ -4,6 +4,7 @@ const common = @import("../common.zig");
 const connection = @import("connection.zig");
 const fields = @import("fields.zig");
 const frame = @import("frame.zig");
+const flow = @import("flow.zig");
 const header_block = @import("header_block.zig");
 const payload = @import("payload.zig");
 const peer_mod = @import("peer.zig");
@@ -35,8 +36,20 @@ pub const PushPromise = struct {
 
 pub const Data = struct {
     stream_id: u31,
-    bytes: []const u8,
     end_stream: bool,
+    // DATA frame length is 24-bit on the wire. Keeping the charge in the three
+    // bytes that were previously padding preserves Data=24 B / Event=32 B.
+    _flow_charge: [3]u8,
+    bytes: []const u8,
+
+    /// Complete DATA frame payload length charged to HTTP/2 flow control. This
+    /// can exceed `bytes.len` when padding is present and is the amount callers
+    /// should release back to receive-credit accounting.
+    pub inline fn flowControlledBytes(self: Data) u32 {
+        return (@as(u32, self._flow_charge[0]) << 16) |
+            (@as(u32, self._flow_charge[1]) << 8) |
+            @as(u32, self._flow_charge[2]);
+    }
 };
 
 pub const SettingsTicket = u32;
@@ -75,6 +88,44 @@ pub const SettingsApplied = struct {
     pub inline fn acknowledge(self: SettingsApplied, sync: *SettingsSync) ?SettingsTicket {
         if (!self.ack) return null;
         return sync.acknowledge();
+    }
+};
+
+/// Caller-owned helper for RFC 9113 graceful server shutdown. It performs only
+/// HTTP/2 state transitions: the caller remains responsible for choosing the
+/// grace interval and for supplying the final last-stream-id based on what its
+/// application layer might have processed.
+pub const GracefulGoAway = struct {
+    phase: Phase = .open,
+
+    pub const Phase = enum(u2) { open, announced, final };
+
+    /// Sends the initial GOAWAY(MAX_STREAM_ID, NO_ERROR). No timer is started;
+    /// the caller decides when enough time has passed before `finish()`.
+    pub fn announce(
+        self: *GracefulGoAway,
+        session: *Session,
+        out: *std.Io.Writer,
+        debug_data: []const u8,
+    ) SendGoAwayError!void {
+        if (self.phase != .open or session.streams.local_role != .server) return error.Protocol;
+        try session.sendGoAway(out, std.math.maxInt(u31), .no_error, debug_data);
+        self.phase = .announced;
+    }
+
+    /// Sends the final NO_ERROR cutoff. The caller supplies the highest peer-
+    /// initiated stream that might have been processed; Session deliberately
+    /// does not infer application-level processing from protocol receipt.
+    pub fn finish(
+        self: *GracefulGoAway,
+        session: *Session,
+        out: *std.Io.Writer,
+        last_stream_id: u31,
+        debug_data: []const u8,
+    ) SendGoAwayError!void {
+        if (self.phase != .announced) return error.Protocol;
+        try session.sendGoAway(out, last_stream_id, .no_error, debug_data);
+        self.phase = .final;
     }
 };
 
@@ -182,9 +233,11 @@ const Pending = struct {
     }
 };
 
-/// High-level receive-side HTTP/2 session state over caller-owned stream and
-/// header-block storage. HPACK codec objects remain caller-owned because they
-/// own allocator-backed dynamic tables; this type merely holds stable pointers.
+/// Integrated HTTP/2 session state over caller-owned stream and header-block
+/// storage. This remains protocol core: it owns HTTP/2 state transitions but no
+/// sockets, TLS, event loop, timers, or application work queues. HPACK codec
+/// objects remain caller-owned because they own allocator-backed dynamic tables;
+/// this type merely holds stable pointers.
 ///
 /// The stream store extends the `StreamManager` contract with one operation:
 ///
@@ -486,21 +539,58 @@ pub const Session = struct {
         if (increment == 0) return error.Protocol;
 
         if (stream_id == 0) {
-            var next = self.connection.receive_window;
-            next.update(increment) catch return error.FlowControl;
-            send_mod.writeWindowUpdate(out, 0, increment) catch |err| switch (err) {
-                error.Protocol => unreachable,
-                error.WriteFailed => {
-                    self.pending.poison();
-                    return error.WriteFailed;
-                },
-            };
-            self.connection.receive_window = next;
+            try self.sendConnectionWindowUpdate(out, increment);
             return;
         }
 
         const tracked = store.get(stream_id) orelse return error.StreamClosed;
         try self.sendWindowUpdateTracked(out, stream_id, tracked, increment);
+    }
+
+    /// Emits a connection WINDOW_UPDATE according to caller-owned receive-
+    /// capacity accounting. Returns the advertised increment, or zero when the
+    /// low watermark has not been reached.
+    pub fn replenishConnectionReceive(
+        self: *Session,
+        out: *std.Io.Writer,
+        credit: *flow.ReceiveCredit,
+    ) SendStreamControlError!u31 {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        const increment = credit.proposal(self.connection.receive_window) orelse return 0;
+        try self.sendConnectionWindowUpdate(out, increment);
+        credit.commit(increment);
+        return increment;
+    }
+
+    /// Stream-level receive-credit counterpart. Stream storage and the
+    /// replenishment accumulator both remain caller-owned.
+    pub fn replenishStreamReceive(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        credit: *flow.ReceiveCredit,
+    ) SendStreamControlError!u31 {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        const tracked = store.get(stream_id) orelse return error.StreamClosed;
+        const increment = credit.proposal(tracked.windows.receive) orelse return 0;
+        try self.sendWindowUpdateTracked(out, stream_id, tracked, increment);
+        credit.commit(increment);
+        return increment;
+    }
+
+    pub fn replenishStreamReceiveExisting(
+        self: *Session,
+        out: *std.Io.Writer,
+        existing: streams_mod.Existing,
+        credit: *flow.ReceiveCredit,
+    ) SendStreamControlError!u31 {
+        if (existing.manager != &self.streams) return error.Protocol;
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        const increment = credit.proposal(existing.tracked.windows.receive) orelse return 0;
+        try self.sendWindowUpdateTracked(out, existing.stream_id, existing.tracked, increment);
+        credit.commit(increment);
+        return increment;
     }
 
     pub fn sendWindowUpdateExisting(
@@ -513,6 +603,23 @@ pub const Session = struct {
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (increment == 0) return error.Protocol;
         try self.sendWindowUpdateTracked(out, existing.stream_id, existing.tracked, increment);
+    }
+
+    fn sendConnectionWindowUpdate(
+        self: *Session,
+        out: *std.Io.Writer,
+        increment: u31,
+    ) SendStreamControlError!void {
+        var next = self.connection.receive_window;
+        next.update(increment) catch return error.FlowControl;
+        send_mod.writeWindowUpdate(out, 0, increment) catch |err| switch (err) {
+            error.Protocol => unreachable,
+            error.WriteFailed => {
+                self.pending.poison();
+                return error.WriteFailed;
+            },
+        };
+        self.connection.receive_window = next;
     }
 
     fn sendWindowUpdateTracked(
@@ -727,7 +834,16 @@ pub const Session = struct {
         const result = self.streams.receiveData(store, complete.header.stream_id, complete.header.length, end_stream);
         if (receiveFault(complete.header.stream_id, result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
-        return .{ .data = .{ .stream_id = complete.header.stream_id, .bytes = bytes, .end_stream = end_stream } };
+        return .{ .data = .{
+            .stream_id = complete.header.stream_id,
+            .end_stream = end_stream,
+            ._flow_charge = .{
+                @intCast((complete.header.length >> 16) & 0xff),
+                @intCast((complete.header.length >> 8) & 0xff),
+                @intCast(complete.header.length & 0xff),
+            },
+            .bytes = bytes,
+        } };
     }
 
     fn receiveHeaders(self: *Session, store: anytype, complete: frame.CompleteFrame, scratch: []u8, sink: anytype) (hpack.codec.Error || error{HeaderBlockTooLarge})!Event {
@@ -1314,6 +1430,8 @@ fn settingBytes(setting: @import("settings.zig").Setting) [6]u8 {
 
 test "send session remains compact with local header phase" {
     try std.testing.expectEqual(@as(usize, 128), @sizeOf(Session));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Data));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Event));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(SettingsSync));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(stream_mod.Tracked));
 }
@@ -1718,4 +1836,133 @@ test "session control preflight is retry safe and writer failure poisons" {
     try std.testing.expectError(error.WriteFailed, session.sendWindowUpdate(&store, &failing, 0, 1000));
     try std.testing.expectEqual(@as(u31, 60_000), session.connection.receive_window.available());
     try std.testing.expect(session.sendPoisoned());
+}
+
+test "DATA event exposes full flow-controlled payload length" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+
+    const padded = [_]u8{ 2, 'a', 'b', 'c', 0, 0 };
+    var scratch: [1]u8 = undefined;
+    var sink: NullSink = .{};
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = padded.len, .type = .data, .flags = 0x08, .stream_id = 1 },
+        .payload = &padded,
+    }, &scratch, &sink);
+    try std.testing.expectEqualStrings("abc", event.data.bytes);
+    try std.testing.expectEqual(@as(u32, padded.len), event.data.flowControlledBytes());
+    try std.testing.expectEqual(@as(u31, 65_529), session.connection.receive_window.available());
+    try std.testing.expectEqual(@as(u31, 65_529), store.get(1).?.windows.receive.available());
+}
+
+test "receive credit helpers replenish connection and stream after release" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+
+    session.connection.receive_window.value = 15_535;
+    store.get(1).?.windows.receive.value = 15_535;
+    var connection_credit = try flow.ReceiveCredit.init(65_535, 32_767);
+    var stream_credit = try flow.ReceiveCredit.init(65_535, 32_767);
+    connection_credit.release(50_000);
+    stream_credit.release(50_000);
+
+    var wire_storage: [64]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expectEqual(@as(u31, 50_000), try session.replenishConnectionReceive(&wire, &connection_credit));
+    try std.testing.expectEqual(@as(u31, 50_000), try session.replenishStreamReceive(&store, &wire, 1, &stream_credit));
+    try std.testing.expectEqual(@as(u31, 65_535), session.connection.receive_window.available());
+    try std.testing.expectEqual(@as(u31, 65_535), store.get(1).?.windows.receive.available());
+    try std.testing.expectEqual(@as(u32, 0), connection_credit.released);
+    try std.testing.expectEqual(@as(u32, 0), stream_credit.released);
+
+    var frames = frame.CompleteIterator.init(wire.buffered(), frame.default_max_frame_size);
+    const connection_update = (try frames.next()).?;
+    try std.testing.expectEqual(frame.Type.window_update, connection_update.header.type);
+    try std.testing.expectEqual(@as(u31, 0), connection_update.header.stream_id);
+    try std.testing.expectEqual(@as(u32, 50_000), std.mem.readInt(u32, connection_update.payload[0..4], .big));
+    const stream_update = (try frames.next()).?;
+    try std.testing.expectEqual(@as(u31, 1), stream_update.header.stream_id);
+    try std.testing.expectEqual(@as(u32, 50_000), std.mem.readInt(u32, stream_update.payload[0..4], .big));
+    try std.testing.expect((try frames.next()) == null);
+}
+
+test "receive credit helper does not commit released bytes on writer failure" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    session.connection.receive_window.value = 15_535;
+    var credit = try flow.ReceiveCredit.init(65_535, 32_767);
+    credit.release(50_000);
+
+    var no_space: [0]u8 = .{};
+    var failing = std.Io.Writer.fixed(&no_space);
+    try std.testing.expectError(error.WriteFailed, session.replenishConnectionReceive(&failing, &credit));
+    try std.testing.expectEqual(@as(u31, 15_535), session.connection.receive_window.available());
+    try std.testing.expectEqual(@as(u32, 50_000), credit.released);
+    try std.testing.expect(session.sendPoisoned());
+}
+
+test "graceful GOAWAY helper performs only the two HTTP2 shutdown phases" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var drain: GracefulGoAway = .{};
+
+    var wire_storage: [64]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try drain.announce(&session, &wire, "drain");
+    try std.testing.expectEqual(GracefulGoAway.Phase.announced, drain.phase);
+    try drain.finish(&session, &wire, 1, "done");
+    try std.testing.expectEqual(GracefulGoAway.Phase.final, drain.phase);
+    try std.testing.expectEqual(@as(?u31, 1), session.streams.lastSentGoAwayStream());
+    try std.testing.expectError(error.Protocol, drain.finish(&session, &wire, 1, ""));
+
+    var frames = frame.CompleteIterator.init(wire.buffered(), frame.default_max_frame_size);
+    const initial = (try frames.next()).?;
+    const first = try payload.goAway(initial.payload);
+    try std.testing.expectEqual(std.math.maxInt(u31), first.last_stream_id);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(protocol.ErrorCode.no_error)), first.error_code);
+    const final = (try frames.next()).?;
+    const second = try payload.goAway(final.payload);
+    try std.testing.expectEqual(@as(u31, 1), second.last_stream_id);
+    try std.testing.expectEqualStrings("done", second.debug_data);
+    try std.testing.expect((try frames.next()) == null);
+}
+
+test "graceful GOAWAY helper is server-only and owns no timing policy" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var drain: GracefulGoAway = .{};
+    var wire_storage: [32]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expectError(error.Protocol, drain.announce(&session, &wire, ""));
+    try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
+    try std.testing.expectEqual(GracefulGoAway.Phase.open, drain.phase);
 }
