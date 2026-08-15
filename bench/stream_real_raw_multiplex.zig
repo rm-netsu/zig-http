@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
         var stream_index: usize = 0;
         while (stream_index < common.streams_per_connection) : (stream_index += 1) {
             const id: u31 = @intCast(stream_index * 2 + 1);
-            const tracked = http.http2.stream.Tracked.init(peer.settings.initial_window_size, 65_535);
+            const tracked = http.http2.stream.Tracked.init(65_535);
             const slot = store.insert(id, tracked) orelse return error.StoreFull;
             try slot.stream.localHeaders(true);
         }

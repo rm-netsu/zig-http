@@ -63,10 +63,11 @@ pub const Context = struct {
             const body = bodyAt(i + runtime_seed);
             self.candidates[i] = .{ .stream_id = id, .remaining = body };
             const tracked = self.store.get(id).?;
-            tracked.windows.send.value = if (((i + runtime_seed) & 3) == 0)
+            const effective: i32 = if (((i + runtime_seed) & 3) == 0)
                 0
             else
                 @intCast(1024 + ((body + @as(u32, @truncate(runtime_seed))) % 65_000));
+            tracked.windows.send.adjustment = effective - @as(i32, @intCast(self.session.peer.settings.initial_window_size));
         }
     }
 

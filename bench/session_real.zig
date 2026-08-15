@@ -82,12 +82,16 @@ pub const Store = struct {
         return &slot.value;
     }
 
-    pub inline fn applyPeerInitialWindow(self: *Store, change: http.http2.PeerState.InitialWindowChange) bool {
+    pub inline fn maxActiveSendAdjustment(self: *Store) i32 {
+        var result: i32 = 0;
         for (&self.slots) |*slot| {
             if (!slot.used) continue;
-            slot.value.windows.applyPeerInitialDelta(change.old, change.new) catch return false;
+            switch (slot.value.stream.state) {
+                .open, .half_closed_remote => result = @max(result, slot.value.windows.send.adjustment),
+                else => {},
+            }
         }
-        return true;
+        return result;
     }
 
     pub inline fn reset(self: *Store) void {

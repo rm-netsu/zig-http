@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
         const entry = fixture.entry(round);
         var ctx = &contexts[entry.scenario];
         const id = shared.nextStreamId(&ctx.next_stream_id);
-        if (ctx.session.streams.receiveHeaders(&ctx.store, &ctx.session.peer, id, true) != .accepted) return error.Protocol;
+        if (ctx.session.streams.receiveHeaders(&ctx.store, id, true) != .accepted) return error.Protocol;
         const existing = ctx.session.streams.existing(&ctx.store, id).?;
         const stats = try ctx.session.sendHeadersExisting(&discard.writer, existing, entry.body == 0, &staging, entry.fields);
         checksum +%= stats.encoded_bytes + stats.frame_count;
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
             if (result.blocked or result.consumed == 0) return error.FlowControl;
             left -= @intCast(result.consumed);
             try ctx.session.peer.send_window.update(@intCast(result.consumed));
-            try ctx.store.get(id).?.windows.send.update(@intCast(result.consumed));
+            try ctx.store.get(id).?.windows.send.update(ctx.session.peer.settings.initial_window_size, @intCast(result.consumed));
             checksum +%= result.consumed;
         }
         tx += 1;

@@ -19,6 +19,7 @@ test {
     _ = http2.settings.Settings;
     _ = http2.settings.StreamDecoder;
     _ = http2.flow.FlowWindow;
+    _ = http2.flow.StreamSendWindow;
     _ = http2.flow.ReceiveCredit;
     _ = http2.fields.Validator;
     _ = http2.payload.HeadersPayload;

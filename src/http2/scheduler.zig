@@ -62,11 +62,13 @@ pub const RoundRobin = struct {
                     const tracked = store.get(candidate.stream_id) orelse unreachable;
                     std.debug.assert(!session.streams.unprocessedByPeer(&session.peer, candidate.stream_id));
                     std.debug.assert(tracked.stream.state == .open or tracked.stream.state == .half_closed_remote);
-                    const max_payload = @min(
-                        @as(usize, session.peer.send_window.available()),
-                        @as(usize, tracked.windows.send.available()),
-                        @as(usize, session.peer.settings.max_frame_size),
+                    const stream_window = tracked.windows.send.adjustment + @as(i32, @intCast(session.peer.settings.initial_window_size));
+                    const bounded = @min(
+                        session.peer.send_window.value,
+                        stream_window,
+                        @as(i32, @intCast(session.peer.settings.max_frame_size)),
                     );
+                    const max_payload: usize = if (bounded <= 0) 0 else @intCast(bounded);
                     if (candidate.remaining == 0 or max_payload != 0) {
                         const amount = @min(candidate.remaining, max_payload);
                         self.cursor = if (index + 1 == candidates.len) 0 else index + 1;
@@ -146,8 +148,8 @@ test "round robin skips blocked streams and rotates ready work" {
             };
             return null;
         }
-        pub fn applyPeerInitialWindow(_: *@This(), _: @import("peer.zig").State.InitialWindowChange) bool {
-            return true;
+        pub fn maxActiveSendAdjustment(_: *@This()) i32 {
+            return 0;
         }
     };
 
@@ -162,9 +164,9 @@ test "round robin skips blocked streams and rotates ready work" {
     try session.streams.openLocal(&store, &session.peer, 1, false);
     try session.streams.openLocal(&store, &session.peer, 3, false);
     try session.streams.openLocal(&store, &session.peer, 5, false);
-    store.get(1).?.windows.send.value = 0;
-    store.get(3).?.windows.send.value = 100;
-    store.get(5).?.windows.send.value = 200;
+    store.get(1).?.windows.send.adjustment = -65_535;
+    store.get(3).?.windows.send.adjustment = 100 - 65_535;
+    store.get(5).?.windows.send.adjustment = 200 - 65_535;
 
     const candidates = [_]Candidate{
         .{ .stream_id = 1, .remaining = 80 },
@@ -201,8 +203,8 @@ test "round robin schedules empty END_STREAM without flow credit" {
             self.value = value;
             return &self.value.?;
         }
-        pub fn applyPeerInitialWindow(_: *@This(), _: @import("peer.zig").State.InitialWindowChange) bool {
-            return true;
+        pub fn maxActiveSendAdjustment(_: *@This()) i32 {
+            return 0;
         }
     };
 
@@ -216,7 +218,7 @@ test "round robin schedules empty END_STREAM without flow credit" {
     var store: Store = .{};
     try session.streams.openLocal(&store, &session.peer, 1, false);
     session.peer.send_window.value = 0;
-    store.get(1).?.windows.send.value = 0;
+    store.get(1).?.windows.send.adjustment = -65_535;
 
     const candidates = [_]Candidate{.{ .stream_id = 1, .remaining = 0, .end_stream = true }};
     var scheduler: RoundRobin = .{};
@@ -240,8 +242,8 @@ test "round robin distinguishes idle from flow-control blocking" {
             self.value = value;
             return &self.value.?;
         }
-        pub fn applyPeerInitialWindow(_: *@This(), _: @import("peer.zig").State.InitialWindowChange) bool {
-            return true;
+        pub fn maxActiveSendAdjustment(_: *@This()) i32 {
+            return 0;
         }
     };
 

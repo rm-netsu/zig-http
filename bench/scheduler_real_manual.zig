@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 const available = @min(
                     @as(usize, ctx.session.peer.send_window.available()),
-                    @as(usize, tracked.windows.send.available()),
+                    @as(usize, tracked.windows.send.available(ctx.session.peer.settings.initial_window_size)),
                     @as(usize, ctx.session.peer.settings.max_frame_size),
                 );
                 if (available != 0) {

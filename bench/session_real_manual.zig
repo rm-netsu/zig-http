@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
             fields_count += 1;
         }
         try validator.finish();
-        if (manager.receiveHeaders(&store, &peer, id, end_on_headers) != .accepted) return error.Protocol;
+        if (manager.receiveHeaders(&store, id, end_on_headers) != .accepted) return error.Protocol;
         store.get(id).?.remote_headers = .regular;
         checksum +%= fields_count;
 

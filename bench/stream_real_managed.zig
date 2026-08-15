@@ -23,10 +23,10 @@ pub fn main(init: std.process.Init) !void {
             try manager.openLocal(&store, &peer, id, true);
             const body = fixture.body(stream_index);
             if (body == 0) {
-                const headers = manager.receiveHeaders(&store, &peer, id, true);
+                const headers = manager.receiveHeaders(&store, id, true);
                 if (headers != .accepted) return error.Protocol;
             } else {
-                const headers = manager.receiveHeaders(&store, &peer, id, false);
+                const headers = manager.receiveHeaders(&store, id, false);
                 if (headers != .accepted) return error.Protocol;
                 var left = body;
                 while (left != 0) {

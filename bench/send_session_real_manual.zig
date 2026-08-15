@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
         const entry = fixture.entry(round);
         var ctx = &contexts[entry.scenario];
         const id = shared.nextStreamId(&ctx.next_stream_id);
-        if (ctx.manager.receiveHeaders(&ctx.store, &ctx.peer, id, true) != .accepted) return error.Protocol;
+        if (ctx.manager.receiveHeaders(&ctx.store, id, true) != .accepted) return error.Protocol;
         try shared.validateResponse(entry.fields);
         try ctx.manager.localHeaders(&ctx.store, &ctx.peer, id, entry.body == 0);
         var framer = try http.http2.send.HeaderFramer.init(&discard.writer, &staging, ctx.peer.settings.max_frame_size, id, entry.body == 0);
@@ -56,9 +56,9 @@ pub fn main(init: std.process.Init) !void {
             const header: http.http2.FrameHeader = .{ .length = n, .type = .data, .flags = @intFromBool(left == 0), .stream_id = id };
             try http.http2.frame.writeFrame(&discard.writer, header, shared.body_bytes[0..n]);
             try ctx.peer.consumeSend(n);
-            try ctx.manager.localData(&ctx.store, id, n, left == 0);
+            try ctx.manager.localData(&ctx.store, &ctx.peer, id, n, left == 0);
             try ctx.peer.send_window.update(@intCast(n));
-            try ctx.store.get(id).?.windows.send.update(@intCast(n));
+            try ctx.store.get(id).?.windows.send.update(ctx.peer.settings.initial_window_size, @intCast(n));
             checksum +%= n;
         }
         tx += 1;

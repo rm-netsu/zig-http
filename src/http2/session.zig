@@ -241,10 +241,12 @@ const Pending = struct {
 ///
 /// The stream store extends the `StreamManager` contract with one operation:
 ///
-///     applyPeerInitialWindow(change: PeerState.InitialWindowChange) bool
+///     maxActiveSendAdjustment() i32
 ///
-/// It must apply the ordered SETTINGS_INITIAL_WINDOW_SIZE delta to every live
-/// locally-sending stream and return false if any window would overflow.
+/// This is consulted only when a rare SETTINGS_INITIAL_WINDOW_SIZE increase
+/// could overflow a stream according to the manager's conservative high-water
+/// mark. Stores can scan, maintain an aggregate, or coordinate shards however
+/// they choose; ordinary SETTINGS changes require no store-wide mutation.
 pub const Session = struct {
     connection: connection.State = .{},
     streams: streams_mod.Manager,
@@ -425,7 +427,7 @@ pub const Session = struct {
         if (existing.manager != &self.streams) return error.Protocol;
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
-        return self.dataSendCreditTracked(existing.tracked);
+        return self.dataSendCreditTrackedFused(existing.tracked);
     }
 
     inline fn dataSendCreditTracked(self: *const Session, tracked: *const stream_mod.Tracked) streams_mod.LocalError!DataSendCredit {
@@ -436,9 +438,24 @@ pub const Session = struct {
         }
         return .{ .max_payload = @min(
             @as(usize, self.peer.send_window.available()),
-            @as(usize, tracked.windows.send.available()),
+            @as(usize, tracked.windows.send.available(self.peer.settings.initial_window_size)),
             @as(usize, self.peer.settings.max_frame_size),
         ) };
+    }
+
+    inline fn dataSendCreditTrackedFused(self: *const Session, tracked: *const stream_mod.Tracked) streams_mod.LocalError!DataSendCredit {
+        switch (tracked.stream.state) {
+            .open, .half_closed_remote => {},
+            .half_closed_local, .closed => return error.StreamClosed,
+            else => return error.Protocol,
+        }
+        const stream_window = tracked.windows.send.adjustment + @as(i32, @intCast(self.peer.settings.initial_window_size));
+        const bounded = @min(
+            self.peer.send_window.value,
+            stream_window,
+            @as(i32, @intCast(self.peer.settings.max_frame_size)),
+        );
+        return .{ .max_payload = if (bounded <= 0) 0 else @intCast(bounded) };
     }
 
     /// Sends at most one DATA frame, bounded by the peer frame-size setting and
@@ -456,7 +473,7 @@ pub const Session = struct {
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
         const tracked = store.get(stream_id) orelse return error.StreamClosed;
-        return self.sendDataTracked(out, stream_id, tracked, bytes, end_stream);
+        return self.sendDataTracked(out, stream_id, tracked, bytes, end_stream, false);
     }
 
     /// DATA fast path for a caller that already resolved a stable stream record.
@@ -472,7 +489,7 @@ pub const Session = struct {
         if (existing.manager != &self.streams) return error.Protocol;
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
-        return self.sendDataTracked(out, existing.stream_id, existing.tracked, bytes, end_stream);
+        return self.sendDataTracked(out, existing.stream_id, existing.tracked, bytes, end_stream, true);
     }
 
     /// Sends one SETTINGS frame and returns a synchronization ticket. ACKs are
@@ -724,8 +741,13 @@ pub const Session = struct {
         tracked: *stream_mod.Tracked,
         bytes: []const u8,
         end_stream: bool,
+        comptime fused_credit: bool,
     ) SendDataError!SendDataResult {
-        const available = (try self.dataSendCreditTracked(tracked)).max_payload;
+        const credit = if (fused_credit)
+            try self.dataSendCreditTrackedFused(tracked)
+        else
+            try self.dataSendCreditTracked(tracked);
+        const available = credit.max_payload;
         if (bytes.len == 0 and !end_stream)
             return .{ .consumed = 0, .blocked = false, .end_stream = false };
 
@@ -751,10 +773,7 @@ pub const Session = struct {
             self.pending.poison();
             return error.FlowControl;
         };
-        self.streams.localDataTracked(stream_id, tracked, @intCast(amount), will_end) catch |err| {
-            self.pending.poison();
-            return err;
-        };
+        self.streams.localDataTrackedAssumeCredit(&self.peer, stream_id, tracked, @intCast(amount), will_end);
         return .{
             .consumed = amount,
             .blocked = amount < bytes.len,
@@ -947,7 +966,7 @@ pub const Session = struct {
             (informational and end_stream) or (field_kind == .trailers and !end_stream))
             return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
 
-        const result = self.streams.receiveHeaders(store, &self.peer, pending.streamId(), end_stream);
+        const result = self.streams.receiveHeaders(store, pending.streamId(), end_stream);
         if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
 
@@ -969,7 +988,7 @@ pub const Session = struct {
 
     fn commitPushPromise(self: *Session, store: anytype, pending: Pending, field_count: u32) Event {
         const promised_stream_id = pending.promisedStream();
-        const result = self.streams.receivePushPromise(store, &self.peer, pending.streamId(), promised_stream_id);
+        const result = self.streams.receivePushPromise(store, pending.streamId(), promised_stream_id);
         if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
         return .{ .push_promise = .{
@@ -992,12 +1011,29 @@ pub const Session = struct {
             count +|= 1;
             switch (effect) {
                 .header_table_size => |size| self.encoder.setAllowedMaxSize(@intCast(size)),
-                .initial_window => |change| if (!store.applyPeerInitialWindow(change))
+                .initial_window => |change| self.applyPeerInitialWindow(store, change) catch
                     return .{ .fault = .{ .connection = .flow_control_error } },
                 else => {},
             }
         }
         return .{ .settings = .{ .ack = parsed.ack, .count = count } };
+    }
+
+    fn applyPeerInitialWindow(
+        self: *Session,
+        store: anytype,
+        change: peer_mod.State.InitialWindowChange,
+    ) error{FlowControl}!void {
+        self.streams.applyPeerInitialWindow(change, null) catch |err| switch (err) {
+            error.FlowControl => return error.FlowControl,
+            error.ExactWindowScanRequired => {
+                const exact = store.maxActiveSendAdjustment();
+                self.streams.applyPeerInitialWindow(change, exact) catch |exact_err| switch (exact_err) {
+                    error.FlowControl => return error.FlowControl,
+                    error.ExactWindowScanRequired => unreachable,
+                };
+            },
+        };
     }
 
     fn receiveWindowUpdate(self: *Session, store: anytype, complete: frame.CompleteFrame) Event {
@@ -1007,7 +1043,7 @@ pub const Session = struct {
             error.FlowControl => .{ .fault = .{ .connection = .flow_control_error } },
         };
         if (routed) |update| {
-            const result = self.streams.receiveWindowUpdate(store, update.stream_id, update.increment);
+            const result = self.streams.receiveWindowUpdate(store, &self.peer, update.stream_id, update.increment);
             if (receiveFault(update.stream_id, result)) |fault| return .{ .fault = fault };
             if (result == .ignored_after_goaway) return .ignored;
             return .{ .window_update = .{ .stream_id = update.stream_id, .increment = update.increment } };
@@ -1073,6 +1109,7 @@ fn receiveFault(stream_id: u31, result: streams_mod.ReceiveResult) ?Fault {
 const TestStore = struct {
     const Slot = struct { id: u31 = 0, used: bool = false, value: stream_mod.Tracked = undefined };
     slots: [8]Slot = [_]Slot{.{}} ** 8,
+    max_adjustment_scans: u32 = 0,
 
     fn slot(id: u31) usize {
         return (@as(usize, id) >> 1) % 8;
@@ -1091,12 +1128,17 @@ const TestStore = struct {
         return &s.value;
     }
 
-    pub fn applyPeerInitialWindow(self: *TestStore, change: peer_mod.State.InitialWindowChange) bool {
+    pub fn maxActiveSendAdjustment(self: *TestStore) i32 {
+        self.max_adjustment_scans += 1;
+        var result: i32 = 0;
         for (&self.slots) |*slot_value| {
             if (!slot_value.used) continue;
-            slot_value.value.windows.applyPeerInitialDelta(change.old, change.new) catch return false;
+            switch (slot_value.value.stream.state) {
+                .open, .half_closed_remote => result = @max(result, slot_value.value.windows.send.adjustment),
+                else => {},
+            }
         }
-        return true;
+        return result;
     }
 };
 
@@ -1299,7 +1341,37 @@ test "session applies SETTINGS header table and stream window effects" {
     }, &scratch, &sink);
     try std.testing.expectEqual(@as(u16, 2), event.settings.count);
     try std.testing.expectEqual(@as(u32, 2048), outbound.allowed_max_size);
-    try std.testing.expectEqual(@as(u31, 32768), store.get(1).?.windows.send.available());
+    try std.testing.expectEqual(@as(u31, 32768), store.get(1).?.windows.send.available(session.peer.settings.initial_window_size));
+    try std.testing.expectEqual(@as(u32, 0), store.max_adjustment_scans);
+}
+
+test "session requests exact stream scan only after positive send-window growth" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    try session.streams.openLocal(&store, &session.peer, 1, false);
+
+    // A stream WINDOW_UPDATE beyond the initial window records only a packed
+    // manager marker; no store-wide aggregate is maintained by Session.
+    const update_result = session.streams.receiveWindowUpdate(&store, &session.peer, 1, 1024);
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, update_result);
+    try std.testing.expectEqual(@as(i32, 1024), store.get(1).?.windows.send.adjustment);
+
+    var sink: NullSink = .{};
+    var scratch: [32]u8 = undefined;
+    const bytes = settingBytes(.{ .id = .initial_window_size, .value = 70_000 });
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = 6, .type = .settings, .flags = 0, .stream_id = 0 },
+        .payload = &bytes,
+    }, &scratch, &sink);
+    try std.testing.expect(event == .settings);
+    try std.testing.expectEqual(@as(u32, 1), store.max_adjustment_scans);
+    try std.testing.expectEqual(@as(u31, 71_024), store.get(1).?.windows.send.available(session.peer.settings.initial_window_size));
 }
 
 test "session drains oversized header list before returning the limit error" {
@@ -1529,7 +1601,7 @@ test "session DATA send obeys flow control and caller backpressure" {
     var h2 = std.Io.Writer.fixed(&h2_storage);
     _ = try session2.sendHeaders(&store2, &h2, 1, false, &staging, &items);
     session2.peer.send_window.value = 0;
-    store2.get(1).?.windows.send.value = 0;
+    store2.get(1).?.windows.send.adjustment = -@as(i32, @intCast(session2.peer.settings.initial_window_size));
     var d2_storage: [32]u8 = undefined;
     var d2 = std.Io.Writer.fixed(&d2_storage);
     const blocked = try session2.sendData(&store2, &d2, 1, "x", true);
@@ -1571,7 +1643,7 @@ test "send response tracks informational final and trailers phases" {
     var storage: [64]u8 = undefined;
     var session = Session.init(.server, .{}, &inbound, &outbound, &storage);
     var store: TestStore = .{};
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
 
     var frame_staging: [256]u8 = undefined;
     var wire_storage: [1024]u8 = undefined;
@@ -1603,7 +1675,7 @@ test "invalid local fields fail before stream or HPACK mutation" {
     var storage: [64]u8 = undefined;
     var session = Session.init(.server, .{}, &inbound, &outbound, &storage);
     var store: TestStore = .{};
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
     const before_state = store.get(1).?.stream.state;
     const before_count = outbound.dynamic.count();
     const invalid = [_]hpack.EncodedField{.{ .field = .{ .name = "content-type", .value = "text/plain" }, .indexing = .incremental }};
@@ -1626,7 +1698,7 @@ test "session sends PUSH_PROMISE and opens promised response stream" {
     var block_storage: [64]u8 = undefined;
     var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
     var store: TestStore = .{};
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
 
     const promised_request = [_]hpack.EncodedField{
         .{ .field = .{ .name = ":method", .value = "GET" } },
@@ -1667,7 +1739,7 @@ test "PUSH_PROMISE preflight respects role and peer push setting" {
     var block_storage: [64]u8 = undefined;
     var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
     var store: TestStore = .{};
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
     _ = try session.peer.applySetting(.{ .id = .enable_push, .value = 0 });
 
     const promised_request = [_]hpack.EncodedField{
@@ -1755,7 +1827,7 @@ test "session sends HTTP2 control frames with state-aware commits" {
     var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
     var store: TestStore = .{};
 
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
     try std.testing.expectEqual(@as(u32, 1), session.streams.activeRemote());
     session.connection.receive_window.value = 60_000;
     store.get(1).?.windows.receive.value = 59_000;
@@ -1815,7 +1887,7 @@ test "session control preflight is retry safe and writer failure poisons" {
     var block_storage: [64]u8 = undefined;
     var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
     var store: TestStore = .{};
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
 
     var storage: [32]u8 = undefined;
     var out = std.Io.Writer.fixed(&storage);
@@ -1847,7 +1919,7 @@ test "DATA event exposes full flow-controlled payload length" {
     var block_storage: [64]u8 = undefined;
     var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
     var store: TestStore = .{};
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
 
     const padded = [_]u8{ 2, 'a', 'b', 'c', 0, 0 };
     var scratch: [1]u8 = undefined;
@@ -1871,7 +1943,7 @@ test "receive credit helpers replenish connection and stream after release" {
     var block_storage: [64]u8 = undefined;
     var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
     var store: TestStore = .{};
-    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
 
     session.connection.receive_window.value = 15_535;
     store.get(1).?.windows.receive.value = 15_535;

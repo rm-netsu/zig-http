@@ -8,8 +8,8 @@ pub const Role = enum { client, server };
 
 /// State advertised by the peer and therefore constraining what the local
 /// endpoint can send. Stream-level windows remain caller-owned; changes to
-/// SETTINGS_INITIAL_WINDOW_SIZE are returned as ordered effects for the caller
-/// to apply to its active stream table.
+/// SETTINGS_INITIAL_WINDOW_SIZE are returned as ordered effects so composed
+/// stream state can validate them in wire order.
 pub const State = struct {
     settings: settings.Settings = .{},
     send_window: flow.FlowWindow = .{},
@@ -238,14 +238,14 @@ test "SETTINGS ACK has no effects" {
     try std.testing.expect((try parsed.effects.next()) == null);
 }
 
-test "initial-window effect applies directly to caller-owned stream windows" {
+test "initial-window effect changes relative stream window without mutation" {
     const stream = @import("stream.zig");
     var peer = State.init(.server);
-    var windows = stream.Windows.init(peer.settings.initial_window_size, 65_535);
+    var windows = stream.Windows.init(65_535);
+    try windows.consumeSend(peer.settings.initial_window_size, 10_000);
     const effect = try peer.applySetting(.{ .id = .initial_window_size, .value = 32_768 });
-    const change = effect.initial_window;
-    try windows.applyPeerInitialDelta(change.old, change.new);
-    try std.testing.expectEqual(@as(u31, 32_768), windows.send.available());
+    try std.testing.expectEqual(@as(i32, -32_767), effect.initial_window.delta());
+    try std.testing.expectEqual(@as(u31, 22_768), windows.send.available(peer.settings.initial_window_size));
 }
 
 test "outbound peer constraints cover frame size push and DATA credit" {

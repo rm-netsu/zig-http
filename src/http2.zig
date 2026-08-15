@@ -23,6 +23,7 @@ pub const CompleteFrameIterator = frame.CompleteIterator;
 pub const parseCompleteFrame = frame.parseComplete;
 pub const Settings = settings.Settings;
 pub const FlowWindow = flow.FlowWindow;
+pub const StreamSendWindow = flow.StreamSendWindow;
 pub const ReceiveCredit = flow.ReceiveCredit;
 pub const ConnectionState = connection.State;
 pub const StreamManager = streams.Manager;

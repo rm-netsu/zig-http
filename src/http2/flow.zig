@@ -43,8 +43,59 @@ pub const ReceiveCredit = struct {
     }
 };
 
-/// Signed local accounting is useful when SETTINGS_INITIAL_WINDOW_SIZE shrinks
-/// a peer's per-stream send window below zero.
+/// Per-stream send credit represented as a signed adjustment relative to the
+/// peer's current SETTINGS_INITIAL_WINDOW_SIZE. SETTINGS changes therefore
+/// remain O(1) connection state updates: no active-stream table sweep is needed.
+///
+/// `adjustment` accounts only for stream-local DATA consumption and
+/// WINDOW_UPDATE increments. The effective window is
+/// `peer_initial_window + adjustment` and can be negative after a SETTINGS
+/// decrease, as required by HTTP/2.
+pub const StreamSendWindow = struct {
+    adjustment: i32 = 0,
+
+    pub inline fn signed(self: StreamSendWindow, peer_initial_window: u31) i64 {
+        return @as(i64, peer_initial_window) + @as(i64, self.adjustment);
+    }
+
+    pub inline fn available(self: StreamSendWindow, peer_initial_window: u31) u31 {
+        // Validated SETTINGS transitions guarantee that the effective stream
+        // window remains <= 2^31-1; the negative bound is representable too.
+        // Keep the DATA hot path in i32 instead of widening every probe to i64.
+        const value = self.adjustment + @as(i32, @intCast(peer_initial_window));
+        return if (value <= 0) 0 else @intCast(value);
+    }
+
+    pub inline fn consume(self: *StreamSendWindow, peer_initial_window: u31, amount: u32) error{FlowControl}!void {
+        if (amount > 0x7fff_ffff) return error.FlowControl;
+        // Empty DATA consumes no flow-control credit and remains legal even
+        // when a SETTINGS decrease has made the effective stream window
+        // negative. Stream-state validation is handled separately.
+        if (amount == 0) return;
+        const current = self.adjustment + @as(i32, @intCast(peer_initial_window));
+        if (current <= 0 or @as(u32, @intCast(current)) < amount) return error.FlowControl;
+        self.adjustment -= @as(i32, @intCast(amount));
+    }
+
+    /// Commit counterpart for a caller that already proved `amount <= available`.
+    /// This is useful after bytes have been successfully written, where repeating
+    /// the same effective-window calculation only adds hot-path overhead.
+    pub inline fn consumeAssumeAvailable(self: *StreamSendWindow, amount: u32) void {
+        std.debug.assert(amount <= 0x7fff_ffff);
+        self.adjustment -= @as(i32, @intCast(amount));
+    }
+
+    pub fn update(self: *StreamSendWindow, peer_initial_window: u31, increment: u31) error{FlowControl}!void {
+        if (increment == 0) return error.FlowControl;
+        const next_adjustment = @as(i64, self.adjustment) + @as(i64, increment);
+        const max_adjustment = @as(i64, 0x7fff_ffff) - @as(i64, peer_initial_window);
+        if (next_adjustment > max_adjustment) return error.FlowControl;
+        self.adjustment = @intCast(next_adjustment);
+    }
+};
+
+/// Generic signed flow-control window used for connection send/receive and
+/// stream receive accounting. Stream send windows use `StreamSendWindow`.
 pub const FlowWindow = struct {
     value: i32 = 65_535,
 
@@ -61,6 +112,10 @@ pub const FlowWindow = struct {
         self.value = @intCast(next);
     }
 
+    /// Applies SETTINGS_INITIAL_WINDOW_SIZE to an absolute stream window.
+    /// The composed HTTP/2 Session uses `StreamSendWindow` instead, but this
+    /// primitive remains available for callers that intentionally choose an
+    /// eager per-stream update policy.
     pub fn applyInitialDelta(self: *FlowWindow, old: u31, new: u31) error{FlowControl}!void {
         const next = @as(i64, self.value) + @as(i64, new) - @as(i64, old);
         if (next > 0x7fff_ffff or next < -0x7fff_ffff) return error.FlowControl;
@@ -73,12 +128,57 @@ pub const FlowWindow = struct {
     }
 };
 
+test "relative stream send window follows peer initial size lazily" {
+    var w: StreamSendWindow = .{};
+    try std.testing.expectEqual(@as(u31, 65_535), w.available(65_535));
+    try w.consume(65_535, 10_000);
+    try std.testing.expectEqual(@as(u31, 55_535), w.available(65_535));
+    try std.testing.expectEqual(@as(u31, 22_768), w.available(32_768));
+    try std.testing.expectEqual(@as(i32, -10_000), w.adjustment);
+    try w.update(32_768, 2_000);
+    try std.testing.expectEqual(@as(u31, 24_768), w.available(32_768));
+}
+
+test "relative stream send window tracks negative settings result" {
+    var w: StreamSendWindow = .{};
+    try w.consume(65_535, 60_000);
+    try std.testing.expectEqual(@as(i32, -27_232), w.signed(32_768));
+    try std.testing.expectEqual(@as(u31, 0), w.available(32_768));
+    try w.update(32_768, 27_232);
+    try std.testing.expectEqual(@as(u31, 0), w.available(32_768));
+    try w.update(32_768, 1);
+    try std.testing.expectEqual(@as(u31, 1), w.available(32_768));
+}
+
+test "zero-length DATA is allowed with a negative stream send window" {
+    var w: StreamSendWindow = .{};
+    try w.consume(65_535, 60_000);
+    try std.testing.expect(w.signed(32_768) < 0);
+    try w.consume(32_768, 0);
+    try std.testing.expectError(error.FlowControl, w.consume(32_768, 1));
+}
+
+test "relative stream window rejects overflow against current initial size" {
+    var w: StreamSendWindow = .{};
+    try std.testing.expectError(error.FlowControl, w.update(65_535, 0));
+    try std.testing.expectError(error.FlowControl, w.update(65_535, 0x7fff_ffff));
+}
+
 test "flow control window" {
     var w: FlowWindow = .{};
     try w.consume(1024);
     try w.update(512);
     try std.testing.expectEqual(@as(u31, 65023), w.available());
     try std.testing.expectError(error.FlowControl, w.update(0));
+}
+
+test "absolute flow window retains eager initial SETTINGS primitive" {
+    var w: FlowWindow = .{};
+    try w.consume(60_000);
+    try w.applyInitialDelta(65_535, 16_384);
+    try std.testing.expectEqual(@as(i32, -43_616), w.value);
+    try w.applyInitialDelta(16_384, 65_535);
+    try std.testing.expectEqual(@as(i32, 5_535), w.value);
 }
 
 test "receive credit replenishment is caller driven and two phase" {

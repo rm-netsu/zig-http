@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
         var stream_index: usize = 0;
         while (stream_index < common.streams_per_connection) : (stream_index += 1) {
             const id: u31 = @intCast(stream_index * 2 + 1);
-            var tracked = http.http2.stream.Tracked.init(65_535, 65_535);
+            var tracked = http.http2.stream.Tracked.init(65_535);
             try tracked.stream.localHeaders(true);
             const ptr = store.insert(id, tracked) orelse return error.StoreFull;
             const body = fixture.body(stream_index);

@@ -74,25 +74,20 @@ pub const Existing = struct {
         return self.manager.receiveResetTracked(self.stream_id, self.tracked);
     }
 
-    pub inline fn receiveWindowUpdate(self: Existing, increment: u31) ReceiveResult {
-        return self.manager.receiveWindowUpdateTracked(self.stream_id, self.tracked, increment);
+    pub inline fn receiveWindowUpdate(self: Existing, peer: *const peer_mod.State, increment: u31) ReceiveResult {
+        return self.manager.receiveWindowUpdateTracked(peer, self.stream_id, self.tracked, increment);
     }
 
     pub inline fn localHeaders(self: Existing, peer: *const peer_mod.State, end_stream: bool) LocalError!void {
         try self.manager.localHeadersTracked(peer, self.stream_id, self.tracked, end_stream);
     }
 
-    pub inline fn localData(self: Existing, payload_length: u32, end_stream: bool) LocalError!void {
-        try self.manager.localDataTracked(self.stream_id, self.tracked, payload_length, end_stream);
+    pub inline fn localData(self: Existing, peer: *const peer_mod.State, payload_length: u32, end_stream: bool) LocalError!void {
+        try self.manager.localDataTracked(peer, self.stream_id, self.tracked, payload_length, end_stream);
     }
 
     pub inline fn localReset(self: Existing) LocalError!void {
         try self.manager.localResetTracked(self.stream_id, self.tracked);
-    }
-
-    /// Applies a SETTINGS_INITIAL_WINDOW_SIZE change returned by `peer.State`.
-    pub inline fn applyPeerInitialWindow(self: Existing, change: peer_mod.State.InitialWindowChange) LocalError!void {
-        self.tracked.windows.applyPeerInitialDelta(change.old, change.new) catch return error.FlowControl;
     }
 
     /// Records receive credit after the local endpoint emits a stream-level
@@ -116,7 +111,10 @@ pub const Existing = struct {
 /// frames after END_STREAM/RST_STREAM; removing it opts into the stricter
 /// high-water-only closed-stream behavior.
 pub const Manager = struct {
-    highest_local_stream_id: u31 = 0,
+    // High bit is spare in HTTP/2 stream identifiers and records whether an
+    // active stream has ever observed positive send-window adjustment since
+    // the last exact validation scan. This avoids growing Manager/Session.
+    highest_local_bits: u32 = 0,
     highest_remote_stream_id: u31 = 0,
     local_active: u32 = 0,
     remote_active: u32 = 0,
@@ -127,6 +125,24 @@ pub const Manager = struct {
     local_goaway_last_stream_id: u32 = no_goaway,
 
     const no_goaway: u32 = 0x8000_0000;
+    const positive_send_adjustment_bit: u32 = 0x8000_0000;
+    const stream_id_mask: u32 = 0x7fff_ffff;
+
+    inline fn highestLocalStreamId(self: Manager) u31 {
+        return @intCast(self.highest_local_bits & stream_id_mask);
+    }
+
+    inline fn positiveSendAdjustmentSeen(self: Manager) bool {
+        return (self.highest_local_bits & positive_send_adjustment_bit) != 0;
+    }
+
+    inline fn notePositiveSendAdjustment(self: *Manager) void {
+        self.highest_local_bits |= positive_send_adjustment_bit;
+    }
+
+    inline fn clearPositiveSendAdjustment(self: *Manager) void {
+        self.highest_local_bits &= stream_id_mask;
+    }
 
     pub fn init(local_role: Role, local_limits: LocalLimits) Manager {
         return .{ .local_role = local_role, .local_limits = local_limits };
@@ -149,6 +165,34 @@ pub const Manager = struct {
 
     pub inline fn activeRemote(self: Manager) u32 {
         return self.remote_active;
+    }
+
+    pub const InitialWindowApplyError = error{ FlowControl, ExactWindowScanRequired };
+
+    /// Validates a peer SETTINGS_INITIAL_WINDOW_SIZE change without touching
+    /// every stream in the common case. Decreases are always safe with respect
+    /// to the upper bound. Increases use a packed positive-adjustment marker;
+    /// only a potential 2^31-1 overflow requires the caller to provide an exact
+    /// maximum adjustment across open/half-closed(remote) streams.
+    pub fn applyPeerInitialWindow(
+        self: *Manager,
+        change: peer_mod.State.InitialWindowChange,
+        exact_active_max_adjustment: ?i32,
+    ) InitialWindowApplyError!void {
+        if (change.new <= change.old or !self.positiveSendAdjustmentSeen()) return;
+
+        const exact = exact_active_max_adjustment orelse return error.ExactWindowScanRequired;
+        if (@as(i64, change.new) + @as(i64, @max(exact, 0)) > 0x7fff_ffff)
+            return error.FlowControl;
+        // An exact scan that found no positive active adjustment lets future
+        // SETTINGS increases return to the O(1) path until another WINDOW_UPDATE
+        // grows a locally-sendable stream above its initial window.
+        if (exact <= 0) self.clearPositiveSendAdjustment();
+    }
+
+    pub inline fn sendWindowAvailable(self: Manager, peer: *const peer_mod.State, tracked: *const Tracked) u31 {
+        _ = self;
+        return tracked.windows.send.available(peer.settings.initial_window_size);
     }
 
     /// Records the last peer-initiated stream identifier placed in a locally
@@ -187,7 +231,7 @@ pub const Manager = struct {
 
     fn absentClosed(self: Manager, stream_id: u31) bool {
         if (stream_id == 0) return false;
-        const highest = if (self.localInitiated(stream_id)) self.highest_local_stream_id else self.highest_remote_stream_id;
+        const highest = if (self.localInitiated(stream_id)) self.highestLocalStreamId() else self.highest_remote_stream_id;
         return stream_id <= highest;
     }
 
@@ -221,8 +265,8 @@ pub const Manager = struct {
         return self.local_active < peer.settings.max_concurrent_streams;
     }
 
-    fn newTracked(self: Manager, peer: *const peer_mod.State) Tracked {
-        return Tracked.init(peer.settings.initial_window_size, self.local_limits.initial_window_size);
+    fn newTracked(self: Manager) Tracked {
+        return Tracked.init(self.local_limits.initial_window_size);
     }
 
     /// Registers a client-initiated request stream before sending its first
@@ -230,15 +274,15 @@ pub const Manager = struct {
     /// push streams with `reserveLocal` and later call `localHeaders`.
     pub fn openLocal(self: *Manager, store: anytype, peer: *const peer_mod.State, stream_id: u31, end_stream: bool) LocalError!void {
         if (self.local_role != .client or stream_id == 0 or !self.localInitiated(stream_id)) return error.Protocol;
-        if (stream_id <= self.highest_local_stream_id or store.get(stream_id) != null) return error.Protocol;
+        if (stream_id <= self.highestLocalStreamId() or store.get(stream_id) != null) return error.Protocol;
         if (peer.goAwayReceived()) return error.GoAway;
         if (!self.peerLimitAvailable(peer)) return error.PeerLimit;
 
-        var value = self.newTracked(peer);
+        var value = self.newTracked();
         try value.stream.localHeaders(end_stream);
         const inserted = store.insert(stream_id, value) orelse return error.StoreFull;
         _ = inserted;
-        self.highest_local_stream_id = stream_id;
+        self.highest_local_bits = (self.highest_local_bits & positive_send_adjustment_bit) | @as(u32, stream_id);
         self.local_active += 1;
     }
 
@@ -249,14 +293,14 @@ pub const Manager = struct {
         if (associated_stream_id == 0 or !self.remoteInitiated(associated_stream_id)) return error.Protocol;
         const associated = store.get(associated_stream_id) orelse return error.Protocol;
         if (associated.stream.state != .open and associated.stream.state != .half_closed_remote) return error.Protocol;
-        if (promised_stream_id == 0 or !self.localInitiated(promised_stream_id) or promised_stream_id <= self.highest_local_stream_id)
+        if (promised_stream_id == 0 or !self.localInitiated(promised_stream_id) or promised_stream_id <= self.highestLocalStreamId())
             return error.Protocol;
         if (store.get(promised_stream_id) != null) return error.Protocol;
 
-        var value = self.newTracked(peer);
+        var value = self.newTracked();
         try value.stream.reserveLocal();
         _ = store.insert(promised_stream_id, value) orelse return error.StoreFull;
-        self.highest_local_stream_id = promised_stream_id;
+        self.highest_local_bits = (self.highest_local_bits & positive_send_adjustment_bit) | @as(u32, promised_stream_id);
     }
 
     /// Applies locally sent HEADERS to an existing stream, including the
@@ -279,23 +323,43 @@ pub const Manager = struct {
         self.adjustActive(stream_id, before, tracked.stream.state);
     }
 
-    pub fn localData(self: *Manager, store: anytype, stream_id: u31, payload_length: u32, end_stream: bool) LocalError!void {
+    pub fn localData(self: *Manager, store: anytype, peer: *const peer_mod.State, stream_id: u31, payload_length: u32, end_stream: bool) LocalError!void {
         const tracked = store.get(stream_id) orelse return error.StreamClosed;
-        try self.localDataTracked(stream_id, tracked, payload_length, end_stream);
+        try self.localDataTracked(peer, stream_id, tracked, payload_length, end_stream);
     }
 
-    pub fn localDataTracked(self: *Manager, stream_id: u31, tracked: *Tracked, payload_length: u32, end_stream: bool) LocalError!void {
+    pub fn localDataTracked(self: *Manager, peer: *const peer_mod.State, stream_id: u31, tracked: *Tracked, payload_length: u32, end_stream: bool) LocalError!void {
         switch (tracked.stream.state) {
             .open, .half_closed_remote => {},
             .half_closed_local, .closed => return error.StreamClosed,
             else => return error.Protocol,
         }
-        tracked.windows.consumeSend(payload_length) catch return error.FlowControl;
+        tracked.windows.consumeSend(peer.settings.initial_window_size, payload_length) catch return error.FlowControl;
         const before = tracked.stream.state;
         tracked.stream.localData(end_stream) catch |err| switch (err) {
             error.StreamClosed => return error.StreamClosed,
             error.Protocol => return error.Protocol,
         };
+        self.adjustActive(stream_id, before, tracked.stream.state);
+    }
+
+    /// Commit-only DATA transition for callers that already checked stream state
+    /// and send credit against the same ordered connection state. The Session
+    /// uses this after the frame write succeeds; external event loops can use it
+    /// when they retain equivalent invariants.
+    pub inline fn localDataTrackedAssumeCredit(
+        self: *Manager,
+        peer: *const peer_mod.State,
+        stream_id: u31,
+        tracked: *Tracked,
+        payload_length: u32,
+        end_stream: bool,
+    ) void {
+        std.debug.assert(tracked.stream.state == .open or tracked.stream.state == .half_closed_remote);
+        std.debug.assert(tracked.windows.send.available(peer.settings.initial_window_size) >= payload_length);
+        tracked.windows.consumeSendAssumeAvailable(payload_length);
+        const before = tracked.stream.state;
+        tracked.stream.localData(end_stream) catch unreachable;
         self.adjustActive(stream_id, before, tracked.stream.state);
     }
 
@@ -317,7 +381,7 @@ pub const Manager = struct {
     /// have succeeded. A new idle stream can only be opened by a client, so an
     /// idle server-initiated identifier received by a client is a connection
     /// PROTOCOL_ERROR.
-    pub fn receiveHeaders(self: *Manager, store: anytype, peer: *const peer_mod.State, stream_id: u31, end_stream: bool) ReceiveResult {
+    pub fn receiveHeaders(self: *Manager, store: anytype, stream_id: u31, end_stream: bool) ReceiveResult {
         if (stream_id == 0) return .connection_protocol;
         if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
         if (store.get(stream_id)) |tracked| return self.receiveHeadersTracked(stream_id, tracked, end_stream);
@@ -333,7 +397,7 @@ pub const Manager = struct {
         self.highest_remote_stream_id = stream_id;
         if (!self.remoteLimitAvailable()) return .refused_stream;
 
-        var value = self.newTracked(peer);
+        var value = self.newTracked();
         value.stream.remoteHeaders(end_stream) catch unreachable;
         _ = store.insert(stream_id, value) orelse return .refused_stream;
         self.remote_active += 1;
@@ -399,7 +463,7 @@ pub const Manager = struct {
 
     /// Applies a stream-level WINDOW_UPDATE. Connection-level updates belong to
     /// `peer.State.windowUpdate()`.
-    pub fn receiveWindowUpdate(self: *Manager, store: anytype, stream_id: u31, increment: u31) ReceiveResult {
+    pub fn receiveWindowUpdate(self: *Manager, store: anytype, peer: *const peer_mod.State, stream_id: u31, increment: u31) ReceiveResult {
         if (stream_id == 0) return .connection_protocol;
         if (increment == 0) return .stream_protocol;
         if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
@@ -407,11 +471,10 @@ pub const Manager = struct {
             if (self.absentClosed(stream_id)) return .accepted;
             return .connection_protocol;
         };
-        return self.receiveWindowUpdateTracked(stream_id, tracked, increment);
+        return self.receiveWindowUpdateTracked(peer, stream_id, tracked, increment);
     }
 
-    pub fn receiveWindowUpdateTracked(self: *Manager, stream_id: u31, tracked: *Tracked, increment: u31) ReceiveResult {
-        _ = self;
+    pub fn receiveWindowUpdateTracked(self: *Manager, peer: *const peer_mod.State, stream_id: u31, tracked: *Tracked, increment: u31) ReceiveResult {
         _ = stream_id;
         if (increment == 0) return .stream_protocol;
         switch (tracked.stream.state) {
@@ -420,14 +483,17 @@ pub const Manager = struct {
             .idle => return .connection_protocol,
             else => {},
         }
-        tracked.windows.peerWindowUpdate(increment) catch return .stream_flow_control;
+        tracked.windows.peerWindowUpdate(peer.settings.initial_window_size, increment) catch return .stream_flow_control;
+        if ((tracked.stream.state == .open or tracked.stream.state == .half_closed_remote) and
+            tracked.windows.send.adjustment > 0)
+            self.notePositiveSendAdjustment();
         return .accepted;
     }
 
     /// Reserves a remotely initiated server-push stream. The associated stream
     /// may be closed because RFC 9113 permits minimal processing of frames that
     /// raced with a locally sent RST_STREAM.
-    pub fn receivePushPromise(self: *Manager, store: anytype, peer: *const peer_mod.State, associated_stream_id: u31, promised_stream_id: u31) ReceiveResult {
+    pub fn receivePushPromise(self: *Manager, store: anytype, associated_stream_id: u31, promised_stream_id: u31) ReceiveResult {
         if (self.local_role != .client or !self.local_limits.enable_push) return .connection_protocol;
         if (associated_stream_id == 0 or !self.localInitiated(associated_stream_id)) return .connection_protocol;
 
@@ -446,7 +512,7 @@ pub const Manager = struct {
         if (store.get(promised_stream_id) != null) return .connection_protocol;
 
         self.highest_remote_stream_id = promised_stream_id;
-        var value = self.newTracked(peer);
+        var value = self.newTracked();
         value.stream.reserveRemote() catch unreachable;
         _ = store.insert(promised_stream_id, value) orelse return .refused_stream;
         return .accepted;
@@ -490,7 +556,7 @@ test "client request response lifecycle uses caller-owned store" {
     try std.testing.expectEqual(@as(u32, 1), manager.activeLocal());
     try std.testing.expectEqual(State.half_closed_local, store.get(1).?.stream.state);
 
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, false));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, false));
     try std.testing.expectEqual(State.half_closed_local, store.get(1).?.stream.state);
     try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveData(&store, 1, 1024, true));
     try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
@@ -500,31 +566,28 @@ test "client request response lifecycle uses caller-owned store" {
 test "server accepts monotonically increasing client streams and closes skipped ids" {
     var store: TestStore = .{};
     var manager = Manager.init(.server, .{});
-    var peer = peer_mod.State.init(.server);
 
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 5, true));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 5, true));
     const skipped = manager.receiveReset(&store, 3);
     try std.testing.expectEqual(ReceiveResult.accepted, skipped);
-    const reused = manager.receiveHeaders(&store, &peer, 3, true);
+    const reused = manager.receiveHeaders(&store, 3, true);
     try std.testing.expectEqual(ReceiveResult.stream_closed, reused);
 }
 
 test "server enforces local concurrent stream limit with REFUSED_STREAM" {
     var store: TestStore = .{};
     var manager = Manager.init(.server, .{ .max_concurrent_streams = 1 });
-    var peer = peer_mod.State.init(.server);
 
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
-    const refused = manager.receiveHeaders(&store, &peer, 3, true);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
+    const refused = manager.receiveHeaders(&store, 3, true);
     try std.testing.expectEqual(ReceiveResult.refused_stream, refused);
 }
 
 test "stream receive flow control returns stream error" {
     var store: TestStore = .{};
     var manager = Manager.init(.server, .{ .initial_window_size = 4 });
-    var peer = peer_mod.State.init(.server);
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, false));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, false));
     const result = manager.receiveData(&store, 1, 5, false);
     try std.testing.expectEqual(ReceiveResult.stream_flow_control, result);
 }
@@ -535,9 +598,9 @@ test "client accepts server push reservation and pushed response" {
     var peer = peer_mod.State.init(.client);
     try manager.openLocal(&store, &peer, 1, true);
 
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receivePushPromise(&store, &peer, 1, 2));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receivePushPromise(&store, 1, 2));
     try std.testing.expectEqual(State.reserved_remote, store.get(2).?.stream.state);
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 2, false));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 2, false));
     try std.testing.expectEqual(State.half_closed_local, store.get(2).?.stream.state);
 }
 
@@ -545,11 +608,11 @@ test "window update is accepted on closed stream but rejected on idle" {
     var store: TestStore = .{};
     var manager = Manager.init(.server, .{});
     var peer = peer_mod.State.init(.server);
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
     try manager.localHeaders(&store, &peer, 1, true);
     try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveWindowUpdate(&store, 1, 1));
-    const idle = manager.receiveWindowUpdate(&store, 3, 1);
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveWindowUpdate(&store, &peer, 1, 1));
+    const idle = manager.receiveWindowUpdate(&store, &peer, 3, 1);
     try std.testing.expectEqual(ReceiveResult.connection_protocol, idle);
 }
 
@@ -558,7 +621,7 @@ test "local server push reservation opens only when peer limit allows" {
     var manager = Manager.init(.server, .{});
     var peer = peer_mod.State.init(.server);
     // Client request stream 1 is peer initiated and half-closed(remote).
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
     try manager.reserveLocal(&store, &peer, 1, 2);
     try std.testing.expectEqual(State.reserved_local, store.get(2).?.stream.state);
 
@@ -592,8 +655,7 @@ test "tracked cursor avoids another caller-store lookup" {
     try std.testing.expectEqual(State.closed, cursor.tracked.stream.state);
 }
 
-
-test "tracked cursor supports local send state and settings delta" {
+test "tracked cursor supports local send state with relative peer window" {
     var store: TestStore = .{};
     var manager = Manager.init(.client, .{});
     var peer = peer_mod.State.init(.client);
@@ -601,23 +663,70 @@ test "tracked cursor supports local send state and settings delta" {
     const cursor = manager.existing(&store, 1).?;
 
     const effect = try peer.applySetting(.{ .id = .initial_window_size, .value = 70_000 });
-    try cursor.applyPeerInitialWindow(effect.initial_window);
-    try std.testing.expectEqual(@as(u31, 70_000), cursor.tracked.windows.send.available());
+    try manager.applyPeerInitialWindow(effect.initial_window, null);
+    try std.testing.expectEqual(@as(u31, 70_000), cursor.tracked.windows.send.available(peer.settings.initial_window_size));
 
-    try cursor.localData(1024, true);
+    try cursor.localData(&peer, 1024, true);
     try std.testing.expectEqual(State.half_closed_local, cursor.tracked.stream.state);
-    try std.testing.expectEqual(@as(u31, 68_976), cursor.tracked.windows.send.available());
+    try std.testing.expectEqual(@as(u31, 68_976), cursor.tracked.windows.send.available(peer.settings.initial_window_size));
 }
 
+test "peer initial window decrease is O(1) with relative stream windows" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    try manager.openLocal(&store, &peer, 1, false);
+    try manager.localData(&store, &peer, 1, 60_000, false);
+    const effect = try peer.applySetting(.{ .id = .initial_window_size, .value = 16_384 });
+    try manager.applyPeerInitialWindow(effect.initial_window, null);
+    const tracked = store.get(1).?;
+    try std.testing.expectEqual(@as(i64, -43_616), tracked.windows.send.signed(peer.settings.initial_window_size));
+    try std.testing.expectEqual(@as(u31, 0), manager.sendWindowAvailable(&peer, tracked));
+}
+
+test "zero-length local DATA can end a stream with negative send window" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    try manager.openLocal(&store, &peer, 1, false);
+    try manager.localData(&store, &peer, 1, 60_000, false);
+
+    const effect = try peer.applySetting(.{ .id = .initial_window_size, .value = 16_384 });
+    try manager.applyPeerInitialWindow(effect.initial_window, null);
+    try std.testing.expect(store.get(1).?.windows.send.signed(peer.settings.initial_window_size) < 0);
+
+    try manager.localData(&store, &peer, 1, 0, true);
+    try std.testing.expectEqual(State.half_closed_local, store.get(1).?.stream.state);
+}
+
+test "stream manager remains compact" {
+    try std.testing.expectEqual(@as(usize, 36), @sizeOf(Manager));
+}
+
+test "peer initial window increase detects active stream overflow exactly" {
+    var store: TestStore = .{};
+    var manager = Manager.init(.client, .{});
+    var peer = peer_mod.State.init(.client);
+    try manager.openLocal(&store, &peer, 1, false);
+
+    // Grow the stream to the maximum effective window using WINDOW_UPDATE.
+    const increment: u31 = 0x7fff_ffff - 65_535;
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveWindowUpdate(&store, &peer, 1, increment));
+    const effect = try peer.applySetting(.{ .id = .initial_window_size, .value = 65_536 });
+    try std.testing.expectError(error.ExactWindowScanRequired, manager.applyPeerInitialWindow(effect.initial_window, null));
+    try std.testing.expectError(error.FlowControl, manager.applyPeerInitialWindow(
+        effect.initial_window,
+        store.get(1).?.windows.send.adjustment,
+    ));
+}
 
 test "local GOAWAY ignores newer remote streams without creating state" {
     var store: TestStore = .{};
     var manager = Manager.init(.server, .{});
-    var peer = peer_mod.State.init(.server);
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
     try manager.sentGoAway(1);
     try std.testing.expectEqual(@as(?u31, 1), manager.lastSentGoAwayStream());
-    try std.testing.expectEqual(ReceiveResult.ignored_after_goaway, manager.receiveHeaders(&store, &peer, 3, true));
+    try std.testing.expectEqual(ReceiveResult.ignored_after_goaway, manager.receiveHeaders(&store, 3, true));
     try std.testing.expect(store.get(3) == null);
     try std.testing.expectError(error.Protocol, manager.sentGoAway(2));
 }
@@ -634,13 +743,12 @@ test "peer GOAWAY identifies unprocessed local streams" {
     try std.testing.expect(!manager.unprocessedByPeer(&peer, 2));
 }
 
-
 test "zero window update remains an error on a closed stream" {
     var store: TestStore = .{};
     var manager = Manager.init(.server, .{});
     var peer = peer_mod.State.init(.server);
-    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, &peer, 1, true));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
     try manager.localHeaders(&store, &peer, 1, true);
     try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
-    try std.testing.expectEqual(ReceiveResult.stream_protocol, manager.receiveWindowUpdate(&store, 1, 0));
+    try std.testing.expectEqual(ReceiveResult.stream_protocol, manager.receiveWindowUpdate(&store, &peer, 1, 0));
 }
