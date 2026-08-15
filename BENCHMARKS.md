@@ -19,26 +19,26 @@ consume the exact same 41-frame HEADERS/DATA trace.
 
 | Scenario | 0.5.0 median |
 | --- | ---: |
-| HTTP/1 real request+response heads, contiguous | 879,966 tx/s |
-| HTTP/1 real heads, compact fragmented parser | 549,628 tx/s |
-| HTTP/1 real heads, streaming framed parser | 646,858 tx/s |
-| HTTP/1 captured-length fixed bodies | 127.2 M bodies/s |
-| HTTP/1 modeled chunked bodies | 324,206 bodies/s |
-| HTTP/2 real field blocks | 5.404 M blocks/s |
-| HTTP/2 complete trace, direct `parseCompleteFrame` loop | 263.3 M frames/s |
-| HTTP/2 complete trace, `CompleteFrameIterator` | 288.6 M frames/s |
-| HTTP/2 fragmented real frame trace | 33.19 M frames/s |
-| Mixed real headers, 4 threads | 1.951 M tx/s |
+| HTTP/1 real request+response heads, contiguous | 879,021 tx/s |
+| HTTP/1 real heads, compact fragmented parser | 547,650 tx/s |
+| HTTP/1 real heads, streaming framed parser | 651,649 tx/s |
+| HTTP/1 captured-length fixed bodies | 128.3 M bodies/s |
+| HTTP/1 modeled chunked bodies | 323,413 bodies/s |
+| HTTP/2 real field blocks | 5.412 M blocks/s |
+| HTTP/2 complete trace, direct `parseCompleteFrame` loop | 265.7 M frames/s |
+| HTTP/2 complete trace, `CompleteFrameIterator` | 295.0 M frames/s |
+| HTTP/2 fragmented real frame trace | 33.80 M frames/s |
+| Mixed real headers, 4 threads | 2.259 M tx/s |
 
 `FramedHeadParser` is 48 bytes on x86_64 versus 24 bytes for `HeadParser`. In
-the full real-world suite it improves fragmented-head throughput by about 17.7%.
+the full real-world suite it improves fragmented-head throughput by about 19.0%.
 A pinned single-core parser-only run over the same head corpus measured 549,565
 versus 670,996 tx/s, about 22.1%. It is therefore kept as an opt-in
 memory-for-throughput path; the compact parser remains unchanged.
 
 The 20-byte HTTP/2 `FrameDecoder` is unchanged in size. Against the older 0.4.x
 real-world baseline, fragmented trace throughput rises from about 24.82 M to
-33.19 M frames/s. A pinned frame-only diagnostic comparing the old and new frame
+33.80 M frames/s. A pinned frame-only diagnostic comparing the old and new frame
 module measured 76.75 M versus 253.39 M frames/s for contiguous incremental calls
 and 18.22 M versus 34.19 M frames/s for fragmented reads. These narrow numbers
 are diagnostic; the full real trace remains the primary release criterion.
@@ -48,7 +48,7 @@ The real trace also corrects an earlier benchmark conclusion: the original
 `CompleteFrameIterator` was inherently faster. Historical real-trace testing did
 not confirm that old implementation. The refined 0.5.0 iterator is retained
 because the primary benchmark now compares it directly against a simple
-`parseCompleteFrame` loop and measures about a 9.6% advantage on identical input.
+`parseCompleteFrame` loop and measures about an 11.0% advantage on identical input.
 
 Persistent state on x86_64:
 
