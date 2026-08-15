@@ -428,6 +428,61 @@ fn encodedFields(allocator: std.mem.Allocator, encoder: *hpack.Encoder, values: 
     return try allocator.dupe(u8, writer.buffered());
 }
 
+test "session receiveBytes waits for a complete frame and dispatches it" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var block_storage: [256]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [512]u8 = undefined;
+
+    const request_fields = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/bytes" },
+    };
+    const block = try encodedFields(allocator, &wire_encoder, &request_fields);
+    defer allocator.free(block);
+
+    var wire: [1024]u8 = undefined;
+    var encoded_header: [9]u8 = undefined;
+    try (frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = 0x05,
+        .stream_id = 1,
+    }).encode(&encoded_header);
+    @memcpy(wire[0..9], &encoded_header);
+    @memcpy(wire[9..][0..block.len], block);
+    const bytes = wire[0 .. 9 + block.len];
+
+    try std.testing.expect((try session.receiveBytes(
+        &store,
+        bytes[0 .. bytes.len - 1],
+        frame.default_max_frame_size,
+        &scratch,
+        &sink,
+    )) == null);
+    try std.testing.expect(store.get(1) == null);
+
+    const received = (try session.receiveBytes(
+        &store,
+        bytes,
+        frame.default_max_frame_size,
+        &scratch,
+        &sink,
+    )).?;
+    try std.testing.expectEqual(bytes.len, received.consumed);
+    try std.testing.expectEqual(fields.Kind.request, received.event.headers.kind);
+    try std.testing.expect(received.event.headers.end_stream);
+}
+
 test "session decodes request response and trailers without growing Tracked" {
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(stream_mod.Tracked));
     const allocator = std.testing.allocator;
