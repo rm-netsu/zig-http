@@ -1,6 +1,6 @@
 .{
     .name = .http,
-    .version = "0.11.0",
+    .version = "0.12.0",
     .fingerprint = 0x97780db2dca25ca8,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
