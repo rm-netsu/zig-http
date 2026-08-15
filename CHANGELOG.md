@@ -9,6 +9,7 @@
 - Extend `bench-real-streams` with a detached stable-record workload; seven CPU-pinned runs measured 122.029 M tx/s detached versus 122.666 M tx/s fused at the median (~-0.5%), while a final stable-cursor send-session A/B was flat at roughly 1.040 versus 1.041 M tx/s with identical wire output.
 - Correct stale README documentation from the pre-0.13 Session store contract: ordinary initial-window SETTINGS changes no longer require a per-stream store hook, and only the rare overflow-validation path asks for `maxActiveSendAdjustment()`.
 - Preserve `stream.Tracked` at 12 bytes, `StreamManager` at 36 bytes, and `Session` at 128 bytes; detached state is temporary and caller-owned.
+- Pass Debug, ReleaseFast, and ReleaseSafe+ThreadSanitizer test configurations on Zig 0.16.0; the broad real-corpus benchmark remains in the established performance range.
 
 ## 0.13.0
 
