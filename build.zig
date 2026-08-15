@@ -117,4 +117,24 @@ pub fn build(b: *std.Build) void {
         previous_session_run = &run.step;
     }
     session_real_step.dependOn(previous_session_run.?);
+
+    const send_session_step = b.step("bench-real-send-session", "Run isolated real-world HTTP/2 send-session benchmarks");
+    const send_session_cases = [_][]const u8{ "manual", "managed", "managed_tracked" };
+    var previous_send_session_run: ?*std.Build.Step = null;
+    for (send_session_cases) |case| {
+        const source = b.fmt("bench/send_session_real_{s}.zig", .{case});
+        const send_session_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = b.fmt("http-send-session-real-{s}", .{case}), .root_module = send_session_mod });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        if (previous_send_session_run) |previous| run.step.dependOn(previous);
+        previous_send_session_run = &run.step;
+    }
+    send_session_step.dependOn(previous_send_session_run.?);
 }
