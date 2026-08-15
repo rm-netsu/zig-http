@@ -181,6 +181,51 @@ callers that already hold a stable stream record. Use it only while both the
 manager and caller-owned record remain stable; the lookup API remains available
 for containers that can move records.
 
+For runtimes that shard stream records away from the ordered connection owner,
+`Existing.detached()` drops the `Manager` pointer entirely. The resulting
+16-byte `DetachedStreamCursor` can apply the common stream-local DATA,
+RST_STREAM, and stream WINDOW_UPDATE transitions directly to one caller-owned
+`Tracked` record and returns a 1-byte `StreamEffect` containing only aggregate
+bookkeeping that belongs back on the connection owner:
+
+```zig
+const existing = manager.existing(&store, stream_id).?;
+const local = existing.detached();
+
+// This can run where the caller owns `local.tracked`. Connection-level DATA
+// flow accounting must already have happened in wire order.
+const applied = local.receiveData(frame_length, end_stream);
+if (applied.result != .accepted) return mapStreamResult(applied.result);
+
+// Hand only the compact aggregate effect back to the ordered connection owner.
+if (!applied.effect.empty()) {
+    manager.commitStreamEffect(stream_id, applied.effect);
+}
+```
+
+The detached cursor deliberately does **not** re-check manager-owned routing
+invariants such as GOAWAY cutoffs or missing-record classification; use the
+lookup-based `StreamManager` path when those checks have not already been
+resolved. A `Tracked` record still has one logical mutator at a time. Core does
+not make it atomic and does not prescribe how a runtime transfers ownership.
+
+`StreamEffect.ordersConcurrency()` identifies active-count changes that should
+be committed before a later concurrent-stream-limit decision needs an exact
+count. `ordersSettings()` identifies the rarer positive stream WINDOW_UPDATE
+effect that must be visible before a later `SETTINGS_INITIAL_WINDOW_SIZE`
+increase is validated. These ordering hints expose the HTTP/2 dependency without
+requiring a particular queue, lock, or worker topology.
+
+The same split is available on the send side. A stream owner can call
+`DetachedStreamCursor.dataSendCredit(peer_initial_window)`, the connection owner
+can combine that value with connection send credit and peer MAX_FRAME_SIZE and
+write DATA, then the stream owner can call `localDataAssumeCredit()` only after
+the write succeeds. This preserves the existing Session preflight/write/commit
+semantics while allowing a lower-level runtime to keep stream storage on a
+separate shard. The ordinary `Session` and `StreamCursor` APIs remain fused for
+convenience and use specialized hot paths rather than paying detached-effect
+overhead internally.
+
 After a locally sent GOAWAY, peer-initiated stream IDs above its last-stream-id
 return `.ignored_after_goaway`. HPACK and connection-level flow-control minimal
 processing still belong to the connection layer and must happen before the
@@ -258,10 +303,11 @@ callers should treat an undecodable HPACK block as connection-fatal because the
 compression context cannot in general be resumed safely.
 
 A Session store uses the same caller-owned `get`/`insert` contract as
-`StreamManager` and additionally provides
-`applyPeerInitialWindow(change) bool`. That operation applies ordered peer
-`SETTINGS_INITIAL_WINDOW_SIZE` changes to live stream send windows; returning
-false is surfaced as a connection flow-control fault. Received
+`StreamManager`. Ordinary peer `SETTINGS_INITIAL_WINDOW_SIZE` changes are now
+O(1) because each stream send window is represented relative to the current peer
+initial window. Only a rare increase that could overflow an active stream asks
+the store for `maxActiveSendAdjustment() i32`; the store can satisfy that query
+with a scan, a maintained aggregate, or shard coordination. Received
 `SETTINGS_HEADER_TABLE_SIZE` updates the caller-owned outbound HPACK encoder's
 allowed table size automatically.
 

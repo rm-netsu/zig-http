@@ -10,6 +10,43 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.14.0 detached stream-local composition
+
+0.14.0 adds a low-level detached stream cursor for runtimes that keep HTTP/2
+stream records on worker-owned shards while retaining one ordered owner for
+connection state. The detached cursor contains only `{stream_id, *Tracked}` and
+returns a 1-byte `StreamEffect` for the small amount of aggregate bookkeeping
+that belongs back on `StreamManager`. Fused lookup and `Existing` paths remain
+unchanged and do not route their hot loops through the detached abstraction.
+
+`bench-real-streams` now includes `detached_tracked`, using the same captured body
+lengths and 16 KiB DATA segmentation as the existing stable-cursor lifecycle.
+Seven alternating CPU-pinned runs of already-built executables produced these
+medians on the development host:
+
+| Stream composition | Median throughput |
+| --- | ---: |
+| Fused `Existing` cursor | 122.666 M tx/s |
+| Detached cursor + effect commit | 122.029 M tx/s |
+
+The difference is about **-0.5%**, below the level where a separate optimization
+claim is warranted. The purpose of the detached path is ownership topology, not
+faster execution on a fixed-array store: common DATA frames can touch only the
+stream-local 12-byte `Tracked` record, while an END_STREAM/reset or positive
+WINDOW_UPDATE returns compact connection bookkeeping to be committed separately.
+
+The refactoring was also checked against the existing stable-cursor send Session
+because an early prototype routed the fused Session through `StreamEffect` and
+regressed code generation by several percent. That implementation was rejected.
+The final tree keeps the original specialized fused hot path. A symmetric pinned
+A/B against tagged 0.13.0 measured approximately **1.040 vs 1.041 M tx/s** for
+the stable-cursor send-session workload with identical **13,835.6 B/tx** wire
+output. This is treated as flat.
+
+Persistent core state is unchanged: `Tracked=12 B`, `StreamManager=36 B`, and
+`Session=128 B`. `DetachedStreamCursor` is a temporary 16-byte value and
+`StreamEffect` is 1 byte.
+
 ## 0.13.0 SETTINGS initial-window scalability
 
 HTTP/2 `SETTINGS_INITIAL_WINDOW_SIZE` used to apply its delta by mutating every

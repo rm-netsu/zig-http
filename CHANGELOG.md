@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.14.0
+
+- Add a 16-byte `DetachedStreamCursor` for runtimes that keep caller-owned HTTP/2 stream records on separate shards and do not want the ordered connection owner to hold a `StreamManager` pointer while applying common stream-local transitions.
+- Add a 1-byte `StreamEffect` carrying only aggregate active-count and positive-send-adjustment bookkeeping back to `StreamManager`; explicit `ordersConcurrency()` and `ordersSettings()` hints expose the HTTP/2 ordering barriers without prescribing locks, atomics, queues, or a worker topology.
+- Support detached receive-side DATA, RST_STREAM, and stream WINDOW_UPDATE transitions plus send-side DATA credit probing and checked/unchecked post-write DATA commits, while keeping manager-level routing/GOAWAY/missing-stream semantics available through the existing fused APIs.
+- Keep the composed Session and stable `StreamCursor` on specialized direct hot paths after rejecting an initial implementation that reused the detached effect path and regressed the send-session benchmark by several percent.
+- Extend `bench-real-streams` with a detached stable-record workload; seven CPU-pinned runs measured 122.029 M tx/s detached versus 122.666 M tx/s fused at the median (~-0.5%), while a final stable-cursor send-session A/B was flat at roughly 1.040 versus 1.041 M tx/s with identical wire output.
+- Correct stale README documentation from the pre-0.13 Session store contract: ordinary initial-window SETTINGS changes no longer require a per-stream store hook, and only the rare overflow-validation path asks for `maxActiveSendAdjustment()`.
+- Preserve `stream.Tracked` at 12 bytes, `StreamManager` at 36 bytes, and `Session` at 128 bytes; detached state is temporary and caller-owned.
+
 ## 0.13.0
 
 - Represent each HTTP/2 stream send window as a signed adjustment relative to the peer's current `SETTINGS_INITIAL_WINDOW_SIZE`, removing the mandatory live-stream table mutation on ordinary SETTINGS changes.
