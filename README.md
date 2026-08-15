@@ -84,6 +84,7 @@ HPACK is fetched from `https://github.com/rm-netsu/zig-hpack` and pinned by both
 zig build test
 zig build test -Doptimize=ReleaseFast
 zig build bench -Doptimize=ReleaseFast
+zig build bench-real -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.

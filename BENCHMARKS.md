@@ -53,3 +53,49 @@ The optimized common validator keeps two 256-byte read-only byte-class tables: o
 ## Earlier rejected experiments
 
 The 0.3.0 investigations also rejected `std.Io.Writer.writeVecAll` for the tested HTTP/1 and HTTP/2 serialization workloads, manual hexadecimal chunk-size formatting, scalar CR scanning in HTTP/1, and a more branch-minimized HTTP/2 field validator when those variants did not improve measured performance.
+
+## Real-world protocol benchmark
+
+`zig build bench-real -Doptimize=ReleaseFast` is the primary benchmark for
+production-facing parser decisions. It uses the offline corpus documented in
+`bench/REAL_CORPUS.md` rather than a single fixed request.
+
+It covers:
+
+- contiguous HTTP/1.1 request/response heads projected from captured fields;
+- fragmented HTTP/1.1 heads across varied transport-read boundaries;
+- chunked-body decoding using captured response sizes and modeled chunk splits;
+- HTTP/2 field validation on captured request/response blocks;
+- HTTP/2 complete-frame iteration over HEADERS and DATA frames whose HEADERS
+  sizes come from real HPACK encoding and whose DATA sizes follow captured
+  `content-length` values;
+- the same HTTP/2 trace through the incremental decoder with varied read sizes.
+
+Fixture construction and HPACK encoding happen before timing. Timed HTTP parser
+and validator paths are allocation-free; state sizes are printed for every run.
+The older `zig build bench` target remains useful for focused microdiagnostics,
+but optimization decisions should prefer `bench-real` unless a change targets a
+path not represented by the corpus.
+
+### Current 0.4.x development baseline
+
+Five consecutive `ReleaseFast` runs on the same x86_64 Linux host produced the
+following medians. These numbers are a local regression baseline, not network or
+end-to-end server throughput claims.
+
+| Scenario | Median |
+| --- | ---: |
+| HTTP/1 real request+response heads, contiguous | 843,074 tx/s |
+| HTTP/1 real request+response heads, fragmented | 533,890 tx/s |
+| HTTP/1 captured-length fixed bodies | 128.7 M bodies/s |
+| HTTP/1 modeled chunked bodies | 328,815 bodies/s |
+| HTTP/2 real field blocks | 5.419 M blocks/s / 72.77 M fields/s |
+| HTTP/2 complete real frame trace | 216.9 M frames/s |
+| HTTP/2 fragmented real frame trace | 24.82 M frames/s |
+| Mixed real headers, 4 threads | 2.142 M tx/s |
+
+The reported frame-trace MiB/s is *wire coverage*: DATA payload slices are
+returned zero-copy rather than scanned byte-by-byte, so it must not be read as
+memory-copy bandwidth. Likewise, `FixedBody.take` is intentionally tiny and its
+very high transaction rate is mainly useful for detecting regressions in that
+primitive.

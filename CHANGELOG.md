@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add an offline real-world protocol benchmark covering diverse captured HTTP headers, fragmented reads, body framing, HTTP/2 field validation, and realistic HEADERS/DATA frame traces.
+- Fix HTTP/2 frame serialization for payload lengths above 255 bytes by encoding all three 24-bit length octets correctly.
+
 ## 0.4.0
 
 - Parse contiguous HTTP/1 heads line-by-line without a preliminary CRLF-CRLF scan.
