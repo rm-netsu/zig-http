@@ -10,7 +10,7 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - Small process-wide byte-class tables and SIMD validation trade about 512 bytes of read-only data for faster field parsing without increasing per-connection state.
 - Incremental fallbacks preserve streaming operation across arbitrarily fragmented reads.
 - HTTP/2 connection state is split from caller-owned stream storage: connection-wide invariants stay allocation-free while applications choose their own stream slab/hash layout.
-- An optional 128-byte `Session` composes complete-frame parsing, HPACK decode, field semantics, stream transitions, peer SETTINGS/GOAWAY, and flow accounting without owning either HPACK allocators or the stream table.
+- An optional 128-byte `Session` composes complete-frame parsing, HPACK decode, field semantics, stream transitions, peer SETTINGS/GOAWAY, flow accounting, and state-aware outbound control frames without owning either HPACK allocators or the stream table.
 - HTTP/1 bodies and HTTP/2 frame payloads are streamed without whole-message buffering.
 - Strict HTTP/1 framing checks reject ambiguous `Transfer-Encoding` / `Content-Length` input.
 - HPACK is provided by the standalone `hpack` package, with explicit memory and decode limits.
@@ -294,6 +294,24 @@ For an event loop that already owns a stable `StreamCursor`,
 lookup. The fixed-array benchmark does not show a speedup from this cursor, so it
 is an API for expensive real stores rather than a claimed universal fast path.
 
+Control frames use the same send-poison rule while keeping state changes
+transactional with respect to the writer. `sendSettingsAck()` and
+`sendPingAck()` cover the mandatory response paths. `sendWindowUpdate()` credits
+the local connection or retained stream receive window only after the frame is
+successfully written; `sendReset()` closes stream state after the RST_STREAM
+commit; and `sendGoAway()` enforces a non-increasing local last-stream-id before
+recording graceful shutdown state. Stable-cursor variants are available for
+stream WINDOW_UPDATE and RST_STREAM as well.
+
+Sending new SETTINGS values is intentionally kept in the low-level
+`http2.send.writeSettings()` primitive. A Session does not own the local
+SETTINGS synchronization queue or transport receive limits, so silently applying
+those values before their peer ACK would couple the protocol core to an
+application policy it otherwise avoids. The low-level writer streams six-byte
+settings directly without building a whole payload buffer; applications commit
+their corresponding local policy at the appropriate SETTINGS synchronization
+point.
+
 HTTP/2 local field-section phase is tracked in existing `Tracked` padding, so
 `Tracked` remains 12 bytes. `Session` also remains 128 bytes: a send-side poison
 flag uses the otherwise impossible high bit of its pending stream identifier.
@@ -313,7 +331,7 @@ partially advanced.
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS and caller-owned flow/stream state primitives.
 - `http2/streams.zig` — allocation-free stream-ID/concurrency/lifecycle manager over caller-owned storage.
 - `http2/session.zig` — optional 128-byte receive/send session composition with HPACK/field/stream/control dispatch over caller-owned storage.
-- `http2/send.zig` — bounded streaming HPACK field-block framing into HEADERS/CONTINUATION frames.
+- `http2/send.zig` — bounded streaming HPACK field-block framing plus allocation-free SETTINGS/PING/RST_STREAM/WINDOW_UPDATE/GOAWAY serialization.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
 - `hpack` 0.4.1 dependency — standalone RFC 7541 codec with real-world-benchmarked encoder lookup and short-literal Huffman fast paths plus bounded decoding.

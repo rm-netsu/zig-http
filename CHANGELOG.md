@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0
+
+- Add allocation-free HTTP/2 control-frame writers for SETTINGS, SETTINGS ACK, PING, RST_STREAM, WINDOW_UPDATE, and GOAWAY.
+- Add state-aware `Session.sendSettingsAck()`, `sendPing()` / `sendPingAck()`, `sendWindowUpdate()`, `sendReset()`, and `sendGoAway()` paths while keeping Session at 128 bytes and `stream.Tracked` at 12 bytes.
+- Commit local receive-window credit, stream reset state, and GOAWAY cutoffs only after the corresponding frame is successfully written; protocol/size preflight failures remain retry-safe while partial writer failures poison only the send side.
+- Add stable-cursor WINDOW_UPDATE and RST_STREAM send variants for applications with expensive caller-owned stream lookup.
+- Keep outbound SETTINGS value application caller-owned: `http2.send.writeSettings()` serializes ordered values without a whole-frame buffer while the application controls ACK-synchronized local policy changes.
+- Re-run the isolated real send-session benchmark after the control-send additions; existing HEADERS/DATA throughput remains within run-to-run noise with identical wire bytes per transaction.
+
 ## 0.9.0
 
 - Add streaming send-side HTTP/2 Session support for HPACK field blocks, emitting HEADERS plus CONTINUATION frames without buffering the complete encoded block.

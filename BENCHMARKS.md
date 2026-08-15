@@ -10,6 +10,22 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.10.0 send-session regression check
+
+The 0.10.0 control-send work adds separate Session methods and does not modify
+the existing HEADERS/DATA hot path. Because Zig 0.16 code layout can still move
+when unrelated functions are added to the same module, the isolated
+`bench-real-send-session` executables were re-run five times after the change.
+Median throughput from those direct runs was 1.001 M tx/s for manual
+composition, 0.983 M tx/s for the lookup Session, and 0.967 M tx/s for the
+stable-cursor Session. All cases retained 13,835.6 wire bytes per transaction.
+
+These values are within the normal host-to-host/run-to-run spread of the 0.9.0
+measurements and do not indicate a HEADERS/DATA regression. Control frames are
+not given a synthetic throughput benchmark because SETTINGS/PING/GOAWAY/reset
+frequency is application- and failure-driven; their primary regression coverage
+is serialization/state-transition correctness.
+
 ## 0.9.0 send-session results
 
 The send-side Session is measured in isolated executables so outbound HPACK and
