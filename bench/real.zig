@@ -357,7 +357,6 @@ fn benchHttp1Fragmented(io: Io, fixtures: *const Fixtures, transactions: u64) !R
     return .{ .elapsed = elapsed, .transactions = transactions, .operations = transactions * 2, .bytes = bytes, .checksum = checksum };
 }
 
-
 fn parseStreamingFramedHead(parser: *http.http1.FramedHeadParser, mode: http.http1.head.Mode, wire: []const u8, method: []const u8, seed: usize) !usize {
     parser.reset(mode);
     var pos: usize = 0;
@@ -490,7 +489,6 @@ fn dispatchFrame(frame: http.http2.frame.CompleteFrame, guard: *http.http2.conti
         else => frame.payload.len,
     };
 }
-
 
 fn benchH2ParseComplete(io: Io, fixtures: *const Fixtures, target_frames: u64) !Result {
     const loops = @max(@as(u64, 1), target_frames / @max(fixtures.h2_frames, 1));

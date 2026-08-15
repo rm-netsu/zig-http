@@ -51,7 +51,6 @@ fn benchHttp1IncrementalFast(io: Io, wire: []const u8, operations: u64) !i96 {
     return elapsed;
 }
 
-
 fn benchHttp1StreamingFramed(io: Io, wire: []const u8, operations: u64) !i96 {
     var storage: [512]u8 = undefined;
     var parser = http.http1.FramedHeadParser.init(.request, &storage);

@@ -10,6 +10,60 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.5.0 real-world results
+
+The primary 0.5.0 comparison uses `zig build bench-real -Doptimize=ReleaseFast`.
+Five consecutive runs of the final candidate were collected on the same x86_64
+Linux host; the values below are medians. The direct and iterator HTTP/2 rows
+consume the exact same 41-frame HEADERS/DATA trace.
+
+| Scenario | 0.5.0 median |
+| --- | ---: |
+| HTTP/1 real request+response heads, contiguous | 879,966 tx/s |
+| HTTP/1 real heads, compact fragmented parser | 549,628 tx/s |
+| HTTP/1 real heads, streaming framed parser | 646,858 tx/s |
+| HTTP/1 captured-length fixed bodies | 127.2 M bodies/s |
+| HTTP/1 modeled chunked bodies | 324,206 bodies/s |
+| HTTP/2 real field blocks | 5.404 M blocks/s |
+| HTTP/2 complete trace, direct `parseCompleteFrame` loop | 263.3 M frames/s |
+| HTTP/2 complete trace, `CompleteFrameIterator` | 288.6 M frames/s |
+| HTTP/2 fragmented real frame trace | 33.19 M frames/s |
+| Mixed real headers, 4 threads | 1.951 M tx/s |
+
+`FramedHeadParser` is 48 bytes on x86_64 versus 24 bytes for `HeadParser`. In
+the full real-world suite it improves fragmented-head throughput by about 17.7%.
+A pinned single-core parser-only run over the same head corpus measured 549,565
+versus 670,996 tx/s, about 22.1%. It is therefore kept as an opt-in
+memory-for-throughput path; the compact parser remains unchanged.
+
+The 20-byte HTTP/2 `FrameDecoder` is unchanged in size. Against the older 0.4.x
+real-world baseline, fragmented trace throughput rises from about 24.82 M to
+33.19 M frames/s. A pinned frame-only diagnostic comparing the old and new frame
+module measured 76.75 M versus 253.39 M frames/s for contiguous incremental calls
+and 18.22 M versus 34.19 M frames/s for fragmented reads. These narrow numbers
+are diagnostic; the full real trace remains the primary release criterion.
+
+The real trace also corrects an earlier benchmark conclusion: the original
+0.4.0 eight-identical-DATA-frame microbenchmark suggested that
+`CompleteFrameIterator` was inherently faster. Historical real-trace testing did
+not confirm that old implementation. The refined 0.5.0 iterator is retained
+because the primary benchmark now compares it directly against a simple
+`parseCompleteFrame` loop and measures about a 9.6% advantage on identical input.
+
+Persistent state on x86_64:
+
+| Type | Size |
+| --- | ---: |
+| `http1.HeadParser` | 24 B |
+| `http1.FramedHeadParser` | 48 B |
+| `http1.ChunkDecoder` | 32 B |
+| `http2.FrameDecoder` | 20 B |
+| `http2.FlowWindow` | 4 B |
+| `http2.continuation.Guard` | 4 B |
+| `http2.header_block.Collector` | 24 B |
+| `http2.fields.Validator` | 8 B |
+| `http2.CompleteFrameIterator` | 32 B temporary |
+
 ## 0.4.0 versus 0.3.0
 
 Five consecutive ReleaseFast runs were collected from clean worktrees on the same x86_64 Linux host. Values below are medians.
@@ -25,7 +79,7 @@ Five consecutive ReleaseFast runs were collected from clean worktrees on the sam
 
 The field-validation result includes the stricter RFC 9113 check that rejects leading/trailing SP and HTAB.
 
-For a buffer containing eight 32-byte DATA frames, repeatedly calling `parseCompleteFrame` reaches about 398.4 M frames/s, while `CompleteFrameIterator` reaches about 442.0 M frames/s, approximately 1.11x faster. The iterator uses 32 bytes of temporary state on x86_64.
+For a buffer containing eight identical 32-byte DATA frames, the original microbenchmark reported about 398.4 M frames/s for repeated `parseCompleteFrame` calls and 442.0 M frames/s for the 0.4.0 iterator. Later real-trace historical testing showed that this result did not generalize; treat it as a historical microbenchmark result rather than evidence that the 0.4.0 iterator was universally faster.
 
 ## Memory trade-off
 
@@ -48,7 +102,7 @@ The optimized common validator keeps two 256-byte read-only byte-class tables: o
 - HTTP token validation is unrolled four bytes at a time. Eight-byte unrolling increased code size and regressed the parser benchmark.
 - HTTP/2 field values use 8-byte SIMD blocks. A 256-byte lowercase-name table did not improve the validator enough to justify another global table.
 - HTTP/2 frame validation uses one type switch. A special DATA/HEADERS pre-branch did not improve the measured hot path.
-- The batch iterator is retained; a comptime callback dispatcher was only about 1-2% faster and added API complexity.
+- A callback-based complete-frame dispatcher was rejected after real-trace prototypes showed callback/event overhead. The iterator is compared directly with a simple `parseCompleteFrame` loop in `bench-real` instead of being assumed faster.
 
 ## Earlier rejected experiments
 

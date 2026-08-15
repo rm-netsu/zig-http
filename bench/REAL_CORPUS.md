@@ -60,3 +60,14 @@ claimed to come from the HAR files.
 HTTP/2 HEADERS payloads are HPACK-encoded once during fixture construction using
 this repository's pinned HPACK dependency. Fixture construction is excluded from
 all timed regions; HPACK performance is measured separately by zig-hpack.
+
+## HTTP parser comparisons
+
+The HTTP/1 fragmented-head workload is measured through both the compact
+`HeadParser` and the larger `FramedHeadParser`. This keeps the memory-for-CPU
+trade-off visible in the primary benchmark rather than only in a microbenchmark.
+
+The HTTP/2 complete-frame trace is measured twice over the exact same bytes:
+once with a direct `parseCompleteFrame` loop and once with
+`CompleteFrameIterator`. This prevents iterator-specific optimizations from being
+credited unless they beat the simpler complete-frame API on the real trace.

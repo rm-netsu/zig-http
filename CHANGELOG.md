@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - Add an offline real-world protocol benchmark covering diverse captured HTTP headers, fragmented reads, body framing, HTTP/2 field validation, and realistic HEADERS/DATA frame traces.
 - Fix HTTP/2 frame serialization for payload lengths above 255 bytes by encoding all three 24-bit length octets correctly.
+- Update the standalone `hpack` dependency to 0.4.1.
+- Add `FramedHeadParser`, an opt-in incremental HTTP/1 parser that spends a small amount of extra state to accumulate framing while lines arrive and avoid the final header-field traversal.
+- Split common HTTP/2 DATA/HEADERS validation from uncommon frame validation and inline the incremental decoder hot path without increasing its 20-byte state.
+- Refine `CompleteFrameIterator` to retain a shrinking input remainder and reuse the validated complete-frame parser.
+- Extend the real-world benchmark so HTTP/1 compact versus streaming framed parsing and HTTP/2 direct complete parsing versus iteration are measured on identical corpus data.
 
 ## 0.4.0
 

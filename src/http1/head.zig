@@ -180,7 +180,6 @@ pub fn parseResponse(input: []const u8, request_method: []const u8) Error!?Frame
     }
 }
 
-
 /// Incremental framed-head parser optimized for transports that fragment HTTP/1
 /// heads frequently. Unlike `HeadParser.feedRequest` / `feedResponse`, it parses
 /// complete lines as they arrive and carries body-framing state across reads, so
@@ -624,7 +623,6 @@ const TransferEncodingState = struct {
     }
 };
 
-
 test "streaming framed parser handles fragmented request without final field rescan" {
     var scratch: [256]u8 = undefined;
     var p = FramedHeadParser.init(.request, &scratch);
@@ -644,7 +642,6 @@ test "streaming framed parser validates response fields and bodyless semantics" 
     p.reset(.response);
     try std.testing.expectError(error.InvalidHeader, p.feedResponse("HTTP/1.1 204 No Content\r\nX: bad\x01value\r\n\r\n", "GET"));
 }
-
 
 test "streaming framed parser survives one-byte fragmentation" {
     const request = "POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\n";

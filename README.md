@@ -29,7 +29,7 @@ if (try http.http1.parseRequest(input)) |parsed| {
 }
 ```
 
-`parseRequest` and `parseResponse` now scan a contiguous head only once: start-line parsing, field validation, and body framing advance together until the terminating empty line. Malformed complete lines can therefore fail early before the final delimiter arrives. When the head spans reads, use `HeadParser.feedRequest` or `HeadParser.feedResponse`; only head bytes are copied to caller-owned scratch storage.
+`parseRequest` and `parseResponse` now scan a contiguous head only once: start-line parsing, field validation, and body framing advance together until the terminating empty line. Malformed complete lines can therefore fail early before the final delimiter arrives. When the head spans reads, `HeadParser.feedRequest` / `feedResponse` keep the smallest persistent parser state. For transports that fragment heads frequently, `FramedHeadParser` spends 48 bytes instead of 24 bytes on x86_64 to validate complete lines and accumulate body-framing state as they arrive, avoiding the final field traversal. Both parsers copy only head bytes into caller-owned scratch storage.
 
 ## HTTP/2 fast path
 
@@ -46,7 +46,7 @@ if (try http.http2.parseCompleteFrame(input, http.http2.frame.default_max_frame_
 
 The payload slice aliases caller input. Use `FrameDecoder` for fragmented frame headers or payloads.
 
-When a TLS/TCP read contains several complete frames, use the batch iterator to avoid rebuilding a remainder slice and parse-result wrapper for every frame:
+When a TLS/TCP read contains several complete frames, `CompleteFrameIterator` repeatedly applies the same validated zero-copy complete-frame path while retaining the unconsumed remainder:
 
 ```zig
 var frames = http.http2.CompleteFrameIterator.init(
@@ -72,7 +72,7 @@ The iterator itself is 32 bytes on x86_64 and does not become part of persistent
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — protocol state primitives.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
-- `hpack` 0.3.0 dependency — standalone RFC 7541 codec with compact connection state, combined encoder lookup, staged Huffman decoding, and bounded decoding.
+- `hpack` 0.4.1 dependency — standalone RFC 7541 codec with real-world-benchmarked encoder lookup and short-literal Huffman fast paths plus bounded decoding.
 
 ## Dependency
 
