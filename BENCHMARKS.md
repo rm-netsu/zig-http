@@ -10,6 +10,38 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.11.0 outbound control-plane and scheduler checks
+
+The 0.11.0 work completes the high-level outbound control plane with
+PUSH_PROMISE and caller-owned SETTINGS/ACK tickets, then adds a separate
+`bench-real-scheduler` target for DATA selection. The scheduler fixture keeps 64
+client streams in a fixed-array store, derives body sizes from the captured real
+corpus, blocks every fourth stream, and periodically drops the connection send
+window to zero. Manual and managed cases are isolated executables and receive
+the same runtime argument so they scan the same workload shape.
+
+Seven alternating direct runs of already-built scheduler executables produced
+medians of **258.310 M decisions/s** for the manually inlined scan and **112.504
+M decisions/s** for `DataScheduler.nextAssumeValid()`. The helper therefore is
+not a scan-speed optimization on this deliberately cheap store: it costs about
+8.9 ns per scheduling decision versus about 3.9 ns for the hand-inlined loop. It
+is retained as a small correctness/convenience layer for applications that value
+a reusable credit-aware selector; applications chasing the last few nanoseconds
+can keep scheduling policy fully inline or use the lower-level Session credit
+probe.
+
+The existing send-session workload was also re-run after the new code changed
+module layout. Three complete ReleaseFast runs produced medians of **1.004 M
+tx/s** for manual composition, **0.984 M tx/s** for lookup Session, and **1.044
+M tx/s** for stable-cursor Session, all at the unchanged **13,835.6 B/tx**. The
+stable-cursor lead in this short sample is treated as code-layout/run variance,
+not as a universal speedup; importantly, the established HEADERS/DATA path does
+not show a regression.
+
+State sizes remain allocation-conscious: `Session` is 128 B, `stream.Tracked`
+is 12 B, caller-owned `SettingsSync` is 8 B, and `DataScheduler` is 8 B on the
+x86_64 benchmark host.
+
 ## 0.10.0 send-session regression check
 
 The 0.10.0 control-send work adds separate Session methods and does not modify

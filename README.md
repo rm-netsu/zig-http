@@ -239,10 +239,11 @@ allowed table size automatically.
 
 ## HTTP/2 send-side Session
 
-The same 128-byte `Session` also provides streaming outbound HEADERS and DATA
-without owning an output queue or complete HPACK-block buffer. Fields are
-validated before HPACK encoding starts, then encoded directly into a caller-owned
-staging buffer that is flushed as HEADERS/CONTINUATION frames:
+The same 128-byte `Session` also provides streaming outbound HEADERS, DATA,
+PUSH_PROMISE, and the HTTP/2 control plane without owning an output queue or
+complete HPACK-block buffer. Fields are validated before HPACK encoding starts,
+then encoded directly into a caller-owned staging buffer that is flushed as
+HEADERS/PUSH_PROMISE plus CONTINUATION frames:
 
 ```zig
 const fields = [_]http.http2.hpack.EncodedField{
@@ -289,36 +290,101 @@ The amount sent is the minimum of available input, peer
 stream send window. A zero-length DATA frame can still carry END_STREAM when
 both flow-control windows are exhausted because it consumes no credit.
 
+Server push uses the same bounded field-block framer. The four-byte promised
+stream identifier consumes payload space only in the initial PUSH_PROMISE frame;
+CONTINUATION frames use the full staging/frame limit. The promised stream is
+reserved in caller storage before encoding and becomes active only when its
+response HEADERS are sent:
+
+```zig
+_ = try session.sendPushPromise(
+    &store,
+    transport_writer,
+    request_stream_id,
+    promised_stream_id,
+    &frame_staging,
+    &promised_request_fields,
+);
+```
+
 For an event loop that already owns a stable `StreamCursor`,
 `sendHeadersExisting()` and `sendDataExisting()` avoid another caller-store
-lookup. The fixed-array benchmark does not show a speedup from this cursor, so it
-is an API for expensive real stores rather than a claimed universal fast path.
+lookup. The fixed-array benchmark does not universally favor this cursor, so it
+is intended for stores where retaining a stable pointer is already natural.
 
 Control frames use the same send-poison rule while keeping state changes
 transactional with respect to the writer. `sendSettingsAck()` and
-`sendPingAck()` cover the mandatory response paths. `sendWindowUpdate()` credits
-the local connection or retained stream receive window only after the frame is
+`sendPingAck()` cover response paths. `sendWindowUpdate()` credits the local
+connection or retained stream receive window only after the frame is
 successfully written; `sendReset()` closes stream state after the RST_STREAM
 commit; and `sendGoAway()` enforces a non-increasing local last-stream-id before
 recording graceful shutdown state. Stable-cursor variants are available for
 stream WINDOW_UPDATE and RST_STREAM as well.
 
-Sending new SETTINGS values is intentionally kept in the low-level
-`http2.send.writeSettings()` primitive. A Session does not own the local
-SETTINGS synchronization queue or transport receive limits, so silently applying
-those values before their peer ACK would couple the protocol core to an
-application policy it otherwise avoids. The low-level writer streams six-byte
-settings directly without building a whole payload buffer; applications commit
-their corresponding local policy at the appropriate SETTINGS synchronization
-point.
+New SETTINGS frames can now be sent through Session while synchronization stays
+caller-owned. `SettingsSync` is only eight bytes and records wire order; the
+application can attach any policy snapshot to the returned ticket and commit it
+when the corresponding ACK event arrives:
+
+```zig
+var settings_sync: http.http2.SessionSettingsSync = .{};
+const ticket = try session.sendSettings(
+    &settings_sync,
+    transport_writer,
+    &.{.{ .id = .enable_push, .value = 0 }},
+);
+_ = ticket; // associate with caller-owned local policy if needed
+
+// In the receive loop:
+switch (event) {
+    .settings => |applied| if (applied.acknowledge(&settings_sync)) |acked_ticket| {
+        _ = acked_ticket; // commit the matching caller-owned policy snapshot
+    },
+    else => {},
+}
+```
+
+This keeps transport receive limits, stream-store policy, and SETTINGS snapshot
+storage outside Session while still giving ACKs an unambiguous FIFO ticket. A
+failed preflight or writer call does not register a ticket.
+
+### Caller-driven DATA scheduler
+
+`DataScheduler` is an optional one-word round-robin selector over a caller-owned
+list of DATA candidates. It combines connection credit, per-stream credit, and
+peer MAX_FRAME_SIZE without owning buffers, priorities, wakeups, or queues:
+
+```zig
+var scheduler: http.http2.DataScheduler = .{};
+const candidates = [_]http.http2.DataSchedulerCandidate{
+    .{ .stream_id = 1, .remaining = body1.len, .end_stream = true },
+    .{ .stream_id = 3, .remaining = body2.len, .end_stream = true },
+};
+
+switch (try scheduler.next(&session, &store, &candidates)) {
+    .ready => |ready| {
+        // ready.index maps back to caller-owned queue/buffer state.
+        // ready.amount is already bounded by current HTTP/2 send credit.
+        _ = ready;
+    },
+    .blocked => {}, // wait for WINDOW_UPDATE / policy wakeup
+    .idle => {},
+}
+```
+
+`nextAssumeValid()` is the lower-overhead path for event loops whose runnable set
+already contains only live sendable streams; it returns `null` when nothing can
+currently make progress. Scheduling policy remains application-controlled: the
+caller can rebuild or reorder the candidate slice before each round, while the
+helper retains only the next scan index.
 
 HTTP/2 local field-section phase is tracked in existing `Tracked` padding, so
-`Tracked` remains 12 bytes. `Session` also remains 128 bytes: a send-side poison
-flag uses the otherwise impossible high bit of its pending stream identifier.
-Field syntax/semantics and store preconditions fail before HPACK/wire mutation;
-a later HPACK allocation/codec or writer failure marks only the send side
-poisoned because the connection compression or wire state may already be
-partially advanced.
+`Tracked` remains 12 bytes. `Session` remains 128 bytes, `SettingsSync` is 8
+bytes, and `DataScheduler` is one native `usize` (8 bytes on x86_64). Field
+syntax/semantics and store preconditions fail before HPACK/wire mutation; a later
+HPACK allocation/codec or writer failure marks only the send side poisoned
+because the connection compression or wire state may already be partially
+advanced.
 
 ## Modules
 
@@ -331,6 +397,7 @@ partially advanced.
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS and caller-owned flow/stream state primitives.
 - `http2/streams.zig` — allocation-free stream-ID/concurrency/lifecycle manager over caller-owned storage.
 - `http2/session.zig` — optional 128-byte receive/send session composition with HPACK/field/stream/control dispatch over caller-owned storage.
+- `http2/scheduler.zig` — one-word caller-driven round-robin DATA selector over Session flow credit.
 - `http2/send.zig` — bounded streaming HPACK field-block framing plus allocation-free SETTINGS/PING/RST_STREAM/WINDOW_UPDATE/GOAWAY serialization.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
@@ -352,6 +419,7 @@ zig build bench-real-frames -Doptimize=ReleaseFast
 zig build bench-real-streams -Doptimize=ReleaseFast
 zig build bench-real-session -Doptimize=ReleaseFast
 zig build bench-real-send-session -Doptimize=ReleaseFast
+zig build bench-real-scheduler -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.

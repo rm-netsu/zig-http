@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0
+
+- Add streaming outbound HTTP/2 `PUSH_PROMISE` support to Session, including bounded first-frame prefix handling, CONTINUATION framing, server/push-policy preflight, and reserved(local) promised-stream state.
+- Add `Session.sendSettings()` plus an 8-byte caller-owned `SettingsSync` ticket tracker so received ACKs can be matched to sent SETTINGS in wire order without Session owning a policy queue.
+- Validate locally generated SETTINGS before wire mutation, including ENABLE_PUSH role/value rules, INITIAL_WINDOW_SIZE bounds, and MAX_FRAME_SIZE bounds; failed writes do not create synchronization tickets.
+- Add non-mutating Session DATA credit probes and a one-word caller-driven round-robin DATA scheduler that combines connection, stream, and peer frame-size credit while leaving buffers, priorities, wakeups, and queues to the application.
+- Add a lower-overhead `nextAssumeValid()` scheduler path for event loops that already maintain a valid active-stream set, while retaining a checked `idle` / `blocked` / `ready` API.
+- Add an isolated 64-stream scheduler benchmark using captured response body sizes and mixed stream/connection blocking; document its convenience overhead instead of presenting the helper as a scan-speed optimization.
+- Keep `Session` at 128 bytes and `stream.Tracked` at 12 bytes; the new synchronization and scheduling state is caller-owned (8 bytes each on x86_64).
+- Re-run the real send-session benchmark after the additions; HEADERS/DATA throughput remains in the established range with identical wire bytes per transaction.
+
 ## 0.10.0
 
 - Add allocation-free HTTP/2 control-frame writers for SETTINGS, SETTINGS ACK, PING, RST_STREAM, WINDOW_UPDATE, and GOAWAY.
