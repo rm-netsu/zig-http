@@ -237,6 +237,71 @@ false is surfaced as a connection flow-control fault. Received
 `SETTINGS_HEADER_TABLE_SIZE` updates the caller-owned outbound HPACK encoder's
 allowed table size automatically.
 
+## HTTP/2 send-side Session
+
+The same 128-byte `Session` also provides streaming outbound HEADERS and DATA
+without owning an output queue or complete HPACK-block buffer. Fields are
+validated before HPACK encoding starts, then encoded directly into a caller-owned
+staging buffer that is flushed as HEADERS/CONTINUATION frames:
+
+```zig
+const fields = [_]http.http2.hpack.EncodedField{
+    .{ .field = .{ .name = ":status", .value = "200" } },
+    .{ .field = .{ .name = "content-type", .value = "application/json" }, .indexing = .incremental },
+};
+
+var frame_staging: [4097]u8 = undefined; // <= 4096 bytes per field-block frame
+_ = try session.sendHeaders(
+    &store,
+    transport_writer,
+    stream_id,
+    false,
+    &frame_staging,
+    &fields,
+);
+```
+
+The staging buffer needs one lookahead byte, so `4097` bytes caps generated
+HEADERS/CONTINUATION payloads at 4096 bytes even when the peer advertises a much
+larger `SETTINGS_MAX_FRAME_SIZE`. Memory therefore stays bounded independently
+of field-block size. `END_STREAM` is carried only on the initial HEADERS frame;
+`END_HEADERS` is placed on the final HEADERS or CONTINUATION frame, including
+the exact-frame-size boundary case.
+
+DATA is intentionally one frame per call so backpressure stays caller-driven:
+
+```zig
+const sent = try session.sendData(
+    &store,
+    transport_writer,
+    stream_id,
+    body,
+    true,
+);
+body = body[sent.consumed..];
+if (sent.blocked) {
+    // Wait for connection/stream WINDOW_UPDATE before trying again.
+}
+```
+
+The amount sent is the minimum of available input, peer
+`SETTINGS_MAX_FRAME_SIZE`, the peer-advertised connection send window, and the
+stream send window. A zero-length DATA frame can still carry END_STREAM when
+both flow-control windows are exhausted because it consumes no credit.
+
+For an event loop that already owns a stable `StreamCursor`,
+`sendHeadersExisting()` and `sendDataExisting()` avoid another caller-store
+lookup. The fixed-array benchmark does not show a speedup from this cursor, so it
+is an API for expensive real stores rather than a claimed universal fast path.
+
+HTTP/2 local field-section phase is tracked in existing `Tracked` padding, so
+`Tracked` remains 12 bytes. `Session` also remains 128 bytes: a send-side poison
+flag uses the otherwise impossible high bit of its pending stream identifier.
+Field syntax/semantics and store preconditions fail before HPACK/wire mutation;
+a later HPACK allocation/codec or writer failure marks only the send side
+poisoned because the connection compression or wire state may already be
+partially advanced.
+
 ## Modules
 
 - `http1/head.zig` — contiguous and incremental request/response head parsing with body framing.
@@ -247,7 +312,8 @@ allowed table size automatically.
 - `http2/peer.zig` — peer SETTINGS, send-window, outbound constraints, and GOAWAY state.
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS and caller-owned flow/stream state primitives.
 - `http2/streams.zig` — allocation-free stream-ID/concurrency/lifecycle manager over caller-owned storage.
-- `http2/session.zig` — optional 128-byte complete-frame session composition with HPACK/field/stream/control dispatch over caller-owned storage.
+- `http2/session.zig` — optional 128-byte receive/send session composition with HPACK/field/stream/control dispatch over caller-owned storage.
+- `http2/send.zig` — bounded streaming HPACK field-block framing into HEADERS/CONTINUATION frames.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
 - `hpack` 0.4.1 dependency — standalone RFC 7541 codec with real-world-benchmarked encoder lookup and short-literal Huffman fast paths plus bounded decoding.
@@ -267,6 +333,7 @@ zig build bench-real -Doptimize=ReleaseFast
 zig build bench-real-frames -Doptimize=ReleaseFast
 zig build bench-real-streams -Doptimize=ReleaseFast
 zig build bench-real-session -Doptimize=ReleaseFast
+zig build bench-real-send-session -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.

@@ -10,6 +10,50 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.9.0 send-session results
+
+The send-side Session is measured in isolated executables so outbound HPACK and
+frame-writing code in one case cannot affect the code layout of another:
+
+```sh
+zig build bench-real-send-session -Doptimize=ReleaseFast
+```
+
+The fixture uses the same eight connection scenarios and fourteen captured
+request/response exchanges as the receive-side corpus. Each scenario owns an
+independent HPACK encoder and monotonically increasing stream IDs. Response
+field blocks use the same production-like indexing policy as the standalone
+HPACK real-world benchmark: sensitive fields are never indexed, volatile values
+are sent without indexing, and stable fields use incremental indexing. DATA
+sizes come from captured `content-length` values and are split at 16 KiB. After
+each DATA frame the harness models WINDOW_UPDATE so the timed path measures
+steady-state framing/backpressure rather than stopping at the initial 65,535-byte
+credit.
+
+Nine direct runs of the already-built executables, rotated in order and pinned
+to one physical CPU, produced these medians:
+
+| Send composition | Median throughput | Field encode rate | Wire bytes/tx |
+| --- | ---: | ---: | ---: |
+| Manual `Validator + StreamManager + HeaderFramer + Encoder` | 0.990 M tx/s | 15.633 M fields/s | 13,835.6 B |
+| `Session.sendHeaders()` + `sendData()` | 0.973 M tx/s | 15.364 M fields/s | 13,835.6 B |
+| Stable `StreamCursor` + `sendHeadersExisting()` / `sendDataExisting()` | 0.970 M tx/s | 15.308 M fields/s | 13,835.6 B |
+
+The lookup Session is therefore about 1.7% below equivalent manual composition
+on this body-heavy fixture while adding field-section semantics, GOAWAY checks,
+peer frame-size enforcement, both send windows, and explicit backpressure. The
+stable-cursor case is deliberately reported even though this fixed-array store
+is too cheap for it to win: it is statistically neutral/slightly slower here and
+must not be presented as a synthetic speedup. Its purpose is to let applications
+with more expensive hash/slab lookup retain a stable caller-owned stream pointer.
+
+All three paths emit exactly the same logical wire byte count. `Session` remains
+128 bytes and `stream.Tracked` remains 12 bytes on x86_64. Outbound field blocks
+do not need a complete-block scratch allocation: the caller supplies a staging
+buffer of `N + 1` bytes, which yields at most `min(N, peer MAX_FRAME_SIZE)` bytes
+per HEADERS/CONTINUATION payload. The extra byte is lookahead used solely to
+place END_HEADERS correctly when the block length is exactly frame-sized.
+
 ## 0.8.0 session-composition results
 
 The optional `Session` layer is measured separately so its generic dispatch does

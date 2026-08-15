@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0
+
+- Add streaming send-side HTTP/2 Session support for HPACK field blocks, emitting HEADERS plus CONTINUATION frames without buffering the complete encoded block.
+- Bound outbound field-block memory by caller-owned staging storage; one lookahead byte preserves correct END_HEADERS placement when an encoded block exactly fills a frame payload.
+- Add `Session.sendHeaders()` and `sendHeadersExisting()` with HTTP/2 field validation, request/response/informational/trailer phase tracking, stream lifecycle integration, and peer GOAWAY checks.
+- Add `Session.sendData()` and `sendDataExisting()` with one-frame caller-driven backpressure constrained by peer MAX_FRAME_SIZE plus connection and stream send windows.
+- Keep `Session` at 128 bytes and `stream.Tracked` at 12 bytes by storing the local field-section phase in existing per-stream padding and the send-poison bit in an impossible stream-id bit.
+- Poison only the Session send side after HPACK/allocator or writer failures that may have partially advanced the connection compression/wire state; semantic and store preflight failures remain retry-safe.
+- Add isolated `bench-real-send-session` cases over the real response corpus with production-like HPACK indexing and captured body sizes. Nine direct pinned runs measured the lookup Session about 1.7% below manual composition with identical wire bytes per transaction.
+
 ## 0.8.0
 
 - Add a 128-byte allocation-free `Session` that composes complete-frame receive handling with connection rules, HPACK decoding, HTTP/2 field semantics, caller-owned stream transitions, peer SETTINGS/GOAWAY state, and DATA/window accounting.
