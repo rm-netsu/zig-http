@@ -118,6 +118,29 @@ pub fn build(b: *std.Build) void {
     }
     session_real_step.dependOn(previous_session_run.?);
 
+    const scheduler_step = b.step("bench-real-scheduler", "Run caller-driven HTTP/2 DATA scheduler benchmarks");
+    const scheduler_cases = [_][]const u8{ "manual", "managed" };
+    var previous_scheduler_run: ?*std.Build.Step = null;
+    for (scheduler_cases) |case| {
+        const source = b.fmt("bench/scheduler_real_{s}.zig", .{case});
+        const scheduler_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const exe = b.addExecutable(.{ .name = b.fmt("http-scheduler-real-{s}", .{case}), .root_module = scheduler_mod });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        // Keep both isolated executables on the exact same runtime-derived
+        // workload shape while still preventing compile-time folding.
+        run.addArg("2654435761");
+        if (b.args) |args| run.addArgs(args);
+        if (previous_scheduler_run) |previous| run.step.dependOn(previous);
+        previous_scheduler_run = &run.step;
+    }
+    scheduler_step.dependOn(previous_scheduler_run.?);
+
     const send_session_step = b.step("bench-real-send-session", "Run isolated real-world HTTP/2 send-session benchmarks");
     const send_session_cases = [_][]const u8{ "manual", "managed", "managed_tracked" };
     var previous_send_session_run: ?*std.Build.Step = null;
