@@ -13,6 +13,7 @@ pub const connection = @import("http2/connection.zig");
 pub const peer = @import("http2/peer.zig");
 pub const session = @import("http2/session.zig");
 pub const send = @import("http2/send.zig");
+pub const scheduler = @import("http2/scheduler.zig");
 pub const hpack = @import("hpack");
 
 pub const FrameHeader = frame.FrameHeader;
@@ -35,5 +36,11 @@ pub const Session = session.Session;
 pub const SessionEvent = session.Event;
 pub const SessionSendDataResult = session.SendDataResult;
 pub const SessionSendHeadersResult = session.SendHeadersResult;
+pub const SessionSendPushPromiseResult = session.SendPushPromiseResult;
+pub const SessionSettingsSync = session.SettingsSync;
+pub const SessionSettingsTicket = session.SettingsTicket;
+pub const DataScheduler = scheduler.RoundRobin;
+pub const DataSchedulerCandidate = scheduler.Candidate;
+pub const DataSchedulerDecision = scheduler.Decision;
 
 pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
