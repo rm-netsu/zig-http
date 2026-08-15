@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0
+
+- Add allocation-free `StreamManager` over caller-owned stream storage, enforcing stream initiator parity, monotonically increasing stream IDs, concurrent-stream limits, stream state transitions, and per-stream flow control.
+- Add a short-lived `StreamCursor` / `streams.Existing` fast path for event loops that already hold a stable `Tracked` pointer, avoiding repeated slab/hash lookups across HEADERS, DATA, WINDOW_UPDATE, and local send handling.
+- Add local GOAWAY tracking and `ignored_after_goaway` receive results while keeping HPACK and connection-flow minimal processing explicit at the connection layer.
+- Add `unprocessedByPeer()` so callers can identify locally initiated streams that a received GOAWAY proves were not processed.
+- Keep the stream table fully caller-owned: the required store contract is only `get` plus `insert`, with removal policy left to the application.
+- Add isolated `bench-real-streams` cases for lookup-heavy, stable-pointer, and 64-stream multiplexed lifecycles using captured response body sizes.
+- Add `-Dsanitize-thread=true` build support and propagate ThreadSanitizer instrumentation through both `http` and the pinned `hpack` dependency.
+- Keep zero WINDOW_UPDATE increments as stream PROTOCOL_ERROR even on a closed stream, while valid late WINDOW_UPDATE remains accepted.
+
 ## 0.6.0
 
 - Add allocation-free HTTP/2 `ConnectionState` / `ConnectionDecoder` primitives that enforce CONTINUATION adjacency and connection receive flow control across complete and fragmented transport reads.

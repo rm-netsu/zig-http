@@ -127,6 +127,42 @@ Before writing an outbound frame, `PeerState.sendHeader` can enforce the peer's
 `SETTINGS_MAX_FRAME_SIZE`, server-push permission, and connection DATA send
 credit. Stream-level state and flow checks remain explicit and caller-owned.
 
+## HTTP/2 caller-owned stream manager
+
+`StreamManager` adds stream-ID ordering, initiator parity, concurrent-stream
+limits, per-stream state transitions, stream flow control, PUSH_PROMISE
+reservation, and GOAWAY cutoffs without owning the surrounding stream table. A
+store only needs `get(id)` and `insert(id, Tracked)` methods; slab, fixed-array,
+hash-table, or intrusive storage remains an application choice.
+
+```zig
+var manager = http.http2.StreamManager.init(.client, .{});
+var peer = http.http2.PeerState.init(.client);
+
+try manager.openLocal(&store, &peer, 1, true);
+const stream = manager.existing(&store, 1).?;
+if (stream.receiveHeaders(false) != .accepted) return error.Protocol;
+if (stream.receiveData(data_frame_length, true) != .accepted) return error.Protocol;
+try stream.creditReceive(data_frame_length);
+```
+
+`Tracked` remains 12 bytes. `StreamManager` is 36 bytes on x86_64 and does not
+allocate. `StreamCursor` (`streams.Existing`) is a temporary 24-byte cursor for
+callers that already hold a stable stream record. Use it only while both the
+manager and caller-owned record remain stable; the lookup API remains available
+for containers that can move records.
+
+After a locally sent GOAWAY, peer-initiated stream IDs above its last-stream-id
+return `.ignored_after_goaway`. HPACK and connection-level flow-control minimal
+processing still belong to the connection layer and must happen before the
+stream result is discarded. Conversely, `unprocessedByPeer()` identifies local
+streams above a received GOAWAY last-stream-id so application code can decide
+whether its request semantics permit retry.
+
+`LocalLimits.enable_push` is the effective inbound push policy. A client that
+sends `SETTINGS_ENABLE_PUSH=0` should switch this flag only after that SETTINGS
+value has been acknowledged.
+
 ## Modules
 
 - `http1/head.zig` — contiguous and incremental request/response head parsing with body framing.
@@ -136,6 +172,7 @@ credit. Stream-level state and flow checks remain explicit and caller-owned.
 - `http2/connection.zig` — allocation-free connection receive state and complete/fragmented frame integration.
 - `http2/peer.zig` — peer SETTINGS, send-window, outbound constraints, and GOAWAY state.
 - `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS and caller-owned flow/stream state primitives.
+- `http2/streams.zig` — allocation-free stream-ID/concurrency/lifecycle manager over caller-owned storage.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
 - `hpack` 0.4.1 dependency — standalone RFC 7541 codec with real-world-benchmarked encoder lookup and short-literal Huffman fast paths plus bounded decoding.
@@ -149,9 +186,11 @@ HPACK is fetched from `https://github.com/rm-netsu/zig-hpack` and pinned by both
 ```sh
 zig build test
 zig build test -Doptimize=ReleaseFast
+zig build test -Doptimize=ReleaseSafe -Dsanitize-thread=true
 zig build bench -Doptimize=ReleaseFast
 zig build bench-real -Doptimize=ReleaseFast
 zig build bench-real-frames -Doptimize=ReleaseFast
+zig build bench-real-streams -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.

@@ -10,6 +10,53 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.7.0 stream-manager results
+
+The stream layer has its own isolated target because frame-parser measurements
+previously demonstrated that unrelated code in the same executable can alter Zig
+0.16 inlining and instruction layout:
+
+```sh
+zig build bench-real-streams -Doptimize=ReleaseFast
+```
+
+Each case is a separate executable. The fixture uses response body lengths from
+the same offline real-world corpus, DATA chunks no larger than 16 KiB, odd client
+stream IDs, and caller-owned fixed O(1) storage. Five direct runs of the final
+executables produced these medians:
+
+| Isolated stream lifecycle | Median |
+| --- | ---: |
+| Raw primitives, lookup on frame operations | 112.884 M tx/s |
+| `StreamManager`, lookup API | 91.961 M tx/s |
+| Raw primitives, stable `Tracked*` | 147.771 M tx/s |
+| `StreamManager` + `StreamCursor` | 119.748 M tx/s |
+| Raw primitives, 64 simultaneously active streams | 108.840 M tx/s |
+| `StreamManager`, 64 simultaneously active streams | 111.301 M tx/s |
+
+The sequential cases intentionally maximize protocol-dispatch overhead and show
+about a 19% cost for the full manager checks. The multiplexed case is closer to
+the intended HTTP/2 use: all 64 request streams are opened before responses are
+completed in permuted order. There the manager is effectively flat versus the
+manual `Stream + Windows` baseline within run-to-run noise.
+
+The stable-pointer cases are substantially faster than repeated store lookup for
+both raw and managed paths. This is why the library exposes `StreamCursor` as an
+opt-in short-lived cursor rather than putting a cache inside persistent connection
+state.
+
+State sizes on x86_64:
+
+| Type | Size |
+| --- | ---: |
+| `http2.StreamManager` | 36 B |
+| `http2.StreamCursor` | 24 B temporary |
+| `http2.stream.Tracked` | 12 B per stored stream |
+| `http2.StreamReceiveResult` | 1 B |
+
+The manager performs no heap allocation. Store allocation, tombstone retention,
+and reclamation policy remain outside the protocol core.
+
 ## 0.6.0 connection-state results
 
 The broad `zig build bench-real -Doptimize=ReleaseFast` workload is intentionally
