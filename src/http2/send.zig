@@ -1,10 +1,111 @@
 const std = @import("std");
 const frame = @import("frame.zig");
+const protocol = @import("protocol.zig");
+const settings = @import("settings.zig");
 
 pub const HeaderFrameStats = struct {
     encoded_bytes: usize,
     frame_count: u32,
 };
+
+/// Writes a SETTINGS frame without retaining the payload. Each six-byte value
+/// is encoded through a tiny stack buffer, so large extension setting lists do
+/// not require a caller-owned contiguous frame buffer.
+pub fn writeSettings(
+    out: *std.Io.Writer,
+    items: []const settings.Setting,
+    peer_max_frame_size: u32,
+) (std.Io.Writer.Error || error{FrameTooLarge})!void {
+    const payload_len = std.math.mul(usize, items.len, 6) catch return error.FrameTooLarge;
+    if (payload_len > peer_max_frame_size or payload_len > frame.max_frame_size) return error.FrameTooLarge;
+
+    var header_bytes: [9]u8 = undefined;
+    try (frame.FrameHeader{
+        .length = @intCast(payload_len),
+        .type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    }).encode(&header_bytes);
+    try out.writeAll(&header_bytes);
+
+    for (items) |item| {
+        var encoded: [6]u8 = undefined;
+        settings.encode(&encoded, item);
+        try out.writeAll(&encoded);
+    }
+}
+
+/// Writes an empty SETTINGS acknowledgment frame.
+pub fn writeSettingsAck(out: *std.Io.Writer) std.Io.Writer.Error!void {
+    var wire: [9]u8 = undefined;
+    (frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0x01, .stream_id = 0 }).encode(&wire) catch unreachable;
+    try out.writeAll(&wire);
+}
+
+/// Writes one PING request or response using a single writer call.
+pub fn writePing(out: *std.Io.Writer, ack: bool, payload_bytes: *const [8]u8) std.Io.Writer.Error!void {
+    var wire: [17]u8 = undefined;
+    (frame.FrameHeader{
+        .length = 8,
+        .type = .ping,
+        .flags = @intFromBool(ack),
+        .stream_id = 0,
+    }).encode(wire[0..9]) catch unreachable;
+    @memcpy(wire[9..17], payload_bytes);
+    try out.writeAll(&wire);
+}
+
+/// Writes RST_STREAM. Stream zero is rejected before any bytes are written.
+pub fn writeReset(
+    out: *std.Io.Writer,
+    stream_id: u31,
+    code: protocol.ErrorCode,
+) (std.Io.Writer.Error || error{Protocol})!void {
+    if (stream_id == 0) return error.Protocol;
+    var wire: [13]u8 = undefined;
+    (frame.FrameHeader{ .length = 4, .type = .rst_stream, .flags = 0, .stream_id = stream_id }).encode(wire[0..9]) catch unreachable;
+    std.mem.writeInt(u32, wire[9..13], @intFromEnum(code), .big);
+    try out.writeAll(&wire);
+}
+
+/// Writes a connection- or stream-level WINDOW_UPDATE. Zero credit is rejected
+/// before any bytes are written.
+pub fn writeWindowUpdate(
+    out: *std.Io.Writer,
+    stream_id: u31,
+    increment: u31,
+) (std.Io.Writer.Error || error{Protocol})!void {
+    if (increment == 0) return error.Protocol;
+    var wire: [13]u8 = undefined;
+    (frame.FrameHeader{ .length = 4, .type = .window_update, .flags = 0, .stream_id = stream_id }).encode(wire[0..9]) catch unreachable;
+    std.mem.writeInt(u32, wire[9..13], increment, .big);
+    try out.writeAll(&wire);
+}
+
+/// Writes GOAWAY while respecting the peer's advertised maximum frame size.
+/// Debug data stays caller-owned and is streamed after the fixed 17-byte prefix.
+pub fn writeGoAway(
+    out: *std.Io.Writer,
+    peer_max_frame_size: u32,
+    last_stream_id: u31,
+    code: protocol.ErrorCode,
+    debug_data: []const u8,
+) (std.Io.Writer.Error || error{FrameTooLarge})!void {
+    const payload_len = std.math.add(usize, debug_data.len, 8) catch return error.FrameTooLarge;
+    if (payload_len > peer_max_frame_size or payload_len > frame.max_frame_size) return error.FrameTooLarge;
+
+    var prefix: [17]u8 = undefined;
+    try (frame.FrameHeader{
+        .length = @intCast(payload_len),
+        .type = .goaway,
+        .flags = 0,
+        .stream_id = 0,
+    }).encode(prefix[0..9]);
+    std.mem.writeInt(u32, prefix[9..13], last_stream_id, .big);
+    std.mem.writeInt(u32, prefix[13..17], @intFromEnum(code), .big);
+    try out.writeAll(&prefix);
+    try out.writeAll(debug_data);
+}
 
 /// Streaming writer that turns one HPACK field block into HEADERS followed by
 /// zero or more CONTINUATION frames. The caller-owned staging buffer bounds
@@ -153,4 +254,74 @@ test "header framer streams HEADERS and CONTINUATION frames" {
     try std.testing.expectEqual(@as(u8, 0x04), c.header.flags);
     try std.testing.expectEqualStrings("ij", c.payload);
     try std.testing.expect((try it.next()) == null);
+}
+
+test "control frame writers serialize fixed payloads" {
+    var storage: [128]u8 = undefined;
+    var out = std.Io.Writer.fixed(&storage);
+
+    const ping_data = "12345678".*;
+    try writeSettingsAck(&out);
+    try writePing(&out, true, &ping_data);
+    try writeReset(&out, 3, .cancel);
+    try writeWindowUpdate(&out, 3, 1024);
+    try writeGoAway(&out, frame.default_max_frame_size, 3, .no_error, "bye");
+
+    var it = frame.CompleteIterator.init(out.buffered(), frame.default_max_frame_size);
+    const ack = (try it.next()).?;
+    try std.testing.expectEqual(frame.Type.settings, ack.header.type);
+    try std.testing.expectEqual(@as(u8, 0x01), ack.header.flags);
+    try std.testing.expectEqual(@as(usize, 0), ack.payload.len);
+
+    const ping = (try it.next()).?;
+    try std.testing.expectEqual(frame.Type.ping, ping.header.type);
+    try std.testing.expectEqual(@as(u8, 0x01), ping.header.flags);
+    try std.testing.expectEqualStrings(&ping_data, ping.payload);
+
+    const reset = (try it.next()).?;
+    try std.testing.expectEqual(frame.Type.rst_stream, reset.header.type);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(protocol.ErrorCode.cancel)), std.mem.readInt(u32, reset.payload[0..4], .big));
+
+    const update = (try it.next()).?;
+    try std.testing.expectEqual(frame.Type.window_update, update.header.type);
+    try std.testing.expectEqual(@as(u32, 1024), std.mem.readInt(u32, update.payload[0..4], .big));
+
+    const goaway = (try it.next()).?;
+    try std.testing.expectEqual(frame.Type.goaway, goaway.header.type);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, goaway.payload[0..4], .big));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(protocol.ErrorCode.no_error)), std.mem.readInt(u32, goaway.payload[4..8], .big));
+    try std.testing.expectEqualStrings("bye", goaway.payload[8..]);
+    try std.testing.expect((try it.next()) == null);
+}
+
+test "settings writer streams ordered values" {
+    const values = [_]settings.Setting{
+        .{ .id = .header_table_size, .value = 2048 },
+        .{ .id = .max_concurrent_streams, .value = 100 },
+        .{ .id = .initial_window_size, .value = 131_072 },
+        .{ .id = .max_frame_size, .value = 32_768 },
+        .{ .id = .max_header_list_size, .value = 65_536 },
+        .{ .id = @enumFromInt(0x10), .value = 1 },
+        .{ .id = @enumFromInt(0x11), .value = 2 },
+        .{ .id = @enumFromInt(0x12), .value = 3 },
+        .{ .id = @enumFromInt(0x13), .value = 4 },
+    };
+    var storage: [128]u8 = undefined;
+    var out = std.Io.Writer.fixed(&storage);
+    try writeSettings(&out, &values, frame.default_max_frame_size);
+    const parsed = (try frame.parseComplete(out.buffered(), frame.default_max_frame_size)).?;
+    try std.testing.expectEqual(frame.Type.settings, parsed.frame.header.type);
+    var it = try settings.Iterator.init(parsed.frame.payload);
+    var i: usize = 0;
+    while (it.next()) |value| : (i += 1) try std.testing.expectEqual(values[i], value);
+    try std.testing.expectEqual(values.len, i);
+}
+
+test "control writers reject invalid sizes before writing" {
+    var storage: [32]u8 = undefined;
+    var out = std.Io.Writer.fixed(&storage);
+    try std.testing.expectError(error.Protocol, writeReset(&out, 0, .cancel));
+    try std.testing.expectError(error.Protocol, writeWindowUpdate(&out, 1, 0));
+    try std.testing.expectError(error.FrameTooLarge, writeGoAway(&out, 8, 0, .no_error, "x"));
+    try std.testing.expectEqual(@as(usize, 0), out.buffered().len);
 }

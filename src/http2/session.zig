@@ -72,6 +72,9 @@ pub const SendDataResult = struct {
 
 pub const SendHeadersError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned };
 pub const SendDataError = std.Io.Writer.Error || streams_mod.LocalError || error{SendPoisoned};
+pub const SendSimpleControlError = std.Io.Writer.Error || error{SendPoisoned};
+pub const SendStreamControlError = std.Io.Writer.Error || streams_mod.LocalError || error{SendPoisoned};
+pub const SendGoAwayError = std.Io.Writer.Error || streams_mod.LocalError || error{ FrameTooLarge, SendPoisoned };
 
 pub const NullSink = struct {
     pub inline fn field(_: *NullSink, _: u31, _: fields.Kind, _: common.Header) void {}
@@ -296,6 +299,170 @@ pub const Session = struct {
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
         return self.sendDataTracked(out, existing.stream_id, existing.tracked, bytes, end_stream);
+    }
+
+    /// Emits the mandatory acknowledgment for a received SETTINGS frame.
+    /// Writer failure poisons the send side because the frame might have been
+    /// partially placed on the transport.
+    pub fn sendSettingsAck(self: *Session, out: *std.Io.Writer) SendSimpleControlError!void {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        send_mod.writeSettingsAck(out) catch |err| {
+            self.pending.poison();
+            return err;
+        };
+    }
+
+    /// Emits a PING request or response. `sendPingAck()` is the common receive
+    /// response path and preserves the peer's opaque eight-byte payload.
+    pub fn sendPing(self: *Session, out: *std.Io.Writer, ack: bool, payload_bytes: *const [8]u8) SendSimpleControlError!void {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        send_mod.writePing(out, ack, payload_bytes) catch |err| {
+            self.pending.poison();
+            return err;
+        };
+    }
+
+    pub inline fn sendPingAck(self: *Session, out: *std.Io.Writer, payload_bytes: *const [8]u8) SendSimpleControlError!void {
+        try self.sendPing(out, true, payload_bytes);
+    }
+
+    /// Advertises newly freed receive credit and commits the matching local
+    /// accounting only after the WINDOW_UPDATE bytes are successfully written.
+    /// Stream-level updates remain valid for retained closed stream records,
+    /// matching the race-tolerant HTTP/2 rules.
+    pub fn sendWindowUpdate(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        increment: u31,
+    ) SendStreamControlError!void {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (increment == 0) return error.Protocol;
+
+        if (stream_id == 0) {
+            var next = self.connection.receive_window;
+            next.update(increment) catch return error.FlowControl;
+            send_mod.writeWindowUpdate(out, 0, increment) catch |err| switch (err) {
+                error.Protocol => unreachable,
+                error.WriteFailed => {
+                    self.pending.poison();
+                    return error.WriteFailed;
+                },
+            };
+            self.connection.receive_window = next;
+            return;
+        }
+
+        const tracked = store.get(stream_id) orelse return error.StreamClosed;
+        try self.sendWindowUpdateTracked(out, stream_id, tracked, increment);
+    }
+
+    pub fn sendWindowUpdateExisting(
+        self: *Session,
+        out: *std.Io.Writer,
+        existing: streams_mod.Existing,
+        increment: u31,
+    ) SendStreamControlError!void {
+        if (existing.manager != &self.streams) return error.Protocol;
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (increment == 0) return error.Protocol;
+        try self.sendWindowUpdateTracked(out, existing.stream_id, existing.tracked, increment);
+    }
+
+    fn sendWindowUpdateTracked(
+        self: *Session,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        tracked: *stream_mod.Tracked,
+        increment: u31,
+    ) SendStreamControlError!void {
+        var next = tracked.windows.receive;
+        next.update(increment) catch return error.FlowControl;
+        send_mod.writeWindowUpdate(out, stream_id, increment) catch |err| switch (err) {
+            error.Protocol => unreachable,
+            error.WriteFailed => {
+                self.pending.poison();
+                return error.WriteFailed;
+            },
+        };
+        tracked.windows.receive = next;
+    }
+
+    /// Sends RST_STREAM and closes the retained local stream record only after
+    /// the reset frame is committed to the writer.
+    pub fn sendReset(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        code: protocol.ErrorCode,
+    ) SendStreamControlError!void {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        const tracked = store.get(stream_id) orelse return error.StreamClosed;
+        try self.sendResetTracked(out, stream_id, tracked, code);
+    }
+
+    pub fn sendResetExisting(
+        self: *Session,
+        out: *std.Io.Writer,
+        existing: streams_mod.Existing,
+        code: protocol.ErrorCode,
+    ) SendStreamControlError!void {
+        if (existing.manager != &self.streams) return error.Protocol;
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        try self.sendResetTracked(out, existing.stream_id, existing.tracked, code);
+    }
+
+    fn sendResetTracked(
+        self: *Session,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        tracked: *stream_mod.Tracked,
+        code: protocol.ErrorCode,
+    ) SendStreamControlError!void {
+        if (tracked.stream.state == .closed) return error.StreamClosed;
+        var manager_probe = self.streams;
+        var tracked_probe = tracked.*;
+        try manager_probe.localResetTracked(stream_id, &tracked_probe);
+
+        send_mod.writeReset(out, stream_id, code) catch |err| switch (err) {
+            error.Protocol => return error.Protocol,
+            error.WriteFailed => {
+                self.pending.poison();
+                return error.WriteFailed;
+            },
+        };
+        self.streams.localResetTracked(stream_id, tracked) catch {
+            self.pending.poison();
+            return error.Protocol;
+        };
+    }
+
+    /// Starts or tightens graceful shutdown. The monotonic GOAWAY stream cutoff
+    /// is preflighted before writing and committed only after the frame succeeds.
+    pub fn sendGoAway(
+        self: *Session,
+        out: *std.Io.Writer,
+        last_stream_id: u31,
+        code: protocol.ErrorCode,
+        debug_data: []const u8,
+    ) SendGoAwayError!void {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        var manager_probe = self.streams;
+        try manager_probe.sentGoAway(last_stream_id);
+
+        send_mod.writeGoAway(out, self.peer.settings.max_frame_size, last_stream_id, code, debug_data) catch |err| switch (err) {
+            error.FrameTooLarge => return error.FrameTooLarge,
+            error.WriteFailed => {
+                self.pending.poison();
+                return error.WriteFailed;
+            },
+        };
+        self.streams.sentGoAway(last_stream_id) catch {
+            self.pending.poison();
+            return error.Protocol;
+        };
     }
 
     fn sendDataTracked(
@@ -1181,4 +1348,97 @@ test "invalid local fields fail before stream or HPACK mutation" {
     try std.testing.expectEqual(before_state, store.get(1).?.stream.state);
     try std.testing.expectEqual(before_count, outbound.dynamic.count());
     try std.testing.expect(!session.sendPoisoned());
+}
+
+test "session sends HTTP2 control frames with state-aware commits" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+    try std.testing.expectEqual(@as(u32, 1), session.streams.activeRemote());
+    session.connection.receive_window.value = 60_000;
+    store.get(1).?.windows.receive.value = 59_000;
+
+    var wire_storage: [256]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try session.sendSettingsAck(&wire);
+    const ping_bytes = "pingpong".*;
+    try session.sendPingAck(&wire, &ping_bytes);
+    try session.sendWindowUpdate(&store, &wire, 0, 1000);
+    try session.sendWindowUpdate(&store, &wire, 1, 2000);
+    try std.testing.expectEqual(@as(u31, 61_000), session.connection.receive_window.available());
+    try std.testing.expectEqual(@as(u31, 61_000), store.get(1).?.windows.receive.available());
+
+    try session.sendReset(&store, &wire, 1, .cancel);
+    try std.testing.expectEqual(stream_mod.State.closed, store.get(1).?.stream.state);
+    try std.testing.expectEqual(@as(u32, 0), session.streams.activeRemote());
+
+    try session.sendGoAway(&wire, 1, .no_error, "done");
+    try std.testing.expect(session.streams.goAwaySent());
+    try std.testing.expectEqual(@as(?u31, 1), session.streams.lastSentGoAwayStream());
+
+    var frames = frame.CompleteIterator.init(wire.buffered(), frame.default_max_frame_size);
+    const settings_ack = (try frames.next()).?;
+    try std.testing.expectEqual(frame.Type.settings, settings_ack.header.type);
+    try std.testing.expectEqual(@as(u8, 0x01), settings_ack.header.flags);
+
+    const ping = (try frames.next()).?;
+    try std.testing.expectEqual(frame.Type.ping, ping.header.type);
+    try std.testing.expectEqual(@as(u8, 0x01), ping.header.flags);
+    try std.testing.expectEqualStrings(&ping_bytes, ping.payload);
+
+    const connection_update = (try frames.next()).?;
+    try std.testing.expectEqual(@as(u31, 0), connection_update.header.stream_id);
+    try std.testing.expectEqual(@as(u32, 1000), std.mem.readInt(u32, connection_update.payload[0..4], .big));
+
+    const stream_update = (try frames.next()).?;
+    try std.testing.expectEqual(@as(u31, 1), stream_update.header.stream_id);
+    try std.testing.expectEqual(@as(u32, 2000), std.mem.readInt(u32, stream_update.payload[0..4], .big));
+
+    const reset = (try frames.next()).?;
+    try std.testing.expectEqual(frame.Type.rst_stream, reset.header.type);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(protocol.ErrorCode.cancel)), std.mem.readInt(u32, reset.payload[0..4], .big));
+
+    const goaway = (try frames.next()).?;
+    try std.testing.expectEqual(frame.Type.goaway, goaway.header.type);
+    try std.testing.expectEqualStrings("done", goaway.payload[8..]);
+    try std.testing.expect((try frames.next()) == null);
+}
+
+test "session control preflight is retry safe and writer failure poisons" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, false));
+
+    var storage: [32]u8 = undefined;
+    var out = std.Io.Writer.fixed(&storage);
+    const before = out.buffered().len;
+    try std.testing.expectError(error.Protocol, session.sendWindowUpdate(&store, &out, 1, 0));
+    try std.testing.expectEqual(before, out.buffered().len);
+    try std.testing.expect(!session.sendPoisoned());
+
+    session.peer.settings.max_frame_size = 8;
+    try std.testing.expectError(error.FrameTooLarge, session.sendGoAway(&out, 1, .no_error, "x"));
+    try std.testing.expect(!session.streams.goAwaySent());
+    try std.testing.expect(!session.sendPoisoned());
+    session.peer.settings.max_frame_size = frame.default_max_frame_size;
+
+    session.connection.receive_window.value = 60_000;
+    var no_space: [0]u8 = .{};
+    var failing = std.Io.Writer.fixed(&no_space);
+    try std.testing.expectError(error.WriteFailed, session.sendWindowUpdate(&store, &failing, 0, 1000));
+    try std.testing.expectEqual(@as(u31, 60_000), session.connection.receive_window.available());
+    try std.testing.expect(session.sendPoisoned());
 }
