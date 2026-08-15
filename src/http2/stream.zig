@@ -111,8 +111,11 @@ pub const Windows = struct {
 
 /// Minimal embeddable stream record for applications that want protocol state
 /// plus both flow-control windows but still own the surrounding stream table.
+pub const RemoteHeaders = enum(u2) { initial, regular, trailers };
+
 pub const Tracked = struct {
     stream: Stream = .{},
+    remote_headers: RemoteHeaders = .initial,
     windows: Windows,
 
     pub fn init(peer_initial_window: u31, local_initial_window: u31) Tracked {

@@ -36,4 +36,6 @@ test {
     _ = http2.peer.State;
     _ = http2.connection.Decoder;
     _ = http2.connection.CompleteIterator;
+    _ = http2.session.Session;
+    _ = http2.session.Event;
 }

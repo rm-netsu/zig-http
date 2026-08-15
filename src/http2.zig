@@ -11,6 +11,7 @@ pub const streams = @import("http2/streams.zig");
 pub const header_block = @import("http2/header_block.zig");
 pub const connection = @import("http2/connection.zig");
 pub const peer = @import("http2/peer.zig");
+pub const session = @import("http2/session.zig");
 pub const hpack = @import("hpack");
 
 pub const FrameHeader = frame.FrameHeader;
@@ -29,5 +30,7 @@ pub const PeerState = peer.State;
 pub const Role = peer.Role;
 pub const ConnectionDecoder = connection.Decoder;
 pub const ConnectionCompleteIterator = connection.CompleteIterator;
+pub const Session = session.Session;
+pub const SessionEvent = session.Event;
 
 pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

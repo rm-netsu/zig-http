@@ -21,7 +21,6 @@ pub const Collector = struct {
     pub fn begin(self: *Collector, stream_id: u31, fragment: []const u8, end_headers: bool) error{ Protocol, HeaderBlockTooLarge }!?[]const u8 {
         if (stream_id == 0 or self.stream_id != 0) return error.Protocol;
         self.used = 0;
-        if (fragment.len > self.storage.len) return error.HeaderBlockTooLarge;
         if (end_headers) return fragment;
         self.stream_id = stream_id;
         try self.append(fragment);
@@ -59,7 +58,7 @@ test "collect continuation fragments" {
 }
 
 test "single-frame header block bypasses collector storage" {
-    var storage: [32]u8 = undefined;
+    var storage: [4]u8 = undefined;
     @memset(&storage, 0xaa);
     var c = Collector.init(&storage);
     const fragment = "larger than storage";
@@ -67,5 +66,5 @@ test "single-frame header block bypasses collector storage" {
     try std.testing.expectEqualStrings(fragment, block);
     try std.testing.expectEqual(@as(u32, 0), c.used);
     try std.testing.expectEqual(@as(u8, 0xaa), storage[0]);
-    try std.testing.expectError(error.HeaderBlockTooLarge, c.begin(1, "012345678901234567890123456789012", true));
+    try std.testing.expectError(error.HeaderBlockTooLarge, c.begin(1, "01234567", false));
 }
