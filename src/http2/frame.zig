@@ -35,9 +35,9 @@ pub const FrameHeader = struct {
 
     pub fn encode(self: FrameHeader, out: *[9]u8) error{FrameTooLarge}!void {
         if (self.length > max_frame_size) return error.FrameTooLarge;
-        out[0] = @intCast(self.length >> 16);
-        out[1] = @intCast(self.length >> 8);
-        out[2] = @intCast(self.length);
+        out[0] = @intCast((self.length >> 16) & 0xff);
+        out[1] = @intCast((self.length >> 8) & 0xff);
+        out[2] = @intCast(self.length & 0xff);
         out[3] = @intFromEnum(self.type);
         out[4] = self.flags;
         std.mem.writeInt(u32, out[5..9], self.stream_id, .big);
@@ -211,6 +211,16 @@ pub fn writeFrame(w: *std.Io.Writer, header: FrameHeader, payload: []const u8) (
     try header.encode(&bytes);
     try w.writeAll(&bytes);
     try w.writeAll(payload);
+}
+
+test "frame header encodes the full 24-bit length" {
+    const lengths = [_]u32{ 256, 4096, default_max_frame_size, max_frame_size };
+    for (lengths) |length| {
+        const h: FrameHeader = .{ .length = length, .type = .data, .flags = 0, .stream_id = 1 };
+        var bytes: [9]u8 = undefined;
+        try h.encode(&bytes);
+        try std.testing.expectEqual(length, FrameHeader.parse(&bytes).length);
+    }
 }
 
 test "frame encode and fragmented decode" {
