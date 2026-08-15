@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .hpack = .{
-            .url = "git+https://github.com/rm-netsu/zig-hpack.git#01b59189a7e2cba946719a92a2c7730a0215470b",
-            .hash = "hpack-0.3.0-I4dbbkmeAQAo5LF1FzKZZK7NbCn3HJziHbV20HPxpE2Y",
+            .url = "git+https://github.com/rm-netsu/zig-hpack.git#6de6a2113bd67e3e9feb56e062840078ca78a843",
+            .hash = "hpack-0.4.1-I4dbbt_FAgC8BPJLQdtPhtlV8iexXhuSwfwsZoa-iHTo",
         },
     },
     .paths = .{
