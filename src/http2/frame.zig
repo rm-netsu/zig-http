@@ -43,7 +43,7 @@ pub const FrameHeader = struct {
         std.mem.writeInt(u32, out[5..9], self.stream_id, .big);
     }
 
-    pub fn validate(self: FrameHeader, peer_max_frame_size: u32) error{ FrameSize, Protocol }!void {
+    pub inline fn validate(self: FrameHeader, peer_max_frame_size: u32) error{ FrameSize, Protocol }!void {
         if (self.length > peer_max_frame_size) return error.FrameSize;
         switch (self.type) {
             .data => {
@@ -52,10 +52,18 @@ pub const FrameHeader = struct {
             },
             .headers => {
                 if (self.stream_id == 0) return error.Protocol;
-                const minimum: u32 = @as(u32, @intFromBool((self.flags & 0x08) != 0)) +
-                    5 * @as(u32, @intFromBool((self.flags & 0x20) != 0));
-                if (self.length < minimum) return error.FrameSize;
+                if ((self.flags & 0x28) != 0) {
+                    const minimum: u32 = @as(u32, @intFromBool((self.flags & 0x08) != 0)) +
+                        5 * @as(u32, @intFromBool((self.flags & 0x20) != 0));
+                    if (self.length < minimum) return error.FrameSize;
+                }
             },
+            else => try self.validateUncommon(),
+        }
+    }
+
+    noinline fn validateUncommon(self: FrameHeader) error{ FrameSize, Protocol }!void {
+        switch (self.type) {
             .priority => {
                 if (self.stream_id == 0) return error.Protocol;
                 if (self.length != 5) return error.FrameSize;
@@ -84,6 +92,7 @@ pub const FrameHeader = struct {
             },
             .window_update => if (self.length != 4) return error.FrameSize,
             .continuation => if (self.stream_id == 0) return error.Protocol,
+            .data, .headers => unreachable,
             else => {},
         }
     }
@@ -131,32 +140,25 @@ pub fn parseComplete(input: []const u8, receiver_max_frame_size: u32) error{ Fra
 }
 
 /// Iterates complete frames already present in one caller-owned transport buffer.
-/// The iterator keeps only the current offset and avoids rebuilding a remainder
-/// slice/result wrapper for every frame. The returned payload remains zero-copy.
+/// The iterator keeps a shrinking remainder slice and delegates to the same
+/// validated zero-copy complete-frame path. Returned payload aliases caller input.
 pub const CompleteIterator = struct {
-    input: []const u8,
+    remaining: []const u8,
+    initial_len: usize,
     receiver_max_frame_size: u32,
-    offset: usize = 0,
 
     pub fn init(input: []const u8, receiver_max_frame_size: u32) CompleteIterator {
-        return .{ .input = input, .receiver_max_frame_size = receiver_max_frame_size };
+        return .{ .remaining = input, .initial_len = input.len, .receiver_max_frame_size = receiver_max_frame_size };
     }
 
     pub inline fn next(self: *CompleteIterator) error{ FrameSize, Protocol }!?CompleteFrame {
-        if (self.input.len - self.offset < 9) return null;
-        const ptr: *const [9]u8 = self.input[self.offset..][0..9];
-        const h = FrameHeader.parse(ptr);
-        try h.validate(self.receiver_max_frame_size);
-        const total = 9 + @as(usize, h.length);
-        if (self.input.len - self.offset < total) return null;
-        const payload_start = self.offset + 9;
-        const end = self.offset + total;
-        self.offset = end;
-        return .{ .header = h, .payload = self.input[payload_start..end] };
+        const parsed = (try parseComplete(self.remaining, self.receiver_max_frame_size)) orelse return null;
+        self.remaining = self.remaining[parsed.consumed..];
+        return parsed.frame;
     }
 
     pub fn consumed(self: CompleteIterator) usize {
-        return self.offset;
+        return self.initial_len - self.remaining.len;
     }
 };
 
@@ -172,7 +174,7 @@ pub const FrameDecoder = struct {
         return .{ .peer_max_frame_size = peer_max };
     }
 
-    pub fn next(self: *FrameDecoder, input: []const u8) error{ FrameSize, Protocol }!Result {
+    pub inline fn next(self: *FrameDecoder, input: []const u8) error{ FrameSize, Protocol }!Result {
         if (self.payload_remaining != 0) {
             if (input.len == 0) return .{ .consumed = 0 };
             const n = @min(input.len, @as(usize, self.payload_remaining));
