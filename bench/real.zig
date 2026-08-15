@@ -357,6 +357,43 @@ fn benchHttp1Fragmented(io: Io, fixtures: *const Fixtures, transactions: u64) !R
     return .{ .elapsed = elapsed, .transactions = transactions, .operations = transactions * 2, .bytes = bytes, .checksum = checksum };
 }
 
+
+fn parseStreamingFramedHead(parser: *http.http1.FramedHeadParser, mode: http.http1.head.Mode, wire: []const u8, method: []const u8, seed: usize) !usize {
+    parser.reset(mode);
+    var pos: usize = 0;
+    var step: usize = seed;
+    while (pos < wire.len) : (step += 1) {
+        const n = @min(fragment_sizes[step % fragment_sizes.len], wire.len - pos);
+        const r = if (mode == .request)
+            try parser.feedRequest(wire[pos .. pos + n])
+        else
+            try parser.feedResponse(wire[pos .. pos + n], method);
+        pos += r.consumed;
+        if (r.framed) |framed| return framed.head.headers.len + pos;
+        if (r.consumed == 0) return error.NoProgress;
+    }
+    return error.IncompleteHead;
+}
+
+fn benchHttp1StreamingFramed(io: Io, fixtures: *const Fixtures, transactions: u64) !Result {
+    var scratch: [max_head_bytes]u8 = undefined;
+    var parser = http.http1.FramedHeadParser.init(.request, &scratch);
+    var checksum: usize = 0;
+    var bytes: u64 = 0;
+    const start = now(io);
+    for (0..transactions) |i| {
+        const fixture = fixtures.heads[i % fixtures.head_count];
+        const request_wire = fixture.request[0..fixture.request_len];
+        const response_wire = fixture.response[0..fixture.response_len];
+        checksum +%= try parseStreamingFramedHead(&parser, .request, request_wire, fixture.request_method, @intCast(i));
+        checksum +%= try parseStreamingFramedHead(&parser, .response, response_wire, fixture.request_method, @intCast(i + 3));
+        bytes += request_wire.len + response_wire.len;
+    }
+    const elapsed = now(io) - start;
+    std.mem.doNotOptimizeAway(checksum);
+    return .{ .elapsed = elapsed, .transactions = transactions, .operations = transactions * 2, .bytes = bytes, .checksum = checksum };
+}
+
 fn benchHttp1FixedBodies(io: Io, fixtures: *const Fixtures, bodies: u64) !Result {
     var input: [data_frame_size]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i * 17 + 11);
@@ -452,6 +489,30 @@ fn dispatchFrame(frame: http.http2.frame.CompleteFrame, guard: *http.http2.conti
         .data => (try http.http2.payload.data(frame.header, frame.payload)).len,
         else => frame.payload.len,
     };
+}
+
+
+fn benchH2ParseComplete(io: Io, fixtures: *const Fixtures, target_frames: u64) !Result {
+    const loops = @max(@as(u64, 1), target_frames / @max(fixtures.h2_frames, 1));
+    const wire = fixtures.h2_wire[0..fixtures.h2_len];
+    var checksum: usize = 0;
+    var frames: u64 = 0;
+    var bytes: u64 = 0;
+    const start = now(io);
+    for (0..loops) |_| {
+        var guard: http.http2.continuation.Guard = .{};
+        var pos: usize = 0;
+        while (pos < wire.len) {
+            const parsed = (try http.http2.parseCompleteFrame(wire[pos..], http.http2.frame.default_max_frame_size)).?;
+            checksum +%= try dispatchFrame(parsed.frame, &guard);
+            pos += parsed.consumed;
+            frames += 1;
+        }
+        bytes += wire.len;
+    }
+    const elapsed = now(io) - start;
+    std.mem.doNotOptimizeAway(checksum);
+    return .{ .elapsed = elapsed, .frames = frames, .bytes = bytes, .checksum = checksum };
 }
 
 fn benchH2Complete(io: Io, fixtures: *const Fixtures, target_frames: u64) !Result {
@@ -639,15 +700,18 @@ pub fn main(init: std.process.Init) !void {
     // complete suite practical for repeated A/B runs.
     try report(out, "http1 real heads contiguous", try benchHttp1Contiguous(io, &fixtures, 500_000));
     try report(out, "http1 real heads fragmented", try benchHttp1Fragmented(io, &fixtures, 250_000));
+    try report(out, "http1 real heads streaming framed", try benchHttp1StreamingFramed(io, &fixtures, 250_000));
     try report(out, "http1 captured-length fixed bodies", try benchHttp1FixedBodies(io, &fixtures, 5_000_000));
     try report(out, "http1 modeled chunked bodies", try benchHttp1Chunked(io, &fixtures, 50_000));
     try report(out, "http2 real field validation", try benchH2Fields(io, 2_000_000));
-    try report(out, "http2 real frame trace complete", try benchH2Complete(io, &fixtures, 30_000_000));
+    try report(out, "http2 real frame trace parseComplete", try benchH2ParseComplete(io, &fixtures, 20_000_000));
+    try report(out, "http2 real frame trace iterator", try benchH2Complete(io, &fixtures, 20_000_000));
     try report(out, "http2 real frame trace fragmented", try benchH2Fragmented(io, &fixtures, 5_000_000));
     try report(out, "parallel mixed headers (4 threads)", try benchParallelMixed(io, &fixtures, 200_000));
 
-    try out.print("state sizes: HeadParser={d} ChunkDecoder={d} FrameDecoder={d} CompleteFrameIterator={d} FlowWindow={d} Guard={d} Collector={d} H2FieldValidator={d}\n", .{
+    try out.print("state sizes: HeadParser={d} FramedHeadParser={d} ChunkDecoder={d} FrameDecoder={d} CompleteFrameIterator={d} FlowWindow={d} Guard={d} Collector={d} H2FieldValidator={d}\n", .{
         @sizeOf(http.http1.HeadParser),
+        @sizeOf(http.http1.FramedHeadParser),
         @sizeOf(http.http1.ChunkDecoder),
         @sizeOf(http.http2.FrameDecoder),
         @sizeOf(http.http2.CompleteFrameIterator),

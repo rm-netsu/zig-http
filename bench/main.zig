@@ -51,6 +51,36 @@ fn benchHttp1IncrementalFast(io: Io, wire: []const u8, operations: u64) !i96 {
     return elapsed;
 }
 
+
+fn benchHttp1StreamingFramed(io: Io, wire: []const u8, operations: u64) !i96 {
+    var storage: [512]u8 = undefined;
+    var parser = http.http1.FramedHeadParser.init(.request, &storage);
+    const pieces = [_]usize{ 17, 43, 127 };
+    var sum: u64 = 0;
+    const start = now(io);
+    for (0..operations) |iteration| {
+        parser.reset(.request);
+        var pos: usize = 0;
+        var step: usize = @intCast(iteration);
+        while (pos < wire.len) : (step += 1) {
+            const n = @min(pieces[step % pieces.len], wire.len - pos);
+            const r = try parser.feedRequest(wire[pos .. pos + n]);
+            pos += r.consumed;
+            if (r.framed) |framed| {
+                sum +%= switch (framed.framing) {
+                    .content_length => |value| value,
+                    else => 0,
+                };
+                break;
+            }
+            if (r.consumed == 0) return error.NoProgress;
+        }
+    }
+    const elapsed = now(io) - start;
+    std.mem.doNotOptimizeAway(sum);
+    return elapsed;
+}
+
 fn benchHttp1Contiguous(io: Io, wire: []const u8, operations: u64) !i96 {
     var sum: u64 = 0;
     const start = now(io);
@@ -210,6 +240,7 @@ pub fn main(init: std.process.Init) !void {
 
     try report(out, "http1 head legacy+framing", try benchHttp1Legacy(io, &request, head_ops), head_ops);
     try report(out, "http1 head incremental-fast", try benchHttp1IncrementalFast(io, &request, head_ops), head_ops);
+    try report(out, "http1 head streaming-framed", try benchHttp1StreamingFramed(io, &request, head_ops), head_ops);
     try report(out, "http1 head contiguous-fast", try benchHttp1Contiguous(io, &request, head_ops), head_ops);
     try report(out, "http1 chunk decode", try benchChunkDecode(io, &chunked, chunk_ops), chunk_ops);
     try report(out, "http2 frame incremental", try benchFrameIncremental(io, &frame_wire, frame_ops), frame_ops);
@@ -218,8 +249,9 @@ pub fn main(init: std.process.Init) !void {
     try report(out, "http2 batch iterator", try benchFrameBatchIterator(io, &frame_batch, frames_per_batch, frame_ops), frame_ops);
     try report(out, "http2 field validation", try benchH2Fields(io, entropy, head_ops), head_ops);
 
-    try out.print("state sizes: HeadParser={d} ChunkDecoder={d} FrameDecoder={d} CompleteFrameIterator={d} FlowWindow={d} Guard={d} Collector={d} H2FieldValidator={d}\n", .{
+    try out.print("state sizes: HeadParser={d} FramedHeadParser={d} ChunkDecoder={d} FrameDecoder={d} CompleteFrameIterator={d} FlowWindow={d} Guard={d} Collector={d} H2FieldValidator={d}\n", .{
         @sizeOf(http.http1.HeadParser),
+        @sizeOf(http.http1.FramedHeadParser),
         @sizeOf(http.http1.ChunkDecoder),
         @sizeOf(http.http2.FrameDecoder),
         @sizeOf(http.http2.CompleteFrameIterator),
