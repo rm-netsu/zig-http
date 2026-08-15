@@ -10,6 +10,66 @@ zig build bench -Doptimize=ReleaseFast
 
 Wire data is mutated from the runtime clock before timing so the parser cannot be folded into compile-time constants. The HTTP/2 field benchmark also mutates one field value at runtime.
 
+## 0.6.0 connection-state results
+
+The broad `zig build bench-real -Doptimize=ReleaseFast` workload is intentionally
+unchanged from 0.5.0. Five runs of the 0.6.0 candidate produced the following
+medians on the same x86_64 Linux host:
+
+| Scenario | 0.6.0 median |
+| --- | ---: |
+| HTTP/1 real request+response heads, contiguous | 879,289 tx/s |
+| HTTP/1 real heads, compact fragmented parser | 552,373 tx/s |
+| HTTP/1 real heads, streaming framed parser | 656,256 tx/s |
+| HTTP/1 captured-length fixed bodies | 128.3 M bodies/s |
+| HTTP/1 modeled chunked bodies | 329,747 bodies/s |
+| HTTP/2 real field blocks | 5.468 M blocks/s |
+| HTTP/2 complete trace, direct `parseCompleteFrame` loop | 269.95 M frames/s |
+| HTTP/2 complete trace, `CompleteFrameIterator` | 295.38 M frames/s |
+| HTTP/2 fragmented real frame trace | 33.90 M frames/s |
+| Mixed real headers, 4 threads | 2.469 M tx/s |
+
+During development, adding unrelated connection benchmark functions to the same
+large executable changed the measured inlined `FrameDecoder` rate by more than
+30% even though `frame.zig` itself was unchanged. This was a benchmark code-layout
+artifact, not a library regression. HTTP/2 connection/frame decisions therefore
+use a second target:
+
+```sh
+zig build bench-real-frames -Doptimize=ReleaseFast
+```
+
+Each row in this target is a **separate executable** built from the same captured
+41-frame layout. That prevents one case from changing another case's inlining or
+instruction layout. Five direct runs of each final executable produced:
+
+| Isolated frame case | Median |
+| --- | ---: |
+| Per-connection complete, raw frame + continuation state | 298.22 M frames/s |
+| Complete + `ConnectionState` | 291.09 M frames/s |
+| Per-connection fragmented raw `FrameDecoder` | 34.45 M frames/s |
+| Fragmented + `ConnectionState` | 33.94 M frames/s |
+
+Connection-wide CONTINUATION and receive-flow accounting therefore cost about
+2.4% on the complete-frame path and about 1.5% on the fragmented path in this
+fixture. No heap allocation is introduced.
+
+New state sizes on x86_64:
+
+| Type | Size |
+| --- | ---: |
+| `http2.ConnectionState` | 8 B |
+| `http2.ConnectionDecoder` | 28 B |
+| `http2.ConnectionCompleteIterator` | 40 B temporary |
+| `http2.PeerState` | 36 B |
+| `http2.stream.Windows` | 8 B |
+| `http2.stream.Tracked` | 12 B |
+| `http2.settings.StreamDecoder` | 7 B |
+
+The isolated frame benchmark is the primary criterion for future frame/connection
+hot-path changes. The broad benchmark remains the primary criterion for HTTP/1,
+field validation, and mixed protocol workloads.
+
 ## 0.5.0 real-world results
 
 The primary 0.5.0 comparison uses `zig build bench-real -Doptimize=ReleaseFast`.

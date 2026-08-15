@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+- Add allocation-free HTTP/2 `ConnectionState` / `ConnectionDecoder` primitives that enforce CONTINUATION adjacency and connection receive flow control across complete and fragmented transport reads.
+- Add a compact `ConnectionViolation` fast path so event loops can map protocol and flow-control failures directly to HTTP/2 connection errors without forcing an error-union wrapper into the fragmented hot path.
+- Add `PeerState` for ordered peer SETTINGS application, connection send credit, outbound maximum-frame/push checks, stream WINDOW_UPDATE routing, and monotonic GOAWAY tracking.
+- Add a seven-byte streaming SETTINGS decoder for setting values split across transport boundaries.
+- Add 8-byte caller-owned per-stream flow windows and a 12-byte `Tracked` stream record, leaving stream-table allocation/layout entirely to the application.
+- Correct zero WINDOW_UPDATE increments to surface a protocol violation; flow-window overflow remains a flow-control violation.
+- Add `bench-real-frames`, which compiles raw/connection and complete/fragmented HTTP/2 cases as separate executables to avoid Zig 0.16 code-layout/inlining cross-contamination between benchmark cases.
+- Keep the broad `bench-real` corpus unchanged from 0.5.0 so historical HTTP/1, field-validation, and raw frame baselines remain comparable.
+
 ## 0.5.0
 
 - Add an offline real-world protocol benchmark covering diverse captured HTTP headers, fragmented reads, body framing, HTTP/2 field validation, and realistic HEADERS/DATA frame traces.

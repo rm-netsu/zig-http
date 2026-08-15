@@ -9,6 +9,7 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - Zero-copy fast paths when a complete HTTP/1 head or HTTP/2 frame is already contiguous in the transport buffer.
 - Small process-wide byte-class tables and SIMD validation trade about 512 bytes of read-only data for faster field parsing without increasing per-connection state.
 - Incremental fallbacks preserve streaming operation across arbitrarily fragmented reads.
+- HTTP/2 connection state is split from caller-owned stream storage: connection-wide invariants stay allocation-free while applications choose their own stream slab/hash layout.
 - HTTP/1 bodies and HTTP/2 frame payloads are streamed without whole-message buffering.
 - Strict HTTP/1 framing checks reject ambiguous `Transfer-Encoding` / `Content-Length` input.
 - HPACK is provided by the standalone `hpack` package, with explicit memory and decode limits.
@@ -63,13 +64,78 @@ _ = consumed; // retain input[consumed..] if it contains an incomplete frame
 
 The iterator itself is 32 bytes on x86_64 and does not become part of persistent connection state unless the application chooses to store it.
 
+## HTTP/2 connection state
+
+`ConnectionDecoder` layers connection-wide receive rules over the existing frame
+parsers without owning a stream table. Its persistent state is 28 bytes on
+x86_64: a 20-byte `FrameDecoder` plus 8 bytes for CONTINUATION sequencing and the
+connection receive flow-control window. These mutable connection contexts are
+intended for one ordered owner at a time; applications that move a connection
+between worker threads should transfer ownership rather than process its frames
+concurrently.
+
+Drain complete frames first:
+
+```zig
+var connection = http.http2.ConnectionDecoder.init(
+    http.http2.frame.default_max_frame_size,
+);
+
+var frames = try connection.complete(input);
+while (try frames.next()) |complete| {
+    // complete.payload aliases input
+    _ = complete;
+}
+const consumed = frames.consumed();
+```
+
+If the remaining tail crosses a transport-read boundary, use the embedded frame
+decoder. Header events are already frame-validated; `checkHeader` adds the
+connection-wide rules and returns a compact violation enum that maps naturally
+to HTTP/2 connection error handling:
+
+```zig
+const result = try connection.frames.next(fragment);
+if (result.event) |event| switch (event) {
+    .header => |header| switch (connection.checkHeader(header)) {
+        .none => {},
+        .protocol => return error.Protocol,
+        .flow_control => return error.FlowControl,
+    },
+    .payload => |chunk| {
+        // chunk.bytes aliases fragment
+        _ = chunk;
+    },
+};
+```
+
+`PeerState` tracks the constraints advertised by the remote endpoint: SETTINGS,
+connection send credit, and monotonic GOAWAY last-stream-id state. SETTINGS are
+surfaced as ordered effects so a caller can apply every
+`SETTINGS_INITIAL_WINDOW_SIZE` delta to its own active-stream table before
+processing the next setting. Drain the returned SETTINGS effects before
+processing any subsequent frame; SETTINGS values take effect in wire order.
+`settings.StreamDecoder` handles SETTINGS values
+that themselves cross transport reads using only seven bytes of state.
+
+`stream.Windows` is an 8-byte caller-owned pair of send/receive stream windows.
+This keeps the library allocation-free at the connection layer: applications can
+embed `stream.Tracked` records in a slab, hash table, intrusive map, or another
+layout appropriate for their event loop.
+
+Before writing an outbound frame, `PeerState.sendHeader` can enforce the peer's
+`SETTINGS_MAX_FRAME_SIZE`, server-push permission, and connection DATA send
+credit. Stream-level state and flow checks remain explicit and caller-owned.
+
 ## Modules
 
 - `http1/head.zig` — contiguous and incremental request/response head parsing with body framing.
 - `http1/body.zig` — fixed-length and streaming chunked-body decoding.
 - `http1/write.zig` — request/response and chunk serialization.
 - `http2/frame.zig` — contiguous, batched, and incremental zero-copy frame parsing plus frame serialization.
-- `http2/settings.zig`, `flow.zig`, `stream.zig` — protocol state primitives.
+- `http2/connection.zig` — allocation-free connection receive state and complete/fragmented frame integration.
+- `http2/peer.zig` — peer SETTINGS, send-window, outbound constraints, and GOAWAY state.
+- `http2/settings.zig`, `flow.zig`, `stream.zig` — streaming SETTINGS and caller-owned flow/stream state primitives.
 - `http2/payload.zig` — typed DATA/HEADERS/PUSH_PROMISE/etc. payload helpers.
 - `http2/continuation.zig`, `header_block.zig` — bounded field-block assembly rules.
 - `hpack` 0.4.1 dependency — standalone RFC 7541 codec with real-world-benchmarked encoder lookup and short-literal Huffman fast paths plus bounded decoding.
@@ -85,6 +151,7 @@ zig build test
 zig build test -Doptimize=ReleaseFast
 zig build bench -Doptimize=ReleaseFast
 zig build bench-real -Doptimize=ReleaseFast
+zig build bench-real-frames -Doptimize=ReleaseFast
 ```
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.
