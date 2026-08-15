@@ -11,6 +11,7 @@ const protocol = @import("protocol.zig");
 const stream_mod = @import("stream.zig");
 const streams_mod = @import("streams.zig");
 const send_mod = @import("send.zig");
+const settings = @import("settings.zig");
 
 pub const Fault = union(enum) {
     connection: protocol.ErrorCode,
@@ -38,9 +39,43 @@ pub const Data = struct {
     end_stream: bool,
 };
 
+pub const SettingsTicket = u32;
+
+/// Tiny caller-owned SETTINGS synchronization state. Session writes register a
+/// ticket only after the frame is committed; received ACK events can then pop
+/// the oldest outstanding ticket in RFC-required order without Session owning a
+/// policy queue or allocator-backed state.
+pub const SettingsSync = struct {
+    sent: SettingsTicket = 0,
+    acked: SettingsTicket = 0,
+
+    fn recordSent(self: *SettingsSync) error{SettingsSequenceExhausted}!SettingsTicket {
+        if (self.sent == std.math.maxInt(SettingsTicket)) return error.SettingsSequenceExhausted;
+        self.sent += 1;
+        return self.sent;
+    }
+
+    pub fn acknowledge(self: *SettingsSync) ?SettingsTicket {
+        if (self.acked == self.sent) return null;
+        self.acked += 1;
+        return self.acked;
+    }
+
+    pub inline fn outstanding(self: SettingsSync) u32 {
+        return self.sent - self.acked;
+    }
+};
+
 pub const SettingsApplied = struct {
     ack: bool,
     count: u16,
+
+    /// Matches this received ACK to the oldest SETTINGS frame successfully sent
+    /// through the same caller-owned synchronization state.
+    pub inline fn acknowledge(self: SettingsApplied, sync: *SettingsSync) ?SettingsTicket {
+        if (!self.ack) return null;
+        return sync.acknowledge();
+    }
 };
 
 pub const Event = union(enum) {
@@ -63,6 +98,7 @@ pub const CompleteResult = struct {
 };
 
 pub const SendHeadersResult = send_mod.HeaderFrameStats;
+pub const SendPushPromiseResult = send_mod.HeaderFrameStats;
 
 pub const SendDataResult = struct {
     consumed: usize,
@@ -70,8 +106,17 @@ pub const SendDataResult = struct {
     end_stream: bool,
 };
 
+pub const DataSendCredit = struct {
+    /// Maximum DATA payload that can be emitted now after connection, stream,
+    /// and peer frame-size limits are combined.
+    max_payload: usize,
+};
+
 pub const SendHeadersError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned };
+pub const SendPushPromiseError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned };
 pub const SendDataError = std.Io.Writer.Error || streams_mod.LocalError || error{SendPoisoned};
+pub const DataSendCreditError = streams_mod.LocalError || error{SendPoisoned};
+pub const SendSettingsError = std.Io.Writer.Error || error{ FrameTooLarge, Protocol, FlowControl, SettingsSequenceExhausted, SendPoisoned };
 pub const SendSimpleControlError = std.Io.Writer.Error || error{SendPoisoned};
 pub const SendStreamControlError = std.Io.Writer.Error || streams_mod.LocalError || error{SendPoisoned};
 pub const SendGoAwayError = std.Io.Writer.Error || streams_mod.LocalError || error{ FrameTooLarge, SendPoisoned };
@@ -267,6 +312,82 @@ pub const Session = struct {
         return result;
     }
 
+    /// Streams one server PUSH_PROMISE field block and reserves the promised
+    /// stream in caller-owned storage. The promised stream remains
+    /// `reserved(local)` until its response HEADERS are sent.
+    ///
+    /// Field and stream preconditions are checked before HPACK output starts.
+    /// Once encoding begins, HPACK/writer failure poisons the send side because
+    /// the connection-scoped compression context or wire may have advanced.
+    pub fn sendPushPromise(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        associated_stream_id: u31,
+        promised_stream_id: u31,
+        frame_staging: []u8,
+        items: []const hpack.EncodedField,
+    ) SendPushPromiseError!SendPushPromiseResult {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        _ = try validateLocalFields(.request, false, items);
+        var framer = send_mod.HeaderFramer.initPushPromise(
+            out,
+            frame_staging,
+            self.peer.settings.max_frame_size,
+            associated_stream_id,
+            promised_stream_id,
+        ) catch return error.BufferTooSmall;
+
+        try self.streams.reserveLocal(store, &self.peer, associated_stream_id, promised_stream_id);
+        for (items) |item| {
+            self.encoder.field(&framer.writer, item.field, item.indexing) catch |err| {
+                self.pending.poison();
+                return err;
+            };
+        }
+        return framer.finish() catch |err| {
+            self.pending.poison();
+            return err;
+        };
+    }
+
+    /// Probes current DATA send credit without mutating protocol state. This is
+    /// intended for caller-owned schedulers that want to choose a runnable
+    /// stream before touching the transport writer.
+    pub fn dataSendCredit(
+        self: *const Session,
+        store: anytype,
+        stream_id: u31,
+    ) DataSendCreditError!DataSendCredit {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
+        const tracked = store.get(stream_id) orelse return error.StreamClosed;
+        return self.dataSendCreditTracked(tracked);
+    }
+
+    pub inline fn dataSendCreditExisting(
+        self: *const Session,
+        existing: streams_mod.Existing,
+    ) DataSendCreditError!DataSendCredit {
+        if (existing.manager != &self.streams) return error.Protocol;
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
+        return self.dataSendCreditTracked(existing.tracked);
+    }
+
+    inline fn dataSendCreditTracked(self: *const Session, tracked: *const stream_mod.Tracked) streams_mod.LocalError!DataSendCredit {
+        switch (tracked.stream.state) {
+            .open, .half_closed_remote => {},
+            .half_closed_local, .closed => return error.StreamClosed,
+            else => return error.Protocol,
+        }
+        return .{ .max_payload = @min(
+            @as(usize, self.peer.send_window.available()),
+            @as(usize, tracked.windows.send.available()),
+            @as(usize, self.peer.settings.max_frame_size),
+        ) };
+    }
+
     /// Sends at most one DATA frame, bounded by the peer frame-size setting and
     /// both connection- and stream-level send windows. When credit is exhausted
     /// no bytes are written and `.blocked` is true. `END_STREAM` is emitted only
@@ -299,6 +420,30 @@ pub const Session = struct {
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
         return self.sendDataTracked(out, existing.stream_id, existing.tracked, bytes, end_stream);
+    }
+
+    /// Sends one SETTINGS frame and returns a synchronization ticket. ACKs are
+    /// matched to these tickets in send order by caller-owned `SettingsSync`.
+    /// The tracker stores only frame order; applications remain free to attach
+    /// arbitrary local policy snapshots to the returned ticket.
+    pub fn sendSettings(
+        self: *Session,
+        sync: *SettingsSync,
+        out: *std.Io.Writer,
+        items: []const settings.Setting,
+    ) SendSettingsError!SettingsTicket {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (sync.sent == std.math.maxInt(SettingsTicket)) return error.SettingsSequenceExhausted;
+        try validateLocalSettings(self.streams.local_role, items);
+
+        send_mod.writeSettings(out, items, self.peer.settings.max_frame_size) catch |err| switch (err) {
+            error.FrameTooLarge => return error.FrameTooLarge,
+            error.WriteFailed => {
+                self.pending.poison();
+                return error.WriteFailed;
+            },
+        };
+        return sync.recordSent() catch unreachable;
     }
 
     /// Emits the mandatory acknowledgment for a received SETTINGS frame.
@@ -473,19 +618,10 @@ pub const Session = struct {
         bytes: []const u8,
         end_stream: bool,
     ) SendDataError!SendDataResult {
-        switch (tracked.stream.state) {
-            .open, .half_closed_remote => {},
-            .half_closed_local, .closed => return error.StreamClosed,
-            else => return error.Protocol,
-        }
+        const available = (try self.dataSendCreditTracked(tracked)).max_payload;
         if (bytes.len == 0 and !end_stream)
             return .{ .consumed = 0, .blocked = false, .end_stream = false };
 
-        const available = @min(
-            @as(usize, self.peer.send_window.available()),
-            @as(usize, tracked.windows.send.available()),
-            @as(usize, self.peer.settings.max_frame_size),
-        );
         if (bytes.len != 0 and available == 0)
             return .{ .consumed = 0, .blocked = true, .end_stream = false };
 
@@ -780,6 +916,18 @@ pub const Session = struct {
         return .{ .goaway = parsed };
     }
 };
+
+fn validateLocalSettings(role: peer_mod.Role, items: []const settings.Setting) error{ Protocol, FlowControl }!void {
+    for (items) |item| switch (item.id) {
+        .enable_push => {
+            if (item.value > 1 or (role == .server and item.value == 1)) return error.Protocol;
+        },
+        .initial_window_size => if (item.value > 0x7fff_ffff) return error.FlowControl,
+        .max_frame_size => if (item.value < frame.default_max_frame_size or item.value > frame.max_frame_size)
+            return error.Protocol,
+        else => {},
+    };
+}
 
 fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack.EncodedField) error{Protocol}!u16 {
     var validator = fields.Validator.init(kind);
@@ -1166,6 +1314,7 @@ fn settingBytes(setting: @import("settings.zig").Setting) [6]u8 {
 
 test "send session remains compact with local header phase" {
     try std.testing.expectEqual(@as(usize, 128), @sizeOf(Session));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(SettingsSync));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(stream_mod.Tracked));
 }
 
@@ -1348,6 +1497,134 @@ test "invalid local fields fail before stream or HPACK mutation" {
     try std.testing.expectEqual(before_state, store.get(1).?.stream.state);
     try std.testing.expectEqual(before_count, outbound.dynamic.count());
     try std.testing.expect(!session.sendPoisoned());
+}
+
+test "session sends PUSH_PROMISE and opens promised response stream" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+
+    const promised_request = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+        .{ .field = .{ .name = ":path", .value = "/style.css" } },
+        .{ .field = .{ .name = "accept", .value = "text/css" } },
+    };
+    var staging: [9]u8 = undefined;
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    const stats = try session.sendPushPromise(&store, &wire, 1, 2, &staging, &promised_request);
+    try std.testing.expect(stats.frame_count > 1);
+    try std.testing.expectEqual(stream_mod.State.reserved_local, store.get(2).?.stream.state);
+    try std.testing.expectEqual(@as(u32, 0), session.streams.activeLocal());
+
+    var frames = frame.CompleteIterator.init(wire.buffered(), frame.default_max_frame_size);
+    const first = (try frames.next()).?;
+    try std.testing.expectEqual(frame.Type.push_promise, first.header.type);
+    try std.testing.expectEqual(@as(u31, 1), first.header.stream_id);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, first.payload[0..4], .big));
+    var last = first;
+    while (try frames.next()) |next| last = next;
+    try std.testing.expectEqual(frame.Type.continuation, last.header.type);
+    try std.testing.expect((last.header.flags & 0x04) != 0);
+
+    const response = [_]hpack.EncodedField{.{ .field = .{ .name = ":status", .value = "200" } }};
+    _ = try session.sendHeaders(&store, &wire, 2, true, &staging, &response);
+    try std.testing.expectEqual(stream_mod.State.closed, store.get(2).?.stream.state);
+}
+
+test "PUSH_PROMISE preflight respects role and peer push setting" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+    _ = try session.peer.applySetting(.{ .id = .enable_push, .value = 0 });
+
+    const promised_request = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":path", .value = "/x" } },
+    };
+    var staging: [64]u8 = undefined;
+    var wire_storage: [128]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expectError(error.Protocol, session.sendPushPromise(&store, &wire, 1, 2, &staging, &promised_request));
+    try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
+    try std.testing.expect(store.get(2) == null);
+    try std.testing.expect(!session.sendPoisoned());
+}
+
+test "SETTINGS synchronization tickets follow ACK order" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var sync: SettingsSync = .{};
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [32]u8 = undefined;
+
+    var wire_storage: [128]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    const one = [_]settings.Setting{.{ .id = .enable_push, .value = 0 }};
+    const two = [_]settings.Setting{.{ .id = .max_concurrent_streams, .value = 32 }};
+    try std.testing.expectEqual(@as(SettingsTicket, 1), try session.sendSettings(&sync, &wire, &one));
+    try std.testing.expectEqual(@as(SettingsTicket, 2), try session.sendSettings(&sync, &wire, &two));
+    try std.testing.expectEqual(@as(u32, 2), sync.outstanding());
+
+    const ack_header: frame.FrameHeader = .{ .length = 0, .type = .settings, .flags = 0x01, .stream_id = 0 };
+    var event = try session.receiveComplete(&store, .{ .header = ack_header, .payload = &.{} }, &scratch, &sink);
+    try std.testing.expect(event.settings.ack);
+    try std.testing.expectEqual(@as(?SettingsTicket, 1), event.settings.acknowledge(&sync));
+    try std.testing.expectEqual(@as(u32, 1), sync.outstanding());
+
+    event = try session.receiveComplete(&store, .{ .header = ack_header, .payload = &.{} }, &scratch, &sink);
+    try std.testing.expectEqual(@as(?SettingsTicket, 2), event.settings.acknowledge(&sync));
+    try std.testing.expectEqual(@as(u32, 0), sync.outstanding());
+
+    event = try session.receiveComplete(&store, .{ .header = ack_header, .payload = &.{} }, &scratch, &sink);
+    try std.testing.expect(event.settings.acknowledge(&sync) == null);
+}
+
+test "SETTINGS send preflight and writer failure preserve synchronization" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var sync: SettingsSync = .{};
+    var storage: [32]u8 = undefined;
+    var out = std.Io.Writer.fixed(&storage);
+
+    const invalid = [_]settings.Setting{.{ .id = .enable_push, .value = 1 }};
+    try std.testing.expectError(error.Protocol, session.sendSettings(&sync, &out, &invalid));
+    try std.testing.expectEqual(@as(u32, 0), sync.outstanding());
+    try std.testing.expectEqual(@as(usize, 0), out.buffered().len);
+    try std.testing.expect(!session.sendPoisoned());
+
+    var no_space: [0]u8 = .{};
+    var failing = std.Io.Writer.fixed(&no_space);
+    const valid = [_]settings.Setting{.{ .id = .max_concurrent_streams, .value = 10 }};
+    try std.testing.expectError(error.WriteFailed, session.sendSettings(&sync, &failing, &valid));
+    try std.testing.expectEqual(@as(u32, 0), sync.outstanding());
+    try std.testing.expect(session.sendPoisoned());
 }
 
 test "session sends HTTP2 control frames with state-aware commits" {

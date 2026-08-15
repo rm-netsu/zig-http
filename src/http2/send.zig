@@ -107,18 +107,23 @@ pub fn writeGoAway(
     try out.writeAll(debug_data);
 }
 
-/// Streaming writer that turns one HPACK field block into HEADERS followed by
-/// zero or more CONTINUATION frames. The caller-owned staging buffer bounds
-/// memory usage independently of the encoded field-block size.
+/// Streaming writer that turns one HPACK field block into HEADERS or
+/// PUSH_PROMISE followed by zero or more CONTINUATION frames. The caller-owned
+/// staging buffer bounds memory usage independently of the encoded block size.
 ///
 /// One extra staging byte is required so a payload exactly equal to the chosen
 /// frame size can remain buffered until `finish()` knows whether it is final.
+/// For PUSH_PROMISE, the four-byte promised-stream prefix consumes space only in
+/// the first frame; continuation frames can use the full staging/frame limit.
 pub const HeaderFramer = struct {
     out: *std.Io.Writer,
     writer: std.Io.Writer,
     stream_id: u31,
-    payload_limit: usize,
+    peer_max_frame_size: u32,
+    staging_limit: usize,
     end_stream: bool,
+    first_type: frame.Type = .headers,
+    promised_stream_id: u31 = 0,
     first: bool = true,
     frame_count: u32 = 0,
     encoded_bytes: usize = 0,
@@ -130,26 +135,53 @@ pub const HeaderFramer = struct {
         stream_id: u31,
         end_stream: bool,
     ) error{BufferTooSmall}!HeaderFramer {
+        return initCommon(out, staging, peer_max_frame_size, stream_id, end_stream, .headers, 0);
+    }
+
+    pub fn initPushPromise(
+        out: *std.Io.Writer,
+        staging: []u8,
+        peer_max_frame_size: u32,
+        associated_stream_id: u31,
+        promised_stream_id: u31,
+    ) error{BufferTooSmall}!HeaderFramer {
+        if (peer_max_frame_size <= 4) return error.BufferTooSmall;
+        return initCommon(out, staging, peer_max_frame_size, associated_stream_id, false, .push_promise, promised_stream_id);
+    }
+
+    fn initCommon(
+        out: *std.Io.Writer,
+        staging: []u8,
+        peer_max_frame_size: u32,
+        stream_id: u31,
+        end_stream: bool,
+        first_type: frame.Type,
+        promised_stream_id: u31,
+    ) error{BufferTooSmall}!HeaderFramer {
         if (staging.len < 2 or peer_max_frame_size == 0) return error.BufferTooSmall;
-        const payload_limit = @min(@as(usize, peer_max_frame_size), staging.len - 1);
-        if (payload_limit == 0) return error.BufferTooSmall;
+        const staging_limit = @min(@as(usize, peer_max_frame_size), staging.len - 1);
+        if (staging_limit == 0) return error.BufferTooSmall;
         return .{
             .out = out,
             .writer = .{
-                .buffer = staging[0 .. payload_limit + 1],
+                .buffer = staging[0 .. staging_limit + 1],
                 .vtable = &.{ .drain = drain },
             },
             .stream_id = stream_id,
-            .payload_limit = payload_limit,
+            .peer_max_frame_size = peer_max_frame_size,
+            .staging_limit = staging_limit,
             .end_stream = end_stream,
+            .first_type = first_type,
+            .promised_stream_id = promised_stream_id,
         };
     }
 
     pub fn finish(self: *HeaderFramer) std.Io.Writer.Error!HeaderFrameStats {
-        if (self.writer.end > self.payload_limit) {
-            try self.emit(self.writer.buffer[0..self.payload_limit], false);
-            const tail = self.writer.end - self.payload_limit;
-            @memmove(self.writer.buffer[0..tail], self.writer.buffer[self.payload_limit..self.writer.end]);
+        const limit = self.currentPayloadLimit();
+        if (self.writer.end > limit) {
+            try self.emit(self.writer.buffer[0..limit], false);
+            const tail = self.writer.end - limit;
+            @memmove(self.writer.buffer[0..tail], self.writer.buffer[limit..self.writer.end]);
             self.writer.end = tail;
         }
         try self.emit(self.writer.buffer[0..self.writer.end], true);
@@ -176,15 +208,16 @@ pub const HeaderFramer = struct {
     fn append(self: *HeaderFramer, input: []const u8) std.Io.Writer.Error!void {
         var bytes = input;
         while (bytes.len != 0) {
-            if (self.writer.end > self.payload_limit) {
-                try self.emit(self.writer.buffer[0..self.payload_limit], false);
-                const tail = self.writer.end - self.payload_limit;
-                @memmove(self.writer.buffer[0..tail], self.writer.buffer[self.payload_limit..self.writer.end]);
+            const limit = self.currentPayloadLimit();
+            if (self.writer.end > limit) {
+                try self.emit(self.writer.buffer[0..limit], false);
+                const tail = self.writer.end - limit;
+                @memmove(self.writer.buffer[0..tail], self.writer.buffer[limit..self.writer.end]);
                 self.writer.end = tail;
-            } else if (self.writer.end == self.payload_limit) {
+            } else if (self.writer.end == limit) {
                 // `bytes` proves there is more HPACK data, so this full payload
                 // cannot be the final frame of the field block.
-                try self.emit(self.writer.buffer[0..self.payload_limit], false);
+                try self.emit(self.writer.buffer[0..limit], false);
                 self.writer.end = 0;
             }
 
@@ -195,22 +228,36 @@ pub const HeaderFramer = struct {
         }
     }
 
-    fn emit(self: *HeaderFramer, payload: []const u8, end_headers: bool) std.Io.Writer.Error!void {
-        std.debug.assert(payload.len <= self.payload_limit);
-        var header_bytes: [9]u8 = undefined;
+    inline fn currentPayloadLimit(self: HeaderFramer) usize {
+        if (self.first and self.first_type == .push_promise)
+            return @min(self.staging_limit, @as(usize, self.peer_max_frame_size) - 4);
+        return self.staging_limit;
+    }
+
+    fn emit(self: *HeaderFramer, field_block_fragment: []const u8, end_headers: bool) std.Io.Writer.Error!void {
+        const first_push = self.first and self.first_type == .push_promise;
+        const prefix_len: usize = if (first_push) 4 else 0;
+        std.debug.assert(field_block_fragment.len + prefix_len <= self.peer_max_frame_size);
+
+        var prefix: [13]u8 = undefined;
         const header: frame.FrameHeader = .{
-            .length = @intCast(payload.len),
-            .type = if (self.first) .headers else .continuation,
-            .flags = (if (self.first and self.end_stream) @as(u8, 0x01) else 0) |
+            .length = @intCast(field_block_fragment.len + prefix_len),
+            .type = if (self.first) self.first_type else .continuation,
+            .flags = (if (self.first and self.first_type == .headers and self.end_stream) @as(u8, 0x01) else 0) |
                 (if (end_headers) @as(u8, 0x04) else 0),
             .stream_id = self.stream_id,
         };
-        header.encode(&header_bytes) catch unreachable;
-        try self.out.writeAll(&header_bytes);
-        try self.out.writeAll(payload);
+        header.encode(prefix[0..9]) catch unreachable;
+        if (first_push) {
+            std.mem.writeInt(u32, prefix[9..13], self.promised_stream_id, .big);
+            try self.out.writeAll(&prefix);
+        } else {
+            try self.out.writeAll(prefix[0..9]);
+        }
+        try self.out.writeAll(field_block_fragment);
         self.first = false;
         self.frame_count +|= 1;
-        self.encoded_bytes +|= payload.len;
+        self.encoded_bytes +|= field_block_fragment.len;
     }
 };
 
@@ -254,6 +301,46 @@ test "header framer streams HEADERS and CONTINUATION frames" {
     try std.testing.expectEqual(@as(u8, 0x04), c.header.flags);
     try std.testing.expectEqualStrings("ij", c.payload);
     try std.testing.expect((try it.next()) == null);
+}
+
+test "push promise framer accounts promised id only in first frame" {
+    var out_storage: [128]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_storage);
+    var staging: [9]u8 = undefined; // up to eight HPACK bytes after the first frame
+    var framer = try HeaderFramer.initPushPromise(&out, &staging, 8, 1, 2);
+    try framer.writer.writeAll("abcdefghij");
+    const stats = try framer.finish();
+    try std.testing.expectEqual(@as(u32, 2), stats.frame_count);
+    try std.testing.expectEqual(@as(usize, 10), stats.encoded_bytes);
+
+    var it = frame.CompleteIterator.init(out.buffered(), frame.default_max_frame_size);
+    const first = (try it.next()).?;
+    try std.testing.expectEqual(frame.Type.push_promise, first.header.type);
+    try std.testing.expectEqual(@as(u8, 0), first.header.flags);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, first.payload[0..4], .big));
+    try std.testing.expectEqualStrings("abcd", first.payload[4..]);
+
+    const continuation = (try it.next()).?;
+    try std.testing.expectEqual(frame.Type.continuation, continuation.header.type);
+    try std.testing.expectEqual(@as(u8, 0x04), continuation.header.flags);
+    try std.testing.expectEqualStrings("efghij", continuation.payload);
+    try std.testing.expect((try it.next()) == null);
+}
+
+test "push promise exact first-frame boundary keeps END_HEADERS" {
+    var out_storage: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_storage);
+    var staging: [9]u8 = undefined;
+    var framer = try HeaderFramer.initPushPromise(&out, &staging, 8, 1, 2);
+    try framer.writer.writeAll("abcd");
+    const stats = try framer.finish();
+    try std.testing.expectEqual(@as(u32, 1), stats.frame_count);
+
+    const parsed = (try frame.parseComplete(out.buffered(), frame.default_max_frame_size)).?;
+    try std.testing.expectEqual(frame.Type.push_promise, parsed.frame.header.type);
+    try std.testing.expectEqual(@as(u8, 0x04), parsed.frame.header.flags);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, parsed.frame.payload[0..4], .big));
+    try std.testing.expectEqualStrings("abcd", parsed.frame.payload[4..]);
 }
 
 test "control frame writers serialize fixed payloads" {
