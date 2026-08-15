@@ -11,6 +11,7 @@ test {
     _ = common.isFieldValue;
 
     _ = http1.head.HeadParser;
+    _ = http1.head.FramedHeadParser;
     _ = http1.body.ChunkDecoder;
     _ = http1.write.requestHead;
 

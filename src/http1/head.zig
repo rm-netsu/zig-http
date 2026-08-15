@@ -180,6 +180,150 @@ pub fn parseResponse(input: []const u8, request_method: []const u8) Error!?Frame
     }
 }
 
+
+/// Incremental framed-head parser optimized for transports that fragment HTTP/1
+/// heads frequently. Unlike `HeadParser.feedRequest` / `feedResponse`, it parses
+/// complete lines as they arrive and carries body-framing state across reads, so
+/// the completed head does not require another traversal of all field lines.
+///
+/// This intentionally spends a small amount of additional per-parser state for
+/// lower fragmented-head CPU cost. The caller still owns all scratch storage and
+/// body bytes are never copied into it.
+pub const FramedHeadParser = struct {
+    scratch: []u8,
+    content_length: ?u64 = null,
+    used: u32 = 0,
+    line_start: u32 = 0,
+    te: TransferEncodingState = .{},
+    mode: Mode,
+    has_te: bool = false,
+    start_seen: bool = false,
+    complete: bool = false,
+    bodyless_response: bool = false,
+
+    pub fn init(mode: Mode, scratch: []u8) FramedHeadParser {
+        return .{ .mode = mode, .scratch = scratch };
+    }
+
+    pub fn reset(self: *FramedHeadParser, mode: Mode) void {
+        self.mode = mode;
+        self.content_length = null;
+        self.used = 0;
+        self.line_start = 0;
+        self.te = .{};
+        self.has_te = false;
+        self.start_seen = false;
+        self.complete = false;
+        self.bodyless_response = false;
+    }
+
+    pub fn feedRequest(self: *FramedHeadParser, input: []const u8) Error!FramedFeedResult {
+        if (self.mode != .request) return error.InvalidStartLine;
+        const consumed = try self.feedLines(input, null);
+        if (!self.complete) return .{ .consumed = consumed };
+        const head = try parseHeadStart(.request, self.scratch[0..self.used]);
+        return .{
+            .consumed = consumed,
+            .framed = .{ .head = head, .framing = try self.requestFraming() },
+        };
+    }
+
+    pub fn feedResponse(self: *FramedHeadParser, input: []const u8, request_method: []const u8) Error!FramedFeedResult {
+        if (self.mode != .response) return error.InvalidStartLine;
+        const consumed = try self.feedLines(input, request_method);
+        if (!self.complete) return .{ .consumed = consumed };
+        const head = try parseHeadStart(.response, self.scratch[0..self.used]);
+        if (self.bodyless_response) {
+            return .{ .consumed = consumed, .framed = .{ .head = head, .framing = .none } };
+        }
+        return .{
+            .consumed = consumed,
+            .framed = .{ .head = head, .framing = try self.responseFraming() },
+        };
+    }
+
+    fn feedLines(self: *FramedHeadParser, input: []const u8, request_method: ?[]const u8) Error!usize {
+        if (self.complete or input.len == 0) return 0;
+        var pos: usize = 0;
+
+        // Complete a CRLF split exactly at the read boundary without rescanning
+        // the buffered prefix.
+        if (self.used != 0 and self.scratch[self.used - 1] == '\r' and input[0] == '\n') {
+            try self.append(input[0..1]);
+            pos = 1;
+            try self.finishLine(request_method);
+            if (self.complete) return pos;
+        }
+
+        while (pos < input.len) {
+            const rel = std.mem.indexOf(u8, input[pos..], "\r\n") orelse {
+                try self.append(input[pos..]);
+                return input.len;
+            };
+            const end = pos + rel + 2;
+            try self.append(input[pos..end]);
+            pos = end;
+            try self.finishLine(request_method);
+            if (self.complete) return pos;
+        }
+        return pos;
+    }
+
+    inline fn append(self: *FramedHeadParser, bytes: []const u8) Error!void {
+        const used = @as(usize, self.used);
+        if (used > self.scratch.len or bytes.len > self.scratch.len - used) return error.HeadTooLarge;
+        if (bytes.len > std.math.maxInt(u32) - self.used) return error.HeadTooLarge;
+        @memcpy(self.scratch[used .. used + bytes.len], bytes);
+        self.used += @intCast(bytes.len);
+    }
+
+    fn finishLine(self: *FramedHeadParser, request_method: ?[]const u8) Error!void {
+        const used = @as(usize, self.used);
+        const start = @as(usize, self.line_start);
+        if (used < start + 2 or self.scratch[used - 2] != '\r' or self.scratch[used - 1] != '\n')
+            return error.InvalidHeader;
+        const line = self.scratch[start .. used - 2];
+        self.line_start = self.used;
+
+        if (!self.start_seen) {
+            const parsed_start = try parseStartLine(self.mode, line);
+            if (self.mode == .response) {
+                const method = request_method orelse return error.InvalidStartLine;
+                self.bodyless_response = responseHasNoBody(parsed_start.start.response.status, method);
+            }
+            self.start_seen = true;
+            return;
+        }
+        if (line.len == 0) {
+            self.complete = true;
+            return;
+        }
+        const h = try parseHeaderLine(line);
+        if (!self.bodyless_response) switch (framingHeaderKind(h.name)) {
+            .content_length => try mergeContentLength(&self.content_length, h.value),
+            .transfer_encoding => {
+                self.has_te = true;
+                try self.te.add(h.value);
+            },
+            .other => {},
+        };
+    }
+
+    fn requestFraming(self: FramedHeadParser) Error!BodyFraming {
+        if (self.has_te and self.content_length != null) return error.AmbiguousFraming;
+        if (self.has_te) return if (self.te.final_chunked) .chunked else error.InvalidTransferEncoding;
+        if (self.content_length) |value| return .{ .content_length = value };
+        return .none;
+    }
+
+    fn responseFraming(self: FramedHeadParser) Error!BodyFraming {
+        if (self.has_te and self.content_length != null) return error.AmbiguousFraming;
+        if (self.has_te) return if (self.te.final_chunked) .chunked else .close;
+        if (self.content_length) |value| return .{ .content_length = value };
+        return .close;
+    }
+};
+
 fn headEnd(input: []const u8) ?usize {
     const marker = "\r\n\r\n";
     const pos = std.mem.indexOf(u8, input, marker) orelse return null;
@@ -479,6 +623,68 @@ const TransferEncodingState = struct {
         if (!self.saw_any) return error.InvalidTransferEncoding;
     }
 };
+
+
+test "streaming framed parser handles fragmented request without final field rescan" {
+    var scratch: [256]u8 = undefined;
+    var p = FramedHeadParser.init(.request, &scratch);
+    var r = try p.feedRequest("POST / HTTP/1.1\r\nHost: ex");
+    try std.testing.expect(r.framed == null);
+    r = try p.feedRequest("ample.com\r\nContent-Length: 7\r\n\r\npayload");
+    try std.testing.expectEqual(@as(u64, 7), r.framed.?.framing.content_length);
+    try std.testing.expectEqualStrings("POST", r.framed.?.head.start.request.method);
+    try std.testing.expectEqual(@as(usize, 32), r.consumed);
+}
+
+test "streaming framed parser validates response fields and bodyless semantics" {
+    var scratch: [256]u8 = undefined;
+    var p = FramedHeadParser.init(.response, &scratch);
+    const r = try p.feedResponse("HTTP/1.1 204 No Content\r\nContent-Length: 99\r\nX-Test: ok\r\n\r\nbody", "GET");
+    try std.testing.expect(r.framed.?.framing == .none);
+    p.reset(.response);
+    try std.testing.expectError(error.InvalidHeader, p.feedResponse("HTTP/1.1 204 No Content\r\nX: bad\x01value\r\n\r\n", "GET"));
+}
+
+
+test "streaming framed parser survives one-byte fragmentation" {
+    const request = "POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\n";
+    var scratch: [256]u8 = undefined;
+    var p = FramedHeadParser.init(.request, &scratch);
+    var parsed: ?FramedHead = null;
+    var pos: usize = 0;
+    while (pos < request.len) {
+        const r = try p.feedRequest(request[pos .. pos + 1]);
+        try std.testing.expectEqual(@as(usize, 1), r.consumed);
+        pos += 1;
+        if (r.framed) |framed| parsed = framed;
+    }
+    try std.testing.expectEqualStrings("/x", parsed.?.head.start.request.target);
+    try std.testing.expectEqual(@as(u64, 3), parsed.?.framing.content_length);
+}
+
+test "streaming framed parser preserves request smuggling rejection" {
+    var scratch: [256]u8 = undefined;
+    var p = FramedHeadParser.init(.request, &scratch);
+    const wire = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n";
+    try std.testing.expectError(error.AmbiguousFraming, p.feedRequest(wire));
+
+    p.reset(.request);
+    try std.testing.expectError(
+        error.InvalidTransferEncoding,
+        p.feedRequest("POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"),
+    );
+}
+
+test "streaming framed parser matches bodyless response framing semantics" {
+    var scratch: [256]u8 = undefined;
+    var p = FramedHeadParser.init(.response, &scratch);
+    // Transfer-Encoding grammar is irrelevant to a 204 response, but field syntax
+    // remains validated exactly like the contiguous response parser.
+    const wire = "HTTP/1.1 204 No Content\r\nTransfer-Encoding: ???\r\nContent-Length: 12\r\n\r\n";
+    const r = try p.feedResponse(wire, "GET");
+    try std.testing.expect(r.framed.?.framing == .none);
+    try std.testing.expect((try parseResponse(wire, "GET")).?.framing == .none);
+}
 
 test "incremental request head and body framing" {
     var scratch: [1024]u8 = undefined;

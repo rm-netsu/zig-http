@@ -3,6 +3,7 @@ pub const body = @import("http1/body.zig");
 pub const write = @import("http1/write.zig");
 
 pub const HeadParser = head.HeadParser;
+pub const FramedHeadParser = head.FramedHeadParser;
 pub const Head = head.Head;
 pub const HeaderIterator = head.HeaderIterator;
 pub const BodyFraming = head.BodyFraming;
