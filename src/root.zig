@@ -38,4 +38,5 @@ test {
     _ = http2.connection.CompleteIterator;
     _ = http2.session.Session;
     _ = http2.session.Event;
+    _ = http2.send.HeaderFramer;
 }

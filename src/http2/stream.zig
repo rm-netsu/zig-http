@@ -116,6 +116,7 @@ pub const RemoteHeaders = enum(u2) { initial, regular, trailers };
 pub const Tracked = struct {
     stream: Stream = .{},
     remote_headers: RemoteHeaders = .initial,
+    local_headers: RemoteHeaders = .initial,
     windows: Windows,
 
     pub fn init(peer_initial_window: u31, local_initial_window: u31) Tracked {
@@ -129,6 +130,10 @@ test "normal request response stream lifecycle" {
     try std.testing.expectEqual(State.half_closed_remote, s.state);
     try s.localHeaders(true);
     try std.testing.expectEqual(State.closed, s.state);
+}
+
+test "tracked stream keeps local and remote header phases in padding" {
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(Tracked));
 }
 
 test "stream windows track directional credit" {

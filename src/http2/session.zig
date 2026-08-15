@@ -10,6 +10,7 @@ const peer_mod = @import("peer.zig");
 const protocol = @import("protocol.zig");
 const stream_mod = @import("stream.zig");
 const streams_mod = @import("streams.zig");
+const send_mod = @import("send.zig");
 
 pub const Fault = union(enum) {
     connection: protocol.ErrorCode,
@@ -61,22 +62,36 @@ pub const CompleteResult = struct {
     event: Event,
 };
 
+pub const SendHeadersResult = send_mod.HeaderFrameStats;
+
+pub const SendDataResult = struct {
+    consumed: usize,
+    blocked: bool,
+    end_stream: bool,
+};
+
+pub const SendHeadersError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned };
+pub const SendDataError = std.Io.Writer.Error || streams_mod.LocalError || error{SendPoisoned};
+
 pub const NullSink = struct {
     pub inline fn field(_: *NullSink, _: u31, _: fields.Kind, _: common.Header) void {}
 };
 
 const Pending = struct {
-    stream_id: u31 = 0,
+    // Bit 31 is impossible for a stream identifier and doubles as the send-side
+    // poison flag without growing Session beyond 128 bytes.
+    stream_bits: u32 = 0,
     detail: u32 = 0,
 
+    const poison_bit: u32 = 0x8000_0000;
     const end_stream_bit: u32 = 0x8000_0000;
 
     inline fn headers(stream_id: u31, end_stream: bool) Pending {
-        return .{ .stream_id = stream_id, .detail = if (end_stream) end_stream_bit else 0 };
+        return .{ .stream_bits = stream_id, .detail = if (end_stream) end_stream_bit else 0 };
     }
 
     inline fn pushPromise(stream_id: u31, promised_stream_id: u31) Pending {
-        return .{ .stream_id = stream_id, .detail = promised_stream_id };
+        return .{ .stream_bits = stream_id, .detail = promised_stream_id };
     }
 
     inline fn promisedStream(self: Pending) u31 {
@@ -91,12 +106,31 @@ const Pending = struct {
         return self.promisedStream() != 0;
     }
 
+    inline fn streamId(self: Pending) u31 {
+        return @intCast(self.stream_bits & 0x7fff_ffff);
+    }
+
     inline fn empty(self: Pending) bool {
-        return self.stream_id == 0;
+        return self.streamId() == 0;
+    }
+
+    inline fn poisoned(self: Pending) bool {
+        return (self.stream_bits & poison_bit) != 0;
+    }
+
+    inline fn poison(self: *Pending) void {
+        self.stream_bits |= poison_bit;
+    }
+
+    inline fn set(self: *Pending, value: Pending) void {
+        const poison_mask = self.stream_bits & poison_bit;
+        self.* = value;
+        self.stream_bits |= poison_mask;
     }
 
     fn clear(self: *Pending) void {
-        self.* = .{};
+        const poison_mask = self.stream_bits & poison_bit;
+        self.* = .{ .stream_bits = poison_mask };
     }
 };
 
@@ -133,6 +167,201 @@ pub const Session = struct {
             .encoder = encoder,
             .collector = header_block.Collector.init(header_storage),
         };
+    }
+
+    /// Streams one local field section directly into HEADERS/CONTINUATION
+    /// frames. `frame_staging.len - 1` bounds the payload retained in memory;
+    /// it may be smaller than the peer-advertised maximum frame size.
+    ///
+    /// Header syntax/semantics and stream/store preconditions are checked before
+    /// HPACK output starts. Once encoding begins, any HPACK allocation/codec or
+    /// writer failure poisons the send side because the connection-scoped HPACK
+    /// context and/or wire may already be partially advanced.
+    pub fn sendHeaders(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        end_stream: bool,
+        frame_staging: []u8,
+        items: []const hpack.EncodedField,
+    ) SendHeadersError!SendHeadersResult {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
+
+        const existing = store.get(stream_id);
+        const kind = self.localHeaderKindTracked(existing, stream_id);
+        const status = try validateLocalFields(kind, end_stream, items);
+        var framer = send_mod.HeaderFramer.init(
+            out,
+            frame_staging,
+            self.peer.settings.max_frame_size,
+            stream_id,
+            end_stream,
+        ) catch return error.BufferTooSmall;
+
+        var tracked = existing;
+        if (tracked) |value| {
+            try self.streams.localHeadersTracked(&self.peer, stream_id, value, end_stream);
+        } else {
+            try self.streams.openLocal(store, &self.peer, stream_id, end_stream);
+            tracked = store.get(stream_id) orelse unreachable;
+        }
+
+        return self.finishSendHeaders(&framer, tracked.?, kind, status, items);
+    }
+
+    /// HEADERS fast path for a caller that already resolved a stable stream
+    /// record. This is useful for server responses and trailers where the event
+    /// loop commonly retains its stream cursor while producing output.
+    pub fn sendHeadersExisting(
+        self: *Session,
+        out: *std.Io.Writer,
+        existing: streams_mod.Existing,
+        end_stream: bool,
+        frame_staging: []u8,
+        items: []const hpack.EncodedField,
+    ) SendHeadersError!SendHeadersResult {
+        if (existing.manager != &self.streams) return error.Protocol;
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
+        const kind = self.localHeaderKindTracked(existing.tracked, existing.stream_id);
+        const status = try validateLocalFields(kind, end_stream, items);
+        var framer = send_mod.HeaderFramer.init(
+            out,
+            frame_staging,
+            self.peer.settings.max_frame_size,
+            existing.stream_id,
+            end_stream,
+        ) catch return error.BufferTooSmall;
+        try self.streams.localHeadersTracked(&self.peer, existing.stream_id, existing.tracked, end_stream);
+        return self.finishSendHeaders(&framer, existing.tracked, kind, status, items);
+    }
+
+    fn finishSendHeaders(
+        self: *Session,
+        framer: *send_mod.HeaderFramer,
+        tracked: *stream_mod.Tracked,
+        kind: fields.Kind,
+        status: u16,
+        items: []const hpack.EncodedField,
+    ) SendHeadersError!SendHeadersResult {
+        for (items) |item| {
+            self.encoder.field(&framer.writer, item.field, item.indexing) catch |err| {
+                self.pending.poison();
+                return err;
+            };
+        }
+        const result = framer.finish() catch |err| {
+            self.pending.poison();
+            return err;
+        };
+        if (kind == .trailers) {
+            tracked.local_headers = .trailers;
+        } else if (kind == .request or !(status >= 100 and status < 200)) {
+            tracked.local_headers = .regular;
+        }
+        return result;
+    }
+
+    /// Sends at most one DATA frame, bounded by the peer frame-size setting and
+    /// both connection- and stream-level send windows. When credit is exhausted
+    /// no bytes are written and `.blocked` is true. `END_STREAM` is emitted only
+    /// when the returned `consumed` reaches the end of `bytes`.
+    pub fn sendData(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        bytes: []const u8,
+        end_stream: bool,
+    ) SendDataError!SendDataResult {
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
+        const tracked = store.get(stream_id) orelse return error.StreamClosed;
+        return self.sendDataTracked(out, stream_id, tracked, bytes, end_stream);
+    }
+
+    /// DATA fast path for a caller that already resolved a stable stream record.
+    /// The cursor must belong to this Session's StreamManager. Peer GOAWAY and
+    /// current flow-control/frame-size limits are still checked on every call.
+    pub fn sendDataExisting(
+        self: *Session,
+        out: *std.Io.Writer,
+        existing: streams_mod.Existing,
+        bytes: []const u8,
+        end_stream: bool,
+    ) SendDataError!SendDataResult {
+        if (existing.manager != &self.streams) return error.Protocol;
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
+        return self.sendDataTracked(out, existing.stream_id, existing.tracked, bytes, end_stream);
+    }
+
+    fn sendDataTracked(
+        self: *Session,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        tracked: *stream_mod.Tracked,
+        bytes: []const u8,
+        end_stream: bool,
+    ) SendDataError!SendDataResult {
+        switch (tracked.stream.state) {
+            .open, .half_closed_remote => {},
+            .half_closed_local, .closed => return error.StreamClosed,
+            else => return error.Protocol,
+        }
+        if (bytes.len == 0 and !end_stream)
+            return .{ .consumed = 0, .blocked = false, .end_stream = false };
+
+        const available = @min(
+            @as(usize, self.peer.send_window.available()),
+            @as(usize, tracked.windows.send.available()),
+            @as(usize, self.peer.settings.max_frame_size),
+        );
+        if (bytes.len != 0 and available == 0)
+            return .{ .consumed = 0, .blocked = true, .end_stream = false };
+
+        const amount = @min(bytes.len, available);
+        const will_end = end_stream and amount == bytes.len;
+        const header: frame.FrameHeader = .{
+            .length = @intCast(amount),
+            .type = .data,
+            .flags = @intFromBool(will_end),
+            .stream_id = stream_id,
+        };
+        frame.writeFrame(out, header, bytes[0..amount]) catch |err| {
+            self.pending.poison();
+            return switch (err) {
+                error.WriteFailed => error.WriteFailed,
+                error.FrameTooLarge => unreachable,
+            };
+        };
+        self.peer.consumeSend(@intCast(amount)) catch {
+            self.pending.poison();
+            return error.FlowControl;
+        };
+        self.streams.localDataTracked(stream_id, tracked, @intCast(amount), will_end) catch |err| {
+            self.pending.poison();
+            return err;
+        };
+        return .{
+            .consumed = amount,
+            .blocked = amount < bytes.len,
+            .end_stream = will_end,
+        };
+    }
+
+    pub inline fn sendPoisoned(self: Session) bool {
+        return self.pending.poisoned();
+    }
+
+    fn localHeaderKindTracked(self: *Session, tracked: ?*stream_mod.Tracked, stream_id: u31) fields.Kind {
+        if (tracked) |value| {
+            if (value.local_headers != .initial) return .trailers;
+            return if (self.streams.local_role == .server) .response else .request;
+        }
+        return if (self.streams.local_role == .client and self.streams.localInitiated(stream_id)) .request else .response;
     }
 
     /// Parses and processes one complete frame directly from a transport buffer.
@@ -207,7 +436,7 @@ pub const Session = struct {
         const end_stream = (complete.header.flags & 0x01) != 0;
         const pending = Pending.headers(complete.header.stream_id, end_stream);
         if (end_headers) return try self.finishBlock(store, pending, parsed.fragment, scratch, sink);
-        self.pending = pending;
+        self.pending.set(pending);
         _ = self.collector.begin(complete.header.stream_id, parsed.fragment, false) catch |err| switch (err) {
             error.Protocol => return .{ .fault = .{ .connection = .protocol_error } },
             error.HeaderBlockTooLarge => return error.HeaderBlockTooLarge,
@@ -223,7 +452,7 @@ pub const Session = struct {
         const end_headers = (complete.header.flags & 0x04) != 0;
         const pending = Pending.pushPromise(complete.header.stream_id, parsed.promised_stream_id);
         if (end_headers) return try self.finishBlock(store, pending, parsed.fragment, scratch, sink);
-        self.pending = pending;
+        self.pending.set(pending);
         _ = self.collector.begin(complete.header.stream_id, parsed.fragment, false) catch |err| switch (err) {
             error.Protocol => return .{ .fault = .{ .connection = .protocol_error } },
             error.HeaderBlockTooLarge => return error.HeaderBlockTooLarge,
@@ -247,7 +476,7 @@ pub const Session = struct {
     }
 
     fn finishBlock(self: *Session, store: anytype, pending: Pending, block: []const u8, scratch: []u8, sink: anytype) hpack.codec.Error!Event {
-        const field_kind: fields.Kind = if (pending.isPushPromise()) .request else self.headerKind(store, pending.stream_id);
+        const field_kind: fields.Kind = if (pending.isPushPromise()) .request else self.headerKind(store, pending.streamId());
         var validator = fields.Validator.init(field_kind);
         var it = self.decoder.iterator(block, scratch);
         var field_count: u32 = 0;
@@ -271,7 +500,7 @@ pub const Session = struct {
                 if (field_kind == .response and header.name.len == 7 and std.mem.eql(u8, header.name, ":status")) {
                     status_code = @as(u16, header.value[0] - '0') * 100 + @as(u16, header.value[1] - '0') * 10 + @as(u16, header.value[2] - '0');
                 }
-                sink.field(if (pending.isPushPromise()) pending.promisedStream() else pending.stream_id, field_kind, header);
+                sink.field(if (pending.isPushPromise()) pending.promisedStream() else pending.streamId(), field_kind, header);
                 field_count +|= 1;
             }
         }
@@ -280,7 +509,7 @@ pub const Session = struct {
                 invalid = true;
             };
         }
-        if (invalid) return .{ .fault = .{ .stream = .{ .stream_id = pending.stream_id, .code = .protocol_error } } };
+        if (invalid) return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
 
         if (pending.isPushPromise()) return self.commitPushPromise(store, pending, field_count);
         return self.commitHeaders(store, pending, field_kind, status_code, field_count);
@@ -297,13 +526,13 @@ pub const Session = struct {
         const informational = field_kind == .response and status >= 100 and status < 200;
         if ((field_kind == .response and status == 101) or
             (informational and end_stream) or (field_kind == .trailers and !end_stream))
-            return .{ .fault = .{ .stream = .{ .stream_id = pending.stream_id, .code = .protocol_error } } };
+            return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
 
-        const result = self.streams.receiveHeaders(store, &self.peer, pending.stream_id, end_stream);
-        if (receiveFault(pending.stream_id, result)) |fault| return .{ .fault = fault };
+        const result = self.streams.receiveHeaders(store, &self.peer, pending.streamId(), end_stream);
+        if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
 
-        if (store.get(pending.stream_id)) |tracked| {
+        if (store.get(pending.streamId())) |tracked| {
             if (field_kind == .trailers) {
                 tracked.remote_headers = .trailers;
             } else if (field_kind == .request or !informational) {
@@ -311,7 +540,7 @@ pub const Session = struct {
             }
         }
         return .{ .headers = .{
-            .stream_id = pending.stream_id,
+            .stream_id = pending.streamId(),
             .kind = field_kind,
             .end_stream = end_stream,
             .field_count = field_count,
@@ -321,11 +550,11 @@ pub const Session = struct {
 
     fn commitPushPromise(self: *Session, store: anytype, pending: Pending, field_count: u32) Event {
         const promised_stream_id = pending.promisedStream();
-        const result = self.streams.receivePushPromise(store, &self.peer, pending.stream_id, promised_stream_id);
-        if (receiveFault(pending.stream_id, result)) |fault| return .{ .fault = fault };
+        const result = self.streams.receivePushPromise(store, &self.peer, pending.streamId(), promised_stream_id);
+        if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
         return .{ .push_promise = .{
-            .associated_stream_id = pending.stream_id,
+            .associated_stream_id = pending.streamId(),
             .promised_stream_id = promised_stream_id,
             .field_count = field_count,
         } };
@@ -384,6 +613,25 @@ pub const Session = struct {
         return .{ .goaway = parsed };
     }
 };
+
+fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack.EncodedField) error{Protocol}!u16 {
+    var validator = fields.Validator.init(kind);
+    var status: u16 = 0;
+    for (items) |item| {
+        const header: common.Header = .{ .name = item.field.name, .value = item.field.value };
+        validator.field(header) catch return error.Protocol;
+        if (kind == .response and header.name.len == 7 and std.mem.eql(u8, header.name, ":status")) {
+            status = @as(u16, header.value[0] - '0') * 100 + @as(u16, header.value[1] - '0') * 10 + @as(u16, header.value[2] - '0');
+        }
+    }
+    validator.finish() catch return error.Protocol;
+    if (kind == .trailers and !end_stream) return error.Protocol;
+    if (kind == .response) {
+        const informational = status >= 100 and status < 200;
+        if (status == 101 or (informational and end_stream)) return error.Protocol;
+    }
+    return status;
+}
 
 fn receiveFault(stream_id: u31, result: streams_mod.ReceiveResult) ?Fault {
     const code = result.errorCode() orelse return null;
@@ -747,4 +995,190 @@ fn settingBytes(setting: @import("settings.zig").Setting) [6]u8 {
     var bytes: [6]u8 = undefined;
     @import("settings.zig").encode(&bytes, setting);
     return bytes;
+}
+
+test "send session remains compact with local header phase" {
+    try std.testing.expectEqual(@as(usize, 128), @sizeOf(Session));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(stream_mod.Tracked));
+}
+
+test "session streams request HEADERS through continuations" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+
+    const items = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+        .{ .field = .{ .name = ":path", .value = "/a/realistically/long/path" } },
+        .{ .field = .{ .name = "accept", .value = "application/json" } },
+    };
+    var staging: [9]u8 = undefined; // eight HPACK bytes per frame
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    const stats = try session.sendHeaders(&store, &wire, 1, false, &staging, &items);
+    try std.testing.expect(stats.frame_count > 1);
+    try std.testing.expectEqual(stream_mod.RemoteHeaders.regular, store.get(1).?.local_headers);
+    try std.testing.expectEqual(stream_mod.State.open, store.get(1).?.stream.state);
+
+    var it = frame.CompleteIterator.init(wire.buffered(), frame.default_max_frame_size);
+    var encoded: [256]u8 = undefined;
+    var encoded_len: usize = 0;
+    var frames: u32 = 0;
+    while ((try it.next())) |complete| {
+        frames += 1;
+        if (frames == 1) {
+            try std.testing.expectEqual(frame.Type.headers, complete.header.type);
+            try std.testing.expect((complete.header.flags & 0x04) == 0);
+        } else {
+            try std.testing.expectEqual(frame.Type.continuation, complete.header.type);
+        }
+        @memcpy(encoded[encoded_len..][0..complete.payload.len], complete.payload);
+        encoded_len += complete.payload.len;
+        if (frames == stats.frame_count) try std.testing.expect((complete.header.flags & 0x04) != 0);
+    }
+    try std.testing.expectEqual(stats.frame_count, frames);
+
+    var verifier = hpack.Decoder.init(allocator, 4096);
+    defer verifier.deinit();
+    var scratch: [512]u8 = undefined;
+    var fields_it = verifier.iterator(encoded[0..encoded_len], &scratch);
+    var count: usize = 0;
+    while (try fields_it.next()) |_| count += 1;
+    try std.testing.expectEqual(items.len, count);
+}
+
+test "session DATA send obeys flow control and caller backpressure" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+
+    const items = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "POST" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":path", .value = "/upload" } },
+    };
+    var staging: [256]u8 = undefined;
+    var head_wire_storage: [512]u8 = undefined;
+    var head_wire = std.Io.Writer.fixed(&head_wire_storage);
+    _ = try session.sendHeaders(&store, &head_wire, 1, false, &staging, &items);
+
+    var body: [20_000]u8 = undefined;
+    @memset(&body, 'x');
+    var data_wire_storage: [24_000]u8 = undefined;
+    var data_wire = std.Io.Writer.fixed(&data_wire_storage);
+    const first = try session.sendData(&store, &data_wire, 1, &body, true);
+    try std.testing.expectEqual(@as(usize, frame.default_max_frame_size), first.consumed);
+    try std.testing.expect(first.blocked);
+    try std.testing.expect(!first.end_stream);
+    const second = try session.sendData(&store, &data_wire, 1, body[first.consumed..], true);
+    try std.testing.expectEqual(body.len - first.consumed, second.consumed);
+    try std.testing.expect(!second.blocked);
+    try std.testing.expect(second.end_stream);
+    try std.testing.expectEqual(stream_mod.State.half_closed_local, store.get(1).?.stream.state);
+
+    // A new stream can close with an empty DATA frame even at zero credit.
+    var session2 = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var store2: TestStore = .{};
+    var h2_storage: [512]u8 = undefined;
+    var h2 = std.Io.Writer.fixed(&h2_storage);
+    _ = try session2.sendHeaders(&store2, &h2, 1, false, &staging, &items);
+    session2.peer.send_window.value = 0;
+    store2.get(1).?.windows.send.value = 0;
+    var d2_storage: [32]u8 = undefined;
+    var d2 = std.Io.Writer.fixed(&d2_storage);
+    const blocked = try session2.sendData(&store2, &d2, 1, "x", true);
+    try std.testing.expect(blocked.blocked);
+    try std.testing.expectEqual(@as(usize, 0), d2.buffered().len);
+    const empty_end = try session2.sendData(&store2, &d2, 1, "", true);
+    try std.testing.expect(empty_end.end_stream);
+    try std.testing.expectEqual(@as(usize, 9), d2.buffered().len);
+}
+
+test "writer failure poisons session send side" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [32]u8 = undefined;
+    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    const items = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":path", .value = "/" } },
+    };
+    var staging: [8]u8 = undefined;
+    var tiny: [4]u8 = undefined;
+    var out = std.Io.Writer.fixed(&tiny);
+    try std.testing.expectError(error.WriteFailed, session.sendHeaders(&store, &out, 1, true, &staging, &items));
+    try std.testing.expect(session.sendPoisoned());
+    try std.testing.expectError(error.SendPoisoned, session.sendHeaders(&store, &out, 3, true, &staging, &items));
+}
+
+test "send response tracks informational final and trailers phases" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &storage);
+    var store: TestStore = .{};
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+
+    var frame_staging: [256]u8 = undefined;
+    var wire_storage: [1024]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    const early = [_]hpack.EncodedField{.{ .field = .{ .name = ":status", .value = "103" } }};
+    _ = try session.sendHeaders(&store, &wire, 1, false, &frame_staging, &early);
+    try std.testing.expectEqual(stream_mod.RemoteHeaders.initial, store.get(1).?.local_headers);
+    try std.testing.expectEqual(stream_mod.State.half_closed_remote, store.get(1).?.stream.state);
+
+    const final = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":status", .value = "200" } },
+        .{ .field = .{ .name = "content-type", .value = "text/plain" } },
+    };
+    _ = try session.sendHeaders(&store, &wire, 1, false, &frame_staging, &final);
+    try std.testing.expectEqual(stream_mod.RemoteHeaders.regular, store.get(1).?.local_headers);
+
+    const trailers = [_]hpack.EncodedField{.{ .field = .{ .name = "x-checksum", .value = "ok" } }};
+    _ = try session.sendHeaders(&store, &wire, 1, true, &frame_staging, &trailers);
+    try std.testing.expectEqual(stream_mod.RemoteHeaders.trailers, store.get(1).?.local_headers);
+    try std.testing.expectEqual(stream_mod.State.closed, store.get(1).?.stream.state);
+}
+
+test "invalid local fields fail before stream or HPACK mutation" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &storage);
+    var store: TestStore = .{};
+    try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, &session.peer, 1, true));
+    const before_state = store.get(1).?.stream.state;
+    const before_count = outbound.dynamic.count();
+    const invalid = [_]hpack.EncodedField{.{ .field = .{ .name = "content-type", .value = "text/plain" }, .indexing = .incremental }};
+    var staging: [128]u8 = undefined;
+    var wire_storage: [128]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expectError(error.Protocol, session.sendHeaders(&store, &wire, 1, false, &staging, &invalid));
+    try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
+    try std.testing.expectEqual(before_state, store.get(1).?.stream.state);
+    try std.testing.expectEqual(before_count, outbound.dynamic.count());
+    try std.testing.expect(!session.sendPoisoned());
 }
