@@ -114,6 +114,7 @@ pub fn parseRequest(input: []const u8) Error!?FramedParseResult {
         cursor += rel + 2;
         if (line.len == 0) {
             head.headers = input[first_eol + 2 .. cursor - 2];
+            if (has_te and head.version == .http_1_0) return error.InvalidTransferEncoding;
             const framing: BodyFraming = if (has_te and content_length != null)
                 return error.AmbiguousFraming
             else if (has_te)
@@ -155,6 +156,7 @@ pub fn parseResponse(input: []const u8, request_method: []const u8) Error!?Frame
         cursor += rel + 2;
         if (line.len == 0) {
             head.headers = input[first_eol + 2 .. cursor - 2];
+            if (has_te and head.version == .http_1_0) return error.InvalidTransferEncoding;
             const framing: BodyFraming = if (bodyless)
                 .none
             else if (has_te and content_length != null)
@@ -169,14 +171,14 @@ pub fn parseResponse(input: []const u8, request_method: []const u8) Error!?Frame
         }
 
         const h = try parseHeaderLine(line);
-        if (!bodyless) switch (framingHeaderKind(h.name)) {
-            .content_length => try mergeContentLength(&content_length, h.value),
+        switch (framingHeaderKind(h.name)) {
+            .content_length => if (!bodyless) try mergeContentLength(&content_length, h.value),
             .transfer_encoding => {
                 has_te = true;
-                try te.add(h.value);
+                if (!bodyless) try te.add(h.value);
             },
             .other => {},
-        };
+        }
     }
 }
 
@@ -195,6 +197,7 @@ pub const FramedHeadParser = struct {
     line_start: u32 = 0,
     te: TransferEncodingState = .{},
     mode: Mode,
+    version: Version = .http_1_1,
     has_te: bool = false,
     start_seen: bool = false,
     complete: bool = false,
@@ -210,6 +213,7 @@ pub const FramedHeadParser = struct {
         self.used = 0;
         self.line_start = 0;
         self.te = .{};
+        self.version = .http_1_1;
         self.has_te = false;
         self.start_seen = false;
         self.complete = false;
@@ -233,6 +237,7 @@ pub const FramedHeadParser = struct {
         if (!self.complete) return .{ .consumed = consumed };
         const head = try parseHeadStart(.response, self.scratch[0..self.used]);
         if (self.bodyless_response) {
+            if (self.has_te and self.version == .http_1_0) return error.InvalidTransferEncoding;
             return .{ .consumed = consumed, .framed = .{ .head = head, .framing = .none } };
         }
         return .{
@@ -286,6 +291,7 @@ pub const FramedHeadParser = struct {
 
         if (!self.start_seen) {
             const parsed_start = try parseStartLine(self.mode, line);
+            self.version = parsed_start.version;
             if (self.mode == .response) {
                 const method = request_method orelse return error.InvalidStartLine;
                 self.bodyless_response = responseHasNoBody(parsed_start.start.response.status, method);
@@ -298,17 +304,18 @@ pub const FramedHeadParser = struct {
             return;
         }
         const h = try parseHeaderLine(line);
-        if (!self.bodyless_response) switch (framingHeaderKind(h.name)) {
-            .content_length => try mergeContentLength(&self.content_length, h.value),
+        switch (framingHeaderKind(h.name)) {
+            .content_length => if (!self.bodyless_response) try mergeContentLength(&self.content_length, h.value),
             .transfer_encoding => {
                 self.has_te = true;
-                try self.te.add(h.value);
+                if (!self.bodyless_response) try self.te.add(h.value);
             },
             .other => {},
-        };
+        }
     }
 
     fn requestFraming(self: FramedHeadParser) Error!BodyFraming {
+        if (self.has_te and self.version == .http_1_0) return error.InvalidTransferEncoding;
         if (self.has_te and self.content_length != null) return error.AmbiguousFraming;
         if (self.has_te) return if (self.te.final_chunked) .chunked else error.InvalidTransferEncoding;
         if (self.content_length) |value| return .{ .content_length = value };
@@ -316,6 +323,7 @@ pub const FramedHeadParser = struct {
     }
 
     fn responseFraming(self: FramedHeadParser) Error!BodyFraming {
+        if (self.has_te and self.version == .http_1_0) return error.InvalidTransferEncoding;
         if (self.has_te and self.content_length != null) return error.AmbiguousFraming;
         if (self.has_te) return if (self.te.final_chunked) .chunked else .close;
         if (self.content_length) |value| return .{ .content_length = value };
@@ -491,10 +499,8 @@ inline fn parseStartLine(mode: Mode, first: []const u8) Error!Head {
                 return error.InvalidStatus;
             const status = @as(u16, code_bytes[0] - '0') * 100 + @as(u16, code_bytes[1] - '0') * 10 + code_bytes[2] - '0';
             if (status < 100 or status > 999) return error.InvalidStatus;
-            const reason = if (rest.len == 3) "" else blk: {
-                if (rest[3] != ' ') return error.InvalidStartLine;
-                break :blk rest[4..];
-            };
+            if (rest.len == 3 or rest[3] != ' ') return error.InvalidStartLine;
+            const reason = rest[4..];
             if (!common.isFieldValue(reason)) return error.InvalidStartLine;
             result.start = .{ .response = .{ .status = status, .reason = reason } };
         },
@@ -524,6 +530,7 @@ pub fn requestBodyFraming(head: Head) Error!BodyFraming {
             try te.add(h.value);
         }
     }
+    if (has_te and head.version == .http_1_0) return error.InvalidTransferEncoding;
     if (has_te and content_length != null) return error.AmbiguousFraming;
     if (has_te) {
         if (!te.final_chunked) return error.InvalidTransferEncoding;
@@ -559,6 +566,7 @@ pub fn responseBodyFraming(head: Head, request_method: []const u8) Error!BodyFra
             try te.add(h.value);
         }
     }
+    if (has_te and head.version == .http_1_0) return error.InvalidTransferEncoding;
     if (has_te and content_length != null) return error.AmbiguousFraming;
     if (has_te) return if (te.final_chunked) .chunked else .close;
     if (content_length) |n| return .{ .content_length = n };
@@ -606,22 +614,86 @@ const TransferEncodingState = struct {
     final_chunked: bool = false,
 
     fn add(self: *TransferEncodingState, value: []const u8) Error!void {
-        var rest = value;
-        while (true) {
-            const comma = std.mem.indexOfScalar(u8, rest, ',');
-            const item0 = common.trimOws(if (comma) |i| rest[0..i] else rest);
-            const semi = std.mem.indexOfScalar(u8, item0, ';');
-            const item = common.trimOws(if (semi) |i| item0[0..i] else item0);
-            if (!common.isToken(item)) return error.InvalidTransferEncoding;
+        if (value.len == "chunked".len and std.ascii.eqlIgnoreCase(value, "chunked")) {
             if (self.saw_chunked) return error.InvalidTransferEncoding;
             self.saw_any = true;
-            self.final_chunked = std.ascii.eqlIgnoreCase(item, "chunked");
-            if (self.final_chunked) self.saw_chunked = true;
-            if (comma) |i| rest = rest[i + 1 ..] else break;
+            self.saw_chunked = true;
+            self.final_chunked = true;
+            return;
         }
-        if (!self.saw_any) return error.InvalidTransferEncoding;
+
+        var pos: usize = 0;
+        var added = false;
+        while (true) {
+            skipTeOws(value, &pos);
+            if (pos == value.len or self.saw_chunked) return error.InvalidTransferEncoding;
+
+            const coding = try scanTeToken(value, &pos);
+            skipTeOws(value, &pos);
+
+            while (pos < value.len and value[pos] == ';') {
+                pos += 1;
+                skipTeOws(value, &pos);
+                _ = try scanTeToken(value, &pos);
+                skipTeOws(value, &pos);
+                if (pos == value.len or value[pos] != '=') return error.InvalidTransferEncoding;
+                pos += 1;
+                skipTeOws(value, &pos);
+                if (pos == value.len) return error.InvalidTransferEncoding;
+                if (value[pos] == '"') try scanTeQuotedString(value, &pos) else _ = try scanTeToken(value, &pos);
+                skipTeOws(value, &pos);
+            }
+
+            const is_chunked = std.ascii.eqlIgnoreCase(coding, "chunked");
+            self.saw_any = true;
+            added = true;
+            self.final_chunked = is_chunked;
+            if (is_chunked) self.saw_chunked = true;
+
+            if (pos == value.len) break;
+            if (value[pos] != ',') return error.InvalidTransferEncoding;
+            pos += 1;
+        }
+        if (!added) return error.InvalidTransferEncoding;
     }
 };
+
+inline fn skipTeOws(value: []const u8, pos: *usize) void {
+    while (pos.* < value.len and (value[pos.*] == ' ' or value[pos.*] == '\t')) pos.* += 1;
+}
+
+inline fn scanTeToken(value: []const u8, pos: *usize) Error![]const u8 {
+    const start = pos.*;
+    while (pos.* < value.len and common.isTchar(value[pos.*])) pos.* += 1;
+    if (pos.* == start) return error.InvalidTransferEncoding;
+    return value[start..pos.*];
+}
+
+fn scanTeQuotedString(value: []const u8, pos: *usize) Error!void {
+    if (pos.* == value.len or value[pos.*] != '"') return error.InvalidTransferEncoding;
+    pos.* += 1;
+    while (pos.* < value.len) {
+        const c = value[pos.*];
+        if (c == '"') { pos.* += 1; return; }
+        if (c == '\\') {
+            pos.* += 1;
+            if (pos.* == value.len or !isQuotedPairChar(value[pos.*])) return error.InvalidTransferEncoding;
+            pos.* += 1;
+            continue;
+        }
+        if (!isQdtext(c)) return error.InvalidTransferEncoding;
+        pos.* += 1;
+    }
+    return error.InvalidTransferEncoding;
+}
+
+inline fn isQdtext(c: u8) bool {
+    return c == '\t' or c == ' ' or c == 0x21 or (c >= 0x23 and c <= 0x5b) or (c >= 0x5d and c <= 0x7e) or c >= 0x80;
+}
+
+inline fn isQuotedPairChar(c: u8) bool {
+    return c == '\t' or c == ' ' or (c >= 0x21 and c <= 0x7e) or c >= 0x80;
+}
 
 test "streaming framed parser handles fragmented request without final field rescan" {
     var scratch: [256]u8 = undefined;
@@ -777,4 +849,22 @@ test "one-pass request parser stops before body and handles incomplete heads" {
 test "one-pass response parser preserves HEAD body semantics" {
     const parsed = (try parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 99\r\nX-Test: ok\r\n\r\n", "HEAD")).?;
     try std.testing.expect(parsed.framing == .none);
+}
+
+
+test "transfer encoding handles quoted commas" {
+    const r = (try parseRequest("POST / HTTP/1.1\r\nTransfer-Encoding: foo; p=\"a,b\", chunked\r\n\r\n")).?;
+    try std.testing.expect(r.framing == .chunked);
+    try std.testing.expectError(error.InvalidTransferEncoding, parseRequest("POST / HTTP/1.1\r\nTransfer-Encoding: foo; p=, chunked\r\n\r\n"));
+}
+
+test "HTTP/1.0 rejects transfer encoding" {
+    try std.testing.expectError(error.InvalidTransferEncoding, parseRequest("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    try std.testing.expectError(error.InvalidTransferEncoding, parseResponse("HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "GET"));
+}
+
+test "response status line requires separator after status code" {
+    try std.testing.expectError(error.InvalidStartLine, parse(.response, "HTTP/1.1 200\r\n\r\n"));
+    const r = (try parse(.response, "HTTP/1.1 200 \r\n\r\n")).?;
+    try std.testing.expectEqualStrings("", r.head.start.response.reason);
 }

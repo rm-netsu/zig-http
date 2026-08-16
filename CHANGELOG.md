@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Harden HTTP/1 response status-line parsing by requiring the RFC-mandated SP after the status code, including when the reason phrase is empty.
+- Replace naive `Transfer-Encoding` comma splitting with an allocation-free scanner that respects quoted-string commas and validates parameter syntax.
+- Reject `Transfer-Encoding` on HTTP/1.0 requests and responses consistently across contiguous, incremental, and framed parser paths.
+- Add a reproducible Zig 0.16.0 builtin-fuzz workaround using a fuzz-only vendored test runner, plus a stateful `FlowWindow` reference-model fuzz target.
+
 ## 0.15.0
 
 - Add `http2.dispatch`, a connection-ordered receive front-end that commits CONTINUATION adjacency and connection DATA flow control before extracting DATA, RST_STREAM, and stream WINDOW_UPDATE as caller-routable stream-local work; HPACK/HEADERS, SETTINGS, GOAWAY, connection WINDOW_UPDATE, PING, and extensions remain on the ordered path.
