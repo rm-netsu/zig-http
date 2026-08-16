@@ -26,6 +26,37 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the HTTP library tests");
     test_step.dependOn(&run_tests.step);
 
+    // Zig 0.16.0's stock test runner has a fuzz-only StackTrace type mismatch.
+    // Keep normal tests on the stock runner; fuzzing uses the narrowly patched
+    // vendored runner and ReleaseSafe for reproducibility.
+    const fuzz_hpack_dep = b.dependency("hpack", .{
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const fuzz_hpack_mod = fuzz_hpack_dep.module("hpack");
+    const fuzz_http_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{.{ .name = "hpack", .module = fuzz_hpack_mod }},
+    });
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("test/fuzz/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{.{ .name = "http", .module = fuzz_http_mod }},
+    });
+    const fuzz_tests = b.addTest(.{
+        .name = "http-fuzz",
+        .root_module = fuzz_mod,
+        .test_runner = .{
+            .path = b.path("build_support/zig-0.16.0-fuzz-test-runner.zig"),
+            .mode = .server,
+        },
+    });
+    const fuzz_step = b.step("fuzz", "Run HTTP property tests and Zig builtin fuzzing");
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
