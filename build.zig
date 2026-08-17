@@ -65,6 +65,18 @@ pub fn build(b: *std.Build) void {
     const http1_client_step = b.step("http1-conformance-client", "Build the cleartext HTTP/1 interoperability fixture client");
     http1_client_step.dependOn(&install_http1_client.step);
 
+    // Generate declaration-level API documentation from the public root module.
+    // Guides remain hand-written because ownership and composition rules are
+    // broader than declaration signatures.
+    const docs_lib = b.addLibrary(.{ .name = "http-docs", .root_module = mod });
+    const install_api_docs = b.addInstallDirectory(.{
+        .source_dir = docs_lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs/api",
+    });
+    const docs_step = b.step("docs", "Generate and install the HTTP API reference");
+    docs_step.dependOn(&install_api_docs.step);
+
     const examples_step = b.step("examples", "Build and run protocol-core usage examples");
     const example_sources = [_][]const u8{
         "http1_client_core",

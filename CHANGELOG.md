@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a first-class documentation workflow: `zig build docs` generates and installs Zig API reference pages, while focused HTTP/1, HTTP/2, concurrency, operations, and migration guides separate architectural/ownership guidance from declaration-level docs.
 - Make composed HTTP/1 trailer generation safe by default: non-empty `MessageWriter` trailers now require an explicit caller-owned field-definition policy, with complete syntax/universally-forbidden/policy preflight before the terminal chunk; raw `endChunks` remains available for deliberately low-level composition.
 - Add caller-owned RFC 9218 priority signal composition state that distinguishes request/update default-reset semantics from response omission overlays without imposing scheduler or client/server merge policy.
 - Add a unified operational error/ownership guide and compile-tested recovery example covering HTTP/1 parser/writer terminal states, HTTP/2 peer-fault scope, local versus poisoned send failures, HPACK/buffer lifetimes, and sharded connection ownership.

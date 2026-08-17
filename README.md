@@ -40,6 +40,24 @@ only state you actually want the HTTP engine to manage:
 None of these levels opens sockets, performs TLS/DNS, registers timers, or owns
 an event loop.
 
+## Documentation
+
+The README is the package overview. Focused guides live under [`docs/`](docs/README.md):
+
+- [HTTP/1 composition](docs/http1.md)
+- [HTTP/2 composition](docs/http2.md)
+- [Concurrency and ownership](docs/concurrency.md)
+- [Operational errors and recovery](docs/operations.md)
+- [Migration guide](docs/migration.md)
+
+Generate declaration-level Zig API documentation with:
+
+```sh
+zig build docs
+```
+
+The generated entry point is `zig-out/docs/api/index.html`.
+
 ## Compile-tested examples
 
 The `examples/` directory contains executable, transport-neutral reference
