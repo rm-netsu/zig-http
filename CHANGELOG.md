@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.0
+
 - Remove the accumulated pre-1.0 compatibility surface: HTTP/2 low-level types now live only under their owning namespaces, HTTP/1 raw parsers/body primitives likewise use `head`/`body`/`semantics`, `Session.init` accepts only named `Options`, HTTP/1 head writers take an explicit version, and the client preface lives at `http2.preface.bytes`. The composed shortcuts remain `http1.ConnectionDecoder` and `http2.Session`/`Event`/`Role`.
 - Add a transport-fragmentation-invariance fuzz target for the composed HTTP/2 `Session`, comparing complete-frame receive against the incremental frame path while checking emitted events, HPACK field counts, peer/connection state, stream records, and aggregate stream counters after every generated frame.
 - Harden HTTP/1 response status-line parsing by requiring the RFC-mandated SP after the status code, including when the reason phrase is empty.
