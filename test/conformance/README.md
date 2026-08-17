@@ -55,11 +55,23 @@ connection. That threading model is not imposed on consumers.
 
 ```sh
 zig build check
+zig build conformance
+H2SPEC_BIN=/path/to/h2spec zig build conformance-h2spec
+zig build all-checks
+
+# Focused equivalents remain available:
 ./test/conformance/run-http1-interop.sh
 ./test/conformance/run-rfc-smoke.sh
 ./test/conformance/run-external-interop.sh
 H2SPEC_BIN=/path/to/h2spec ./test/conformance/run-h2spec.sh
 ```
+
+`zig build conformance` is the reproducible aggregate for the HTTP/1 and HTTP/2
+external tests that do not require h2spec. `zig build conformance-h2spec` keeps
+the upstream binary strict: if neither `H2SPEC_BIN` nor `h2spec` on `PATH` is
+available, the step fails rather than silently substituting another suite.
+`zig build all-checks` combines the normal merge gate, generated API docs, and
+the reproducible conformance aggregate.
 
 Override `ZIG`, `PYTHON`, or the test ports when needed. Scripts choose free
 loopback ports by default and clean up fixture processes automatically.

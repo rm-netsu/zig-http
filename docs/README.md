@@ -36,3 +36,12 @@ zig-out/docs/api/
 Open `zig-out/docs/api/index.html` in a browser. The generated reference is for
 declaration-level details; the guides above define composition, ownership, and
 operational expectations that cannot be expressed by signatures alone.
+
+## Verification workflows
+
+- `zig build check` — dependency-light merge gate.
+- `zig build conformance` — HTTP/1 interoperability plus HTTP/2 RFC smoke and bidirectional external interoperability.
+- `H2SPEC_BIN=/path/to/h2spec zig build conformance-h2spec` — strict upstream h2spec.
+- `zig build all-checks` — merge gate, generated API docs, and reproducible external conformance.
+
+Granular conformance scripts and build targets remain available for focused debugging.

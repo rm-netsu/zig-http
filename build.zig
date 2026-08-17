@@ -153,6 +153,27 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(fixtures_step);
     check_step.dependOn(examples_step);
 
+    // External protocol verification is intentionally separated from `check`:
+    // these steps depend on system tools such as Python and curl. The ordinary
+    // conformance aggregate stays reproducible without h2spec, while the strict
+    // h2spec target keeps a missing upstream binary as an explicit failure.
+    const run_conformance = b.addSystemCommand(&.{ "sh", "test/conformance/run-conformance.sh" });
+    run_conformance.setCwd(b.path("."));
+    run_conformance.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    const conformance_step = b.step("conformance", "Run HTTP/1 and HTTP/2 external interoperability plus RFC smoke tests");
+    conformance_step.dependOn(&run_conformance.step);
+
+    const run_h2spec = b.addSystemCommand(&.{ "sh", "test/conformance/run-h2spec.sh" });
+    run_h2spec.setCwd(b.path("."));
+    run_h2spec.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    const h2spec_step = b.step("conformance-h2spec", "Run the strict upstream h2spec suite (requires h2spec)");
+    h2spec_step.dependOn(&run_h2spec.step);
+
+    const all_checks_step = b.step("all-checks", "Run merge checks, API docs, and reproducible external conformance");
+    all_checks_step.dependOn(check_step);
+    all_checks_step.dependOn(docs_step);
+    all_checks_step.dependOn(conformance_step);
+
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,

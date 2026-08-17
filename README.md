@@ -850,13 +850,13 @@ HPACK is fetched from `https://github.com/rm-netsu/zig-hpack` and pinned by both
 zig build test
 zig build check
 zig build examples
+zig build docs
+zig build conformance
+H2SPEC_BIN=/path/to/h2spec zig build conformance-h2spec
+zig build all-checks
 zig build test -Doptimize=ReleaseFast
 zig build test -Doptimize=ReleaseSafe -Dsanitize-thread=true
 zig build conformance-fixtures
-./test/conformance/run-http1-interop.sh
-./test/conformance/run-rfc-smoke.sh
-./test/conformance/run-external-interop.sh
-H2SPEC_BIN=/path/to/h2spec ./test/conformance/run-h2spec.sh
 zig build bench -Doptimize=ReleaseFast
 zig build bench-real -Doptimize=ReleaseFast
 zig build bench-real-frames -Doptimize=ReleaseFast
@@ -868,6 +868,11 @@ zig build bench-real-settings -Doptimize=ReleaseFast
 zig build bench-real-dispatch -Doptimize=ReleaseFast
 zig build bench-real-send-offer -Doptimize=ReleaseFast
 ```
+
+`zig build check` is the dependency-light merge gate. `zig build conformance`
+runs reproducible external HTTP/1/HTTP/2 interoperability and RFC smoke tests;
+`conformance-h2spec` keeps the upstream binary an explicit dependency.
+`zig build all-checks` combines check, docs, and reproducible conformance.
 
 The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`. HTTP/1/HTTP/2 conformance and bidirectional external interoperability setup is documented in `test/conformance/README.md`.
 
