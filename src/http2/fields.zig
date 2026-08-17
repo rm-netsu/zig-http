@@ -3,6 +3,80 @@ const common = @import("../common.zig");
 
 pub const Kind = enum { request, response, trailers };
 
+pub const RequestTarget = struct {
+    const Scheme = enum(u2) { none, http, https, other };
+
+    method_connect: bool = false,
+    method_options: bool = false,
+    scheme: Scheme = .none,
+    path_seen: bool = false,
+    path_empty: bool = false,
+    path_asterisk: bool = false,
+    path_starts_slash: bool = false,
+    authority_seen: bool = false,
+    authority_empty_host: bool = false,
+    authority_userinfo: bool = false,
+    authority_has_port: bool = false,
+
+    pub fn method(self: *RequestTarget, value: []const u8) error{InvalidHeader}!void {
+        self.method_connect = std.mem.eql(u8, value, "CONNECT");
+        self.method_options = std.mem.eql(u8, value, "OPTIONS");
+    }
+
+    pub fn schemeField(self: *RequestTarget, value: []const u8) error{InvalidHeader}!void {
+        if (!validScheme(value)) return error.InvalidHeader;
+        self.scheme = if (std.ascii.eqlIgnoreCase(value, "http"))
+            .http
+        else if (std.ascii.eqlIgnoreCase(value, "https"))
+            .https
+        else
+            .other;
+    }
+
+    pub fn pathField(self: *RequestTarget, value: []const u8) error{InvalidHeader}!void {
+        const info = validatePathQuery(value) orelse return error.InvalidHeader;
+        self.path_seen = true;
+        self.path_empty = info.path_empty;
+        self.path_asterisk = info.asterisk;
+        self.path_starts_slash = info.starts_slash;
+    }
+
+    pub fn authorityField(self: *RequestTarget, value: []const u8) error{InvalidHeader}!void {
+        const info = validateAuthority(value) orelse return error.InvalidHeader;
+        self.authority_seen = true;
+        self.authority_empty_host = info.empty_host;
+        self.authority_userinfo = info.has_userinfo;
+        self.authority_has_port = info.has_port;
+    }
+
+    pub fn finish(self: RequestTarget, extended_connect: bool) error{InvalidHeader}!void {
+        if (self.method_connect and !extended_connect) {
+            // Traditional CONNECT carries authority-form only: host and a
+            // required decimal port, with no URI scheme/path pseudo-fields.
+            if (!self.authority_seen or self.scheme != .none or self.path_seen or
+                self.authority_empty_host or self.authority_userinfo or !self.authority_has_port)
+                return error.InvalidHeader;
+            return;
+        }
+
+        if (self.scheme == .none or !self.path_seen) return error.InvalidHeader;
+
+        if (self.path_asterisk and !self.method_options) return error.InvalidHeader;
+        if (self.path_asterisk and self.authority_seen) return error.InvalidHeader;
+
+        const http_scheme = self.scheme == .http or self.scheme == .https;
+        if (http_scheme) {
+            if (self.path_empty) return error.InvalidHeader;
+            if (!self.path_asterisk and !self.path_starts_slash) return error.InvalidHeader;
+            if (self.authority_seen and (self.authority_empty_host or self.authority_userinfo))
+                return error.InvalidHeader;
+        } else if (self.authority_seen) {
+            // RFC 3986 hier-part with authority permits only path-abempty.
+            if (!self.path_empty and !self.path_starts_slash) return error.InvalidHeader;
+        }
+    }
+};
+
 pub const Validator = struct {
     kind: Kind,
     regular_seen: bool = false,
@@ -13,6 +87,7 @@ pub const Validator = struct {
     status_seen: bool = false,
     method_connect: bool = false,
     protocol_seen: bool = false,
+    request_target: RequestTarget = .{},
     /// Parsed Content-Length for the current initial field section. Keeping
     /// this on the ephemeral validator lets Session surface HTTP message
     /// semantics without adding per-stream storage to the protocol engine.
@@ -30,8 +105,9 @@ pub const Validator = struct {
             if (self.regular_seen or self.kind == .trailers) return error.InvalidHeader;
             switch (h.name.len) {
                 5 => {
-                    if (!std.mem.eql(u8, h.name, ":path") or self.kind != .request or self.path_seen or h.value.len == 0)
+                    if (!std.mem.eql(u8, h.name, ":path") or self.kind != .request or self.path_seen)
                         return error.InvalidHeader;
+                    try self.request_target.pathField(h.value);
                     self.path_seen = true;
                 },
                 9 => {
@@ -42,19 +118,22 @@ pub const Validator = struct {
                 10 => {
                     if (!std.mem.eql(u8, h.name, ":authority") or self.kind != .request or self.authority_seen)
                         return error.InvalidHeader;
+                    try self.request_target.authorityField(h.value);
                     self.authority_seen = true;
                 },
                 7 => switch (h.name[1]) {
                     'm' => {
-                        if (!std.mem.eql(u8, h.name, ":method") or self.kind != .request or self.method_seen)
+                        if (!std.mem.eql(u8, h.name, ":method") or self.kind != .request or self.method_seen or !common.isToken(h.value))
                             return error.InvalidHeader;
                         self.method_seen = true;
                         self.method_connect = std.mem.eql(u8, h.value, "CONNECT");
+                        try self.request_target.method(h.value);
                     },
                     's' => switch (h.name[2]) {
                         'c' => {
                             if (!std.mem.eql(u8, h.name, ":scheme") or self.kind != .request or self.scheme_seen)
                                 return error.InvalidHeader;
+                            try self.request_target.schemeField(h.value);
                             self.scheme_seen = true;
                         },
                         't' => {
@@ -123,6 +202,7 @@ pub const Validator = struct {
                 } else {
                     if (self.protocol_seen or !self.scheme_seen or !self.path_seen) return error.InvalidHeader;
                 }
+                try self.request_target.finish(self.protocol_seen);
             },
             .response => if (!self.status_seen) return error.InvalidHeader,
             .trailers => {},
@@ -162,6 +242,159 @@ pub const BodyLength = struct {
         }
     }
 };
+
+const AuthorityInfo = struct {
+    empty_host: bool,
+    has_userinfo: bool,
+    has_port: bool,
+};
+
+const PathInfo = struct {
+    path_empty: bool,
+    asterisk: bool,
+    starts_slash: bool,
+};
+
+fn validScheme(value: []const u8) bool {
+    if (value.len == 0 or !std.ascii.isAlphabetic(value[0])) return false;
+    for (value[1..]) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '+', '-', '.' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn validatePathQuery(value: []const u8) ?PathInfo {
+    if (std.mem.eql(u8, value, "*")) return .{
+        .path_empty = false,
+        .asterisk = true,
+        .starts_slash = false,
+    };
+    if (std.mem.indexOfScalar(u8, value, '#') != null) return null;
+    const query_at = std.mem.indexOfScalar(u8, value, '?');
+    const path = if (query_at) |i| value[0..i] else value;
+    const query = if (query_at) |i| value[i + 1 ..] else "";
+    if (!validPath(path) or !validQuery(query)) return null;
+    return .{
+        .path_empty = path.len == 0,
+        .asterisk = false,
+        .starts_slash = path.len != 0 and path[0] == '/',
+    };
+}
+
+fn validPath(value: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < value.len) : (pos += 1) {
+        if (value[pos] == '/') continue;
+        if (!consumeUriChar(value, &pos)) return false;
+    }
+    return true;
+}
+
+fn validQuery(value: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < value.len) : (pos += 1) {
+        if (value[pos] == '/' or value[pos] == '?') continue;
+        if (!consumeUriChar(value, &pos)) return false;
+    }
+    return true;
+}
+
+fn consumeUriChar(value: []const u8, pos: *usize) bool {
+    const c = value[pos.*];
+    switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=' => return true,
+        ':' => return true,
+        '@' => return true,
+        '%' => {
+            if (pos.* + 2 >= value.len or !std.ascii.isHex(value[pos.* + 1]) or !std.ascii.isHex(value[pos.* + 2])) return false;
+            pos.* += 2;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn validateAuthority(value: []const u8) ?AuthorityInfo {
+    if (std.mem.indexOfAny(u8, value, "/?#") != null) return null;
+    const at = std.mem.lastIndexOfScalar(u8, value, '@');
+    const host_port = if (at) |i| blk: {
+        if (!validUserinfo(value[0..i])) return null;
+        if (std.mem.indexOfScalar(u8, value[i + 1 ..], '@') != null) return null;
+        break :blk value[i + 1 ..];
+    } else value;
+    const has_userinfo = at != null;
+
+    if (host_port.len != 0 and host_port[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host_port, ']') orelse return null;
+        if (close <= 1 or !validIpLiteral(host_port[1..close])) return null;
+        if (close + 1 != host_port.len) {
+            if (host_port[close + 1] != ':' or !validPort(host_port[close + 2 ..])) return null;
+        }
+        return .{ .empty_host = false, .has_userinfo = has_userinfo, .has_port = close + 2 < host_port.len };
+    }
+
+    const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
+    const host = if (colon) |i| host_port[0..i] else host_port;
+    if (std.mem.indexOfScalar(u8, host, ':') != null or !validRegName(host)) return null;
+    if (colon) |i| if (!validPort(host_port[i + 1 ..])) return null;
+    return .{ .empty_host = host.len == 0, .has_userinfo = has_userinfo, .has_port = colon != null and host_port[colon.? + 1 ..].len != 0 };
+}
+
+fn validUserinfo(value: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < value.len) : (pos += 1) {
+        const c = value[pos];
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':' => {},
+            '%' => {
+                if (pos + 2 >= value.len or !std.ascii.isHex(value[pos + 1]) or !std.ascii.isHex(value[pos + 2])) return false;
+                pos += 2;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn validRegName(value: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < value.len) : (pos += 1) switch (value[pos]) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=' => {},
+        '%' => {
+            if (pos + 2 >= value.len or !std.ascii.isHex(value[pos + 1]) or !std.ascii.isHex(value[pos + 2])) return false;
+            pos += 2;
+        },
+        else => return false,
+    };
+    return true;
+}
+
+fn validIpLiteral(value: []const u8) bool {
+    if (validIpvFuture(value)) return true;
+    _ = std.Io.net.Ip6Address.parse(value, 0) catch return false;
+    return true;
+}
+
+fn validIpvFuture(value: []const u8) bool {
+    if (value.len < 4 or (value[0] != 'v' and value[0] != 'V')) return false;
+    var pos: usize = 1;
+    const hex_start = pos;
+    while (pos < value.len and std.ascii.isHex(value[pos])) pos += 1;
+    if (pos == hex_start or pos == value.len or value[pos] != '.') return false;
+    pos += 1;
+    const data_start = pos;
+    while (pos < value.len) : (pos += 1) switch (value[pos]) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':' => {},
+        else => return false,
+    };
+    return pos != data_start;
+}
+
+fn validPort(value: []const u8) bool {
+    for (value) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
 
 fn parseContentLength(value: []const u8) ?u64 {
     if (value.len == 0) return null;
@@ -204,11 +437,90 @@ test "HTTP/2 header validation" {
     try std.testing.expectError(error.InvalidHeader, v.field(.{ .name = ":authority", .value = "late.example" }));
 }
 
-test "HTTP/2 request path cannot be empty" {
+test "HTTP/2 HTTP-scheme path cannot be empty" {
     var v = Validator.init(.request);
     try v.field(.{ .name = ":method", .value = "GET" });
     try v.field(.{ .name = ":scheme", .value = "https" });
-    try std.testing.expectError(error.InvalidHeader, v.field(.{ .name = ":path", .value = "" }));
+    try v.field(.{ .name = ":path", .value = "" });
+    try std.testing.expectError(error.InvalidHeader, v.finish());
+
+    var custom = Validator.init(.request);
+    try custom.field(.{ .name = ":method", .value = "GET" });
+    try custom.field(.{ .name = ":scheme", .value = "urn" });
+    try custom.field(.{ .name = ":path", .value = "" });
+    try custom.finish();
+}
+
+test "HTTP/2 request target validates scheme path and authority semantics" {
+    var bad_scheme = Validator.init(.request);
+    try bad_scheme.field(.{ .name = ":method", .value = "GET" });
+    try std.testing.expectError(error.InvalidHeader, bad_scheme.field(.{ .name = ":scheme", .value = "1http" }));
+
+    var userinfo = Validator.init(.request);
+    try userinfo.field(.{ .name = ":method", .value = "GET" });
+    try userinfo.field(.{ .name = ":scheme", .value = "https" });
+    try userinfo.field(.{ .name = ":path", .value = "/" });
+    try userinfo.field(.{ .name = ":authority", .value = "user@example.com" });
+    try std.testing.expectError(error.InvalidHeader, userinfo.finish());
+
+    var empty_host = Validator.init(.request);
+    try empty_host.field(.{ .name = ":method", .value = "GET" });
+    try empty_host.field(.{ .name = ":scheme", .value = "http" });
+    try empty_host.field(.{ .name = ":path", .value = "/" });
+    try empty_host.field(.{ .name = ":authority", .value = ":80" });
+    try std.testing.expectError(error.InvalidHeader, empty_host.finish());
+
+    var relative = Validator.init(.request);
+    try relative.field(.{ .name = ":method", .value = "GET" });
+    try relative.field(.{ .name = ":scheme", .value = "https" });
+    try relative.field(.{ .name = ":path", .value = "relative" });
+    try std.testing.expectError(error.InvalidHeader, relative.finish());
+
+    var fragment = Validator.init(.request);
+    try fragment.field(.{ .name = ":method", .value = "GET" });
+    try fragment.field(.{ .name = ":scheme", .value = "https" });
+    try std.testing.expectError(error.InvalidHeader, fragment.field(.{ .name = ":path", .value = "/x#frag" }));
+
+    var encoded = Validator.init(.request);
+    try encoded.field(.{ .name = ":method", .value = "GET" });
+    try encoded.field(.{ .name = ":scheme", .value = "https" });
+    try encoded.field(.{ .name = ":path", .value = "/a%20b?q=x/y?z" });
+    try encoded.field(.{ .name = ":authority", .value = "[2001:db8::1]:443" });
+    try encoded.finish();
+
+    var custom_rootless = Validator.init(.request);
+    try custom_rootless.field(.{ .name = ":method", .value = "GET" });
+    try custom_rootless.field(.{ .name = ":scheme", .value = "urn" });
+    try custom_rootless.field(.{ .name = ":path", .value = "example:animal" });
+    try custom_rootless.finish();
+
+    var custom_authority = Validator.init(.request);
+    try custom_authority.field(.{ .name = ":method", .value = "GET" });
+    try custom_authority.field(.{ .name = ":scheme", .value = "custom" });
+    try custom_authority.field(.{ .name = ":path", .value = "rootless" });
+    try custom_authority.field(.{ .name = ":authority", .value = "example.test" });
+    try std.testing.expectError(error.InvalidHeader, custom_authority.finish());
+}
+
+test "HTTP/2 asterisk path is restricted to server-wide OPTIONS" {
+    var options = Validator.init(.request);
+    try options.field(.{ .name = ":method", .value = "OPTIONS" });
+    try options.field(.{ .name = ":scheme", .value = "https" });
+    try options.field(.{ .name = ":path", .value = "*" });
+    try options.finish();
+
+    var get = Validator.init(.request);
+    try get.field(.{ .name = ":method", .value = "GET" });
+    try get.field(.{ .name = ":scheme", .value = "https" });
+    try get.field(.{ .name = ":path", .value = "*" });
+    try std.testing.expectError(error.InvalidHeader, get.finish());
+
+    var with_authority = Validator.init(.request);
+    try with_authority.field(.{ .name = ":method", .value = "OPTIONS" });
+    try with_authority.field(.{ .name = ":scheme", .value = "https" });
+    try with_authority.field(.{ .name = ":path", .value = "*" });
+    try with_authority.field(.{ .name = ":authority", .value = "example.com" });
+    try std.testing.expectError(error.InvalidHeader, with_authority.finish());
 }
 
 test "Extended CONNECT pseudo-header rules" {
@@ -243,6 +555,21 @@ test "CONNECT pseudo-header rules" {
     try v.field(.{ .name = ":method", .value = "CONNECT" });
     try v.field(.{ .name = ":authority", .value = "example.com:443" });
     try v.finish();
+
+    var missing_port = Validator.init(.request);
+    try missing_port.field(.{ .name = ":method", .value = "CONNECT" });
+    try missing_port.field(.{ .name = ":authority", .value = "example.com" });
+    try std.testing.expectError(error.InvalidHeader, missing_port.finish());
+
+    var empty_port = Validator.init(.request);
+    try empty_port.field(.{ .name = ":method", .value = "CONNECT" });
+    try empty_port.field(.{ .name = ":authority", .value = "[2001:db8::1]:" });
+    try std.testing.expectError(error.InvalidHeader, empty_port.finish());
+
+    var userinfo = Validator.init(.request);
+    try userinfo.field(.{ .name = ":method", .value = "CONNECT" });
+    try userinfo.field(.{ .name = ":authority", .value = "user@example.com:443" });
+    try std.testing.expectError(error.InvalidHeader, userinfo.finish());
 }
 
 test "HTTP/2 validator rejects uppercase and connection-specific fields" {

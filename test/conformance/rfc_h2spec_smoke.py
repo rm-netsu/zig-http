@@ -429,6 +429,27 @@ def probe_header_semantics(host: str, port: int) -> None:
             (b":path", b"/"),
             (b"te", b"gzip"),
         ],
+        [
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"relative"),
+        ],
+        [
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+            (b":authority", b"user@example.com"),
+        ],
+        [
+            (b":method", b"OPTIONS"),
+            (b":scheme", b"https"),
+            (b":path", b"*"),
+            (b":authority", b"example.com"),
+        ],
+        [
+            (b":method", b"CONNECT"),
+            (b":authority", b"example.com"),
+        ],
     ]
     for headers in malformed:
         sock = connect(host, port)

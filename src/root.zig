@@ -25,6 +25,7 @@ test {
     _ = http2.flow.StreamSendWindow;
     _ = http2.flow.ReceiveCredit;
     _ = http2.fields.Validator;
+    _ = http2.fields.RequestTarget;
     _ = http2.payload.HeadersPayload;
     _ = http2.continuation.Guard;
     _ = http2.preface.Parser;

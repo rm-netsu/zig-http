@@ -226,6 +226,15 @@ connection, `:protocol` is validated as part of request pseudo-header semantics,
 and Session gates Extended CONNECT on negotiated capability. The selected
 application protocol and tunnel bytes remain entirely caller-owned.
 
+Request pseudo-header validation also checks the URI semantics that are safe to
+resolve inside the HTTP core. `:scheme` follows RFC 3986 syntax and remains open
+to non-HTTP schemes; `:path` validates path/query syntax and applies the stricter
+non-empty absolute-path rule only to HTTP/HTTPS; HTTP/HTTPS `:authority` rejects
+empty hosts and deprecated userinfo. Asterisk-form `:path = "*"` is accepted only
+for server-wide OPTIONS without `:authority`, and traditional CONNECT requires
+`:authority` in host:port form. The ephemeral `http2.fields.RequestTarget` state
+is public for consumers composing field validation below `Session`.
+
 ### HTTP/2 extension composition
 
 `Session` does not force consumers to abandon the composed path when they add an
