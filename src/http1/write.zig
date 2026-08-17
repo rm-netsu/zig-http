@@ -67,6 +67,8 @@ pub const MessageWriter = struct {
         InvalidState,
         ContentLengthMismatch,
         TrailersNotAllowed,
+        TrailerPolicyRequired,
+        TrailerRejected,
         InvalidTrailer,
         InvalidResponseFraming,
     };
@@ -148,29 +150,67 @@ pub const MessageWriter = struct {
         };
     }
 
-    /// Complete a chunked or close-delimited message. Fixed-length messages
-    /// finish automatically when their exact declared length is written; if a
-    /// fixed body is still incomplete, this reports `ContentLengthMismatch`
-    /// without poisoning the coordinator so the caller may supply the rest.
+    /// Complete a message without application-defined trailer fields.
+    ///
+    /// Non-empty trailers require `finishWithTrailerPolicy`: RFC 9110 permits
+    /// a sender to generate a trailer field only when the corresponding field
+    /// definition explicitly permits trailer placement. Core cannot know every
+    /// registered or application-defined field, so the safe default is to
+    /// require that semantic decision from the caller.
+    ///
+    /// Fixed-length messages finish automatically when their exact declared
+    /// length is written; if a fixed body is still incomplete, this reports
+    /// `ContentLengthMismatch` without poisoning the coordinator so the caller
+    /// may supply the rest.
     pub fn finish(self: *MessageWriter, w: *std.Io.Writer, trailers: []const common.Header) MessageError!void {
+        if (trailers.len != 0) {
+            return switch (self.state) {
+                .chunked => error.TrailerPolicyRequired,
+                .fixed, .close_delimited => error.TrailersNotAllowed,
+                else => error.InvalidState,
+            };
+        }
+        try self.finishChecked(w, trailers);
+    }
+
+    /// Complete a chunked message after an application/domain policy confirms
+    /// that every trailer field definition permits trailer placement.
+    ///
+    /// `policy` is caller-owned and must provide:
+    ///
+    ///     pub fn allows(self: @This(), name: []const u8) bool
+    ///
+    /// All trailer syntax, universally forbidden framing fields, and policy
+    /// decisions are checked before the terminal chunk is emitted. A rejected
+    /// trailer therefore leaves the writer reusable for another finish attempt.
+    pub fn finishWithTrailerPolicy(self: *MessageWriter, w: *std.Io.Writer, trailers: []const common.Header, policy: anytype) MessageError!void {
+        if (self.state != .chunked) {
+            if (trailers.len != 0 and (self.state == .fixed or self.state == .close_delimited)) return error.TrailersNotAllowed;
+            return error.InvalidState;
+        }
+        try validateTrailers(trailers);
+        for (trailers) |field| {
+            if (!policy.allows(field.name)) return error.TrailerRejected;
+        }
+        try self.finishChecked(w, trailers);
+    }
+
+    fn finishChecked(self: *MessageWriter, w: *std.Io.Writer, trailers: []const common.Header) MessageError!void {
         switch (self.state) {
             .fixed => {
-                if (trailers.len != 0) return error.TrailersNotAllowed;
                 if (self.remaining != 0) return error.ContentLengthMismatch;
                 self.completeMessage();
             },
             .chunked => {
-                try validateTrailers(trailers);
+                // `finish()` only reaches this with no trailers; the policy
+                // variant has already completed semantic preflight.
                 endChunksUnchecked(w, trailers) catch |err| {
                     self.state = .poisoned;
                     return err;
                 };
                 self.completeMessage();
             },
-            .close_delimited => {
-                if (trailers.len != 0) return error.TrailersNotAllowed;
-                self.state = .must_close;
-            },
+            .close_delimited => self.state = .must_close,
             else => return error.InvalidState,
         }
     }
@@ -362,7 +402,13 @@ test "message writer enforces request content length and supports reuse" {
     try std.testing.expect(message.ready());
 }
 
-test "message writer serializes chunked bodies and trailers" {
+test "message writer requires semantic policy for trailers" {
+    const ChecksumTrailers = struct {
+        pub fn allows(_: @This(), name: []const u8) bool {
+            return common.eqlHeaderName(name, "x-checksum");
+        }
+    };
+
     var storage: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&storage);
     var message = MessageWriter.init();
@@ -371,9 +417,40 @@ test "message writer serializes chunked bodies and trailers" {
     });
     try std.testing.expectEqual(head.BodyFraming.chunked, begin.framing);
     _ = try message.writeData(&writer, "abc");
-    try message.finish(&writer, &.{.{ .name = "x-checksum", .value = "ok" }});
+
+    const before = writer.buffered().len;
+    try std.testing.expectError(error.TrailerPolicyRequired, message.finish(&writer, &.{
+        .{ .name = "x-checksum", .value = "ok" },
+    }));
+    try std.testing.expectEqual(before, writer.buffered().len);
+
+    try message.finishWithTrailerPolicy(&writer, &.{
+        .{ .name = "x-checksum", .value = "ok" },
+    }, ChecksumTrailers{});
     try std.testing.expect(message.ready());
     try std.testing.expect(std.mem.endsWith(u8, writer.buffered(), "3\r\nabc\r\n0\r\nx-checksum: ok\r\n\r\n"));
+}
+
+test "message writer trailer policy rejects before terminal chunk" {
+    const NoTrailers = struct {
+        pub fn allows(_: @This(), _: []const u8) bool {
+            return false;
+        }
+    };
+
+    var storage: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    var message = MessageWriter.init();
+    _ = try message.beginResponse(&writer, .http_1_1, 200, "OK", "GET", &.{
+        .{ .name = "transfer-encoding", .value = "chunked" },
+    });
+    _ = try message.writeData(&writer, "abc");
+    const before = writer.buffered().len;
+    try std.testing.expectError(error.TrailerRejected, message.finishWithTrailerPolicy(&writer, &.{
+        .{ .name = "x-checksum", .value = "ok" },
+    }, NoTrailers{}));
+    try std.testing.expectEqual(before, writer.buffered().len);
+    try message.finish(&writer, &.{});
 }
 
 test "message writer prevents reuse after close-delimited response" {
@@ -406,7 +483,6 @@ test "message writer handles HEAD and CONNECT response boundaries" {
     try std.testing.expectError(error.InvalidState, message.writeData(&writer, "not-http"));
 }
 
-
 test "message writer rejects forbidden bodyless response framing before output" {
     var storage: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&storage);
@@ -432,13 +508,17 @@ test "message writer rejects framing fields in trailers before terminal chunk" {
     });
     _ = try message.writeData(&writer, "abc");
     const before = writer.buffered().len;
-    try std.testing.expectError(error.InvalidTrailer, message.finish(&writer, &.{
+    const AllowAll = struct {
+        pub fn allows(_: @This(), _: []const u8) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.InvalidTrailer, message.finishWithTrailerPolicy(&writer, &.{
         .{ .name = "content-length", .value = "3" },
-    }));
+    }, AllowAll{}));
     try std.testing.expectEqual(before, writer.buffered().len);
     try message.finish(&writer, &.{});
 }
-
 
 test "message writer poisons state after partial output failure" {
     var storage: [8]u8 = undefined;

@@ -136,11 +136,21 @@ if (!started.message_done) {
 ```
 
 For streaming output use `Transfer-Encoding: chunked`; each `writeData` call is
-serialized as one chunk and `finish(out, trailers)` emits the terminal chunk.
-Framing fields are rejected in trailers. Responses whose framing is close-delimited
-require `finish(out, &.{})`, after which the caller must close the transport.
-Successful CONNECT and `101` responses transition to `protocolSwitched()`; tunnel
-bytes intentionally remain outside the HTTP writer.
+serialized as one chunk. `finish(out, &.{})` emits a terminal chunk without
+trailers. Non-empty trailers intentionally require
+`finishWithTrailerPolicy(out, trailers, policy)`: RFC 9110 allows a sender to
+generate a trailer field only when that field's definition explicitly permits
+trailer placement, and the protocol core cannot know every registered or
+application-defined field definition. The caller-owned policy exposes
+`allows(name) bool`; syntax, universally forbidden framing fields, and every
+policy decision are preflighted before the terminal chunk is written. The raw
+`http1.write.endChunks()` serializer remains available when the caller deliberately
+owns all trailer semantics. See `examples/http1_trailers.zig`.
+
+Responses whose framing is close-delimited require `finish(out, &.{})`, after
+which the caller must close the transport. Successful CONNECT and `101` responses
+transition to `protocolSwitched()`; tunnel bytes intentionally remain outside the
+HTTP writer.
 
 ## HTTP/1 fast paths
 

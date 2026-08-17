@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
     const example_sources = [_][]const u8{
         "http1_client_core",
         "http1_server_core",
+        "http1_trailers",
         "http2_client_core",
         "http2_server_core",
         "http2_priority",

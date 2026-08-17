@@ -7,6 +7,8 @@ without making sockets, TLS, DNS, or an event loop part of the HTTP core.
 - `http1_client_core.zig` — serialize a request with `MessageWriter`, then parse
   a response with `ConnectionDecoder` and explicit outstanding-method context.
 - `http1_server_core.zig` — parse a request and serialize a framed response.
+- `http1_trailers.zig` — finish a chunked response with application-defined
+  trailers through the explicit RFC 9110 semantic policy hook.
 - `http2_client_core.zig` — create a client `Session`, fixed caller-owned stream
   store, HPACK codecs, and one request HEADERS block.
 - `http2_server_core.zig` — in-memory client/server Session round-trip showing
