@@ -13,6 +13,7 @@ without making sockets, TLS, DNS, or an event loop part of the HTTP core.
   store, HPACK codecs, and one request HEADERS block.
 - `http2_server_core.zig` — in-memory client/server Session round-trip showing
   synchronous field sinks, stream storage, response HEADERS, and DATA.
+- `http2_trailers.zig` — send HTTP/2 trailers only after an explicit application/domain semantic policy accepts every field.
 - `http2_priority.zig` — parse and serialize RFC 9218 Priority values, compose
   request/response/PRIORITY_UPDATE omission semantics with caller-owned state,
   and emit a PRIORITY_UPDATE frame without introducing scheduling policy.

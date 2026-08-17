@@ -688,6 +688,8 @@ _ = try session.sendPushPromise(
 );
 ```
 
+Non-empty HTTP/2 trailers use an explicit semantic policy, mirroring the safe-by-default HTTP/1 composed writer. `sendHeaders()` / `sendHeadersExisting()` return `TrailerPolicyRequired` when the section is trailers; use `sendTrailers()` / `sendTrailersExisting()` after an application/domain policy confirms that each field definition permits trailer placement. The whole decision is preflighted before HPACK, stream, or wire mutation. See `examples/http2_trailers.zig` and `docs/http2.md`.
+
 For an event loop that already owns a stable `StreamCursor`,
 `sendHeadersExisting()` and `sendDataExisting()` avoid another caller-store
 lookup. The fixed-array benchmark does not universally favor this cursor, so it

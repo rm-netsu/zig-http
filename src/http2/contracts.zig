@@ -61,6 +61,18 @@ pub fn assertFieldSink(comptime T: type) void {
         @compileError("zig-http HTTP/2 field sink must provide field(stream_id, kind, header)");
 }
 
+/// Trailer policies are caller-owned because core cannot know the semantics of
+/// every registered or application-defined HTTP field. The composed HTTP/2
+/// send path uses this structural contract only for non-empty trailer blocks.
+pub fn hasTrailerPolicy(comptime T: type) bool {
+    return hasDecl(T, "allows");
+}
+
+pub fn assertTrailerPolicy(comptime T: type) void {
+    if (!hasDecl(T, "allows"))
+        @compileError("zig-http HTTP/2 trailer policy must provide allows(name) bool");
+}
+
 test "contract predicates detect required structural declarations" {
     const Store = struct {
         pub fn get(_: *@This(), _: u31) ?*u8 {
@@ -80,8 +92,16 @@ test "contract predicates detect required structural declarations" {
 
     try std.testing.expect(hasStreamStore(*Store));
     try std.testing.expect(hasSessionStore(*Store));
+    const TrailerPolicy = struct {
+        pub fn allows(_: @This(), _: []const u8) bool {
+            return true;
+        }
+    };
+
     try std.testing.expect(hasFieldSink(*Sink));
+    try std.testing.expect(hasTrailerPolicy(TrailerPolicy));
     try std.testing.expect(!hasStreamStore(*Incomplete));
     try std.testing.expect(!hasSessionStore(*Incomplete));
     try std.testing.expect(!hasFieldSink(*Incomplete));
+    try std.testing.expect(!hasTrailerPolicy(*Incomplete));
 }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make composed HTTP/2 trailer sending fail-closed: non-empty trailers through `Session.sendHeaders()` now require an explicit caller-owned semantic policy, while new `sendTrailers()` / `sendTrailersExisting()` preflight trailer syntax and policy before HPACK, stream, or wire mutation. Add a compile-tested trailer example and structural policy diagnostics; inbound and low-level extension/proxy paths remain unrestricted by application field semantics.
+
 - Add aggregate `zig build conformance`, `conformance-h2spec`, and `all-checks` workflows so contributors can run reproducible external interoperability/RFC smoke, strict upstream h2spec, or the complete merge/docs/conformance gate without memorizing individual fixture scripts; aggregate fixture runs automatically reuse the invoking Zig executable.
 
 - Add a first-class documentation workflow: `zig build docs` generates and installs Zig API reference pages, while focused HTTP/1, HTTP/2, concurrency, operations, and migration guides separate architectural/ownership guidance from declaration-level docs.

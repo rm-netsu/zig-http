@@ -189,7 +189,7 @@ pub const DataSendCredit = struct {
     max_payload: usize,
 };
 
-pub const SendHeadersError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned };
+pub const SendHeadersError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned, TrailerPolicyRequired, TrailerRejected };
 pub const SendPushPromiseError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned };
 pub const SendDataError = std.Io.Writer.Error || streams_mod.LocalError || error{SendPoisoned};
 pub const DataSendCreditError = streams_mod.LocalError || error{SendPoisoned};
@@ -327,6 +327,7 @@ pub const Session = struct {
         const existing = store.get(stream_id);
         const kind = self.localHeaderKindTracked(existing, stream_id);
         const field_info = try validateLocalFields(kind, end_stream, items);
+        if (kind == .trailers and items.len != 0) return error.TrailerPolicyRequired;
         if (field_info.extended_connect and
             (self.streams.local_role != .client or !self.peer.settings.enable_connect_protocol))
             return error.Protocol;
@@ -365,6 +366,7 @@ pub const Session = struct {
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
         const kind = self.localHeaderKindTracked(existing.tracked, existing.stream_id);
         const field_info = try validateLocalFields(kind, end_stream, items);
+        if (kind == .trailers and items.len != 0) return error.TrailerPolicyRequired;
         if (field_info.extended_connect and
             (self.streams.local_role != .client or !self.peer.settings.enable_connect_protocol))
             return error.Protocol;
@@ -377,6 +379,74 @@ pub const Session = struct {
         ) catch return error.BufferTooSmall;
         try self.streams.localHeadersTracked(&self.peer, existing.stream_id, existing.tracked, end_stream);
         return self.finishSendHeaders(&framer, existing.tracked, kind, field_info.status, items);
+    }
+
+    /// Streams a non-empty trailer field section after caller policy confirms
+    /// that every field definition permits trailer placement. Trailer syntax,
+    /// stream state, and the complete policy decision are preflighted before
+    /// HPACK or wire mutation. Trailers always carry END_STREAM.
+    ///
+    /// `policy` must provide:
+    ///
+    ///     pub fn allows(self: @This(), name: []const u8) bool
+    ///
+    /// Empty trailers do not need a policy and may be sent with `sendHeaders`.
+    pub fn sendTrailers(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        frame_staging: []u8,
+        items: []const hpack.EncodedField,
+        policy: anytype,
+    ) SendHeadersError!SendHeadersResult {
+        comptime contracts.assertStreamStore(@TypeOf(store));
+        comptime contracts.assertTrailerPolicy(@TypeOf(policy));
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
+        const tracked = store.get(stream_id) orelse return error.Protocol;
+        if (self.localHeaderKindTracked(tracked, stream_id) != .trailers) return error.Protocol;
+        _ = try validateLocalFields(.trailers, true, items);
+        try validateTrailerPolicy(items, policy);
+
+        var framer = send_mod.HeaderFramer.init(
+            out,
+            frame_staging,
+            self.peer.settings.max_frame_size,
+            stream_id,
+            true,
+        ) catch return error.BufferTooSmall;
+        try self.streams.localHeadersTracked(&self.peer, stream_id, tracked, true);
+        return self.finishSendHeaders(&framer, tracked, .trailers, 0, items);
+    }
+
+    /// Trailer fast path for a caller that already holds a stable stream record.
+    /// The same full semantic preflight as `sendTrailers` occurs before mutation.
+    pub fn sendTrailersExisting(
+        self: *Session,
+        out: *std.Io.Writer,
+        existing: streams_mod.Existing,
+        frame_staging: []u8,
+        items: []const hpack.EncodedField,
+        policy: anytype,
+    ) SendHeadersError!SendHeadersResult {
+        comptime contracts.assertTrailerPolicy(@TypeOf(policy));
+        if (existing.manager != &self.streams) return error.Protocol;
+        if (self.pending.poisoned()) return error.SendPoisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
+        if (self.localHeaderKindTracked(existing.tracked, existing.stream_id) != .trailers) return error.Protocol;
+        _ = try validateLocalFields(.trailers, true, items);
+        try validateTrailerPolicy(items, policy);
+
+        var framer = send_mod.HeaderFramer.init(
+            out,
+            frame_staging,
+            self.peer.settings.max_frame_size,
+            existing.stream_id,
+            true,
+        ) catch return error.BufferTooSmall;
+        try self.streams.localHeadersTracked(&self.peer, existing.stream_id, existing.tracked, true);
+        return self.finishSendHeaders(&framer, existing.tracked, .trailers, 0, items);
     }
 
     fn finishSendHeaders(
@@ -1244,6 +1314,12 @@ fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack
     return .{ .status = status, .extended_connect = validator.extendedConnect() };
 }
 
+fn validateTrailerPolicy(items: []const hpack.EncodedField, policy: anytype) error{TrailerRejected}!void {
+    for (items) |item| {
+        if (!policy.allows(item.field.name)) return error.TrailerRejected;
+    }
+}
+
 fn receiveFault(stream_id: u31, result: streams_mod.ReceiveResult) ?Fault {
     const code = result.errorCode() orelse return null;
     if (result.isConnectionError()) return .{ .connection = code };
@@ -1960,7 +2036,26 @@ test "send response tracks informational final and trailers phases" {
     try std.testing.expectEqual(stream_mod.RemoteHeaders.regular, store.get(1).?.local_headers);
 
     const trailers = [_]hpack.EncodedField{.{ .field = .{ .name = "x-checksum", .value = "ok" } }};
-    _ = try session.sendHeaders(&store, &wire, 1, true, &frame_staging, &trailers);
+    const before_trailers = wire.buffered().len;
+    try std.testing.expectError(error.TrailerPolicyRequired, session.sendHeaders(&store, &wire, 1, true, &frame_staging, &trailers));
+    try std.testing.expectEqual(before_trailers, wire.buffered().len);
+
+    const Reject = struct {
+        pub fn allows(_: @This(), _: []const u8) bool {
+            return false;
+        }
+    };
+    const existing = session.streams.existing(&store, 1).?;
+    try std.testing.expectError(error.TrailerRejected, session.sendTrailersExisting(&wire, existing, &frame_staging, &trailers, Reject{}));
+    try std.testing.expectEqual(before_trailers, wire.buffered().len);
+    try std.testing.expectEqual(stream_mod.RemoteHeaders.regular, store.get(1).?.local_headers);
+
+    const AllowChecksum = struct {
+        pub fn allows(_: @This(), name: []const u8) bool {
+            return std.mem.eql(u8, name, "x-checksum");
+        }
+    };
+    _ = try session.sendTrailers(&store, &wire, 1, &frame_staging, &trailers, AllowChecksum{});
     try std.testing.expectEqual(stream_mod.RemoteHeaders.trailers, store.get(1).?.local_headers);
     try std.testing.expectEqual(stream_mod.State.closed, store.get(1).?.stream.state);
 }

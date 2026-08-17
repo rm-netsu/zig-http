@@ -12,6 +12,7 @@ Compile-tested starting points:
 ```text
 examples/http2_client_core.zig
 examples/http2_server_core.zig
+examples/http2_trailers.zig
 examples/http2_priority.zig
 examples/support/fixed_stream_store.zig
 examples/support/counting_field_sink.zig
@@ -87,3 +88,30 @@ signals while preserving their different omission semantics.
 Scheduling policy, buffering priorities for not-yet-created streams, and merging
 client/server preferences remain caller-owned. The HTTP core intentionally does
 not impose a queue or scheduler topology.
+
+## Trailer field semantics
+
+HTTP/2 framing can validate trailer syntax and universally forbidden connection/framing fields, but core cannot know whether every registered or application-defined HTTP field permits trailer placement. The composed send path is therefore fail-closed for non-empty trailers.
+
+`Session.sendHeaders()` / `sendHeadersExisting()` return `error.TrailerPolicyRequired` when a non-empty field section would be trailers. Use the explicit trailer APIs instead:
+
+```zig
+const Policy = struct {
+    pub fn allows(_: @This(), name: []const u8) bool {
+        return std.mem.eql(u8, name, "x-checksum");
+    }
+};
+
+_ = try session.sendTrailers(
+    &store,
+    out,
+    stream_id,
+    &frame_staging,
+    &trailers,
+    Policy{},
+);
+```
+
+`sendTrailers()` and `sendTrailersExisting()` always carry END_STREAM and preflight the complete field block plus caller policy before stream, HPACK, or wire mutation. Policy rejection returns `error.TrailerRejected`, so the caller can correct the trailers/policy and retry safely.
+
+Inbound trailers remain structurally validated and surfaced to the field sink without requiring this outbound policy. That keeps proxies and extension-aware applications able to inspect or forward fields whose semantics live outside core. Lower-level HPACK/frame writers remain the raw escape hatch when the caller intentionally owns all semantic responsibility.

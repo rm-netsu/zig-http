@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
         "http1_trailers",
         "http2_client_core",
         "http2_server_core",
+        "http2_trailers",
         "http2_priority",
         "error_handling",
     };
