@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add compile-tested, transport-neutral HTTP/1 and HTTP/2 executable examples plus minimal fixed stream-store and synchronous field-sink reference implementations; `zig build check` now runs the examples to catch public API drift.
 - Complete the policy-free RFC 9218 priority surface with allocation-free Structured Fields parsing/serialization for `u`/`i`, preserved omission/default semantics, extension-member validation, duplicate-key handling, and preflighted HTTP/2 PRIORITY_UPDATE writers.
 - Harden HTTP/2 request-target semantics with RFC 3986 scheme/path/authority validation, scheme-specific HTTP/HTTPS empty-path and userinfo rules, asterisk-form OPTIONS checks, and strict host:port authority-form validation for traditional CONNECT.
 - Add allocation-free HTTP/1 `MessageWriter` send-side composition with preflight request/response semantics, exact Content-Length accounting, chunked/trailer completion, close-delimited reuse prevention, HEAD/CONNECT protocol-switch boundaries, and writer-failure poisoning; raw head writers now validate all fields before emitting any bytes.

@@ -65,6 +65,29 @@ pub fn build(b: *std.Build) void {
     const http1_client_step = b.step("http1-conformance-client", "Build the cleartext HTTP/1 interoperability fixture client");
     http1_client_step.dependOn(&install_http1_client.step);
 
+    const examples_step = b.step("examples", "Build and run protocol-core usage examples");
+    const example_sources = [_][]const u8{
+        "http1_client_core",
+        "http1_server_core",
+        "http2_client_core",
+        "http2_server_core",
+        "http2_priority",
+    };
+    for (example_sources) |name| {
+        const example_mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "http", .module = mod }},
+        });
+        const example_exe = b.addExecutable(.{
+            .name = b.fmt("http-example-{s}", .{name}),
+            .root_module = example_mod,
+        });
+        const run_example = b.addRunArtifact(example_exe);
+        examples_step.dependOn(&run_example.step);
+    }
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the HTTP library tests");
@@ -114,6 +137,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(test_step);
     check_step.dependOn(fuzz_step);
     check_step.dependOn(fixtures_step);
+    check_step.dependOn(examples_step);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),

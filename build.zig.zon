@@ -17,6 +17,7 @@
         "BENCHMARKS.md",
         "FUZZING.md",
         "build_support",
+        "examples",
         "test",
         "bench",
         "src",

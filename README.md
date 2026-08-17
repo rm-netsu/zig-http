@@ -40,6 +40,30 @@ only state you actually want the HTTP engine to manage:
 None of these levels opens sockets, performs TLS/DNS, registers timers, or owns
 an event loop.
 
+## Compile-tested examples
+
+The `examples/` directory contains executable, transport-neutral reference
+compositions. They are built and run by `zig build examples`, and the normal
+`zig build check` merge gate depends on that step so examples cannot silently
+fall behind the public API.
+
+Start with:
+
+- `examples/http1_client_core.zig` and `http1_server_core.zig` for the symmetric
+  `ConnectionDecoder` / `MessageWriter` message lifecycle;
+- `examples/http2_client_core.zig` for the minimum client `Session` setup;
+- `examples/http2_server_core.zig` for an in-memory client/server Session
+  round-trip including the caller-owned store and synchronous field sink;
+- `examples/http2_priority.zig` for policy-free RFC 9218 parsing and
+  PRIORITY_UPDATE serialization.
+
+The support files are deliberately simple reference implementations rather than
+core-owned storage policy. `support/fixed_stream_store.zig` shows the complete
+Session store surface (`get`, `insert`, and `maxActiveSendAdjustment`) while
+`support/counting_field_sink.zig` demonstrates the synchronous `field` callback
+without retaining borrowed HPACK slices. Production applications can substitute
+slabs, hash tables, shards, or direct projection into application state.
+
 Public names intentionally follow one path per abstraction level. Composed entry
 points are `http1.ConnectionDecoder`, `http1.MessageWriter`, and `http2.Session`; lower-level types live
 under their owning namespaces (`http1.head`, `http1.body`, `http2.frame`,
@@ -785,6 +809,7 @@ HPACK is fetched from `https://github.com/rm-netsu/zig-hpack` and pinned by both
 ```sh
 zig build test
 zig build check
+zig build examples
 zig build test -Doptimize=ReleaseFast
 zig build test -Doptimize=ReleaseSafe -Dsanitize-thread=true
 zig build conformance-fixtures
