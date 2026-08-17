@@ -23,6 +23,7 @@ pub const LocalLimits = struct {
 pub const ReceiveResult = enum(u8) {
     accepted,
     connection_protocol,
+    connection_stream_closed,
     stream_protocol,
     stream_closed,
     stream_flow_control,
@@ -33,6 +34,7 @@ pub const ReceiveResult = enum(u8) {
         return switch (self) {
             .accepted => null,
             .connection_protocol, .stream_protocol => .protocol_error,
+            .connection_stream_closed => .stream_closed,
             .stream_closed => .stream_closed,
             .stream_flow_control => .flow_control_error,
             .refused_stream => .refused_stream,
@@ -41,7 +43,7 @@ pub const ReceiveResult = enum(u8) {
     }
 
     pub inline fn isConnectionError(self: ReceiveResult) bool {
-        return self == .connection_protocol;
+        return self == .connection_protocol or self == .connection_stream_closed;
     }
 };
 
@@ -656,7 +658,8 @@ pub const Manager = struct {
             return switch (tracked.stream.state) {
                 .idle, .open, .half_closed_local => .accepted,
                 .reserved_remote => if (self.remoteLimitAvailable()) .accepted else .refused_stream,
-                .half_closed_remote, .closed => .stream_closed,
+                .half_closed_remote => .stream_closed,
+                .closed => .connection_stream_closed,
                 .reserved_local => .connection_protocol,
             };
         }
@@ -693,6 +696,7 @@ pub const Manager = struct {
     /// Fast path for a stream record already resolved by caller-owned storage.
     pub fn receiveHeadersTracked(self: *Manager, stream_id: u31, tracked: *Tracked, end_stream: bool) ReceiveResult {
         const before = tracked.stream.state;
+        if (before == .closed) return .connection_stream_closed;
         if (before == .reserved_remote and !self.remoteLimitAvailable()) {
             tracked.stream.state = .closed;
             return .refused_stream;
@@ -932,6 +936,22 @@ test "HEADERS classification observes state without mutating it" {
     try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
     try std.testing.expectEqual(ReceiveResult.stream_closed, manager.classifyHeaders(&store, 1));
     try std.testing.expectEqual(State.half_closed_remote, store.get(1).?.stream.state);
+}
+
+test "HEADERS on a fully closed stream can be a connection STREAM_CLOSED error" {
+    var manager = Manager.init(.server, .{});
+    var store: TestStore = .{};
+    var peer = peer_mod.State.init(.server);
+
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
+    try manager.localHeaders(&store, &peer, 1, true);
+    try std.testing.expectEqual(State.closed, store.get(1).?.stream.state);
+
+    const classified = manager.classifyHeaders(&store, 1);
+    try std.testing.expectEqual(ReceiveResult.connection_stream_closed, classified);
+    try std.testing.expect(classified.isConnectionError());
+    try std.testing.expectEqual(protocol.ErrorCode.stream_closed, classified.errorCode().?);
+    try std.testing.expectEqual(ReceiveResult.connection_stream_closed, manager.receiveHeaders(&store, 1, true));
 }
 
 test "server enforces local concurrent stream limit with REFUSED_STREAM" {

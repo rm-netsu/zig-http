@@ -9,6 +9,7 @@ const max_concurrent_streams: u32 = 32;
 const header_storage_size = 256 * 1024;
 const scratch_size = 256 * 1024;
 const wire_buffer_size = 128 * 1024;
+const response_body = "zig-http";
 
 const Store = struct {
     const Entry = struct {
@@ -16,6 +17,8 @@ const Store = struct {
         used: bool = false,
         value: h2.stream.Tracked = undefined,
         body_length: h2.fields.BodyLength = .{},
+        response_headers_sent: bool = false,
+        response_body_sent: u4 = 0,
     };
 
     entries: [128]Entry = [_]Entry{.{}} ** 128,
@@ -74,23 +77,37 @@ fn sendStreamError(session: *h2.Session, store: *Store, out: *std.Io.Writer, str
 }
 
 fn respond(session: *h2.Session, store: *Store, out: *std.Io.Writer, stream_id: u31, staging: []u8) !void {
+    const entry = store.entry(stream_id) orelse return error.Protocol;
     const response = [_]h2.hpack.EncodedField{
         .{ .field = .{ .name = ":status", .value = "200" } },
-        .{ .field = .{ .name = "content-length", .value = "2" } },
+        .{ .field = .{ .name = "content-length", .value = "8" } },
         .{ .field = .{ .name = "content-type", .value = "text/plain" } },
     };
-    _ = try session.sendHeaders(store, out, stream_id, false, staging, &response);
-    const sent = try session.sendData(store, out, stream_id, "ok", true);
-    // A peer can intentionally reduce INITIAL_WINDOW_SIZE to zero. In that
-    // case keeping the response stream open is required and is useful to the
-    // h2spec concurrency test.
-    if (sent.blocked) std.debug.assert(sent.consumed == 0);
+    if (!entry.response_headers_sent) {
+        _ = try session.sendHeaders(store, out, stream_id, false, staging, &response);
+        entry.response_headers_sent = true;
+    }
+
+    const offset: usize = entry.response_body_sent;
+    if (offset < response_body.len) {
+        const sent = try session.sendData(store, out, stream_id, response_body[offset..], true);
+        entry.response_body_sent += @intCast(sent.consumed);
+    }
     try out.flush();
 }
 
 fn handleEvent(session: *h2.Session, store: *Store, out: *std.Io.Writer, event: h2.SessionEvent, staging: []u8) !bool {
     switch (event) {
-        .ignored, .pending, .window_update, .reset, .goaway, .push_promise => {},
+        .ignored, .pending, .reset, .goaway, .push_promise => {},
+        .window_update => |update| {
+            if (update.stream_id != 0) {
+                if (store.entry(update.stream_id)) |entry| {
+                    if (entry.response_headers_sent and entry.response_body_sent < response_body.len) {
+                        try respond(session, store, out, update.stream_id, staging);
+                    }
+                }
+            }
+        },
         .fault => |fault| switch (fault) {
             .connection => |code| {
                 try sendConnectionError(out, code);
@@ -101,6 +118,11 @@ fn handleEvent(session: *h2.Session, store: *Store, out: *std.Io.Writer, event: 
         .settings => |settings_event| {
             if (!settings_event.ack) {
                 try session.sendSettingsAck(out);
+                for (&store.entries) |*entry| {
+                    if (entry.used and entry.response_headers_sent and entry.response_body_sent < response_body.len) {
+                        try respond(session, store, out, entry.id, staging);
+                    }
+                }
                 try out.flush();
             }
         },
@@ -150,6 +172,11 @@ fn handleEvent(session: *h2.Session, store: *Store, out: *std.Io.Writer, event: 
 fn handleConnection(io: std.Io, stream: net.Stream) !void {
     var owned_stream = stream;
     defer owned_stream.close(io);
+    // Half-close the write side before releasing the socket. h2spec 2.6.0's
+    // old Go runtime recognizes EOF as a clean connection close but can report
+    // a Linux ECONNRESET wrapped in os.SyscallError as a generic test error.
+    // Sending FIN first also better models HTTP/2's GOAWAY-then-close sequence.
+    defer owned_stream.shutdown(io, .send) catch {};
 
     var socket_read_buffer: [16 * 1024]u8 = undefined;
     var socket_write_buffer: [16 * 1024]u8 = undefined;
@@ -268,6 +295,10 @@ fn handleConnection(io: std.Io, stream: net.Stream) !void {
     }
 }
 
+fn connectionWorker(io: std.Io, stream: net.Stream) void {
+    handleConnection(io, stream) catch |err| std.log.err("conformance connection failed: {t}", .{err});
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var port: u16 = 18080;
@@ -291,6 +322,12 @@ pub fn main(init: std.process.Init) !void {
 
     while (true) {
         const stream = server.accept(init.io) catch continue;
-        handleConnection(init.io, stream) catch |err| std.log.err("conformance connection failed: {t}", .{err});
+        const thread = std.Thread.spawn(.{}, connectionWorker, .{ init.io, stream }) catch |err| {
+            var owned_stream = stream;
+            owned_stream.close(init.io);
+            std.log.err("conformance worker spawn failed: {t}", .{err});
+            continue;
+        };
+        thread.detach();
     }
 }

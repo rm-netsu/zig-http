@@ -114,6 +114,14 @@ def next_ping_ack(sock: socket.socket, payload: bytes) -> None:
     raise AssertionError("expected PING acknowledgement was not received")
 
 
+def next_settings_ack(sock: socket.socket) -> None:
+    for _ in range(64):
+        current = recv_frame(sock)
+        if current.type == SETTINGS and current.flags & ACK:
+            return
+    raise AssertionError("expected SETTINGS acknowledgement was not received")
+
+
 def request_block(encoder: Encoder, path: str = "/") -> bytes:
     return encoder.encode([
         (b":method", b"GET"),
@@ -288,13 +296,17 @@ def probe_stream_state_errors(host: str, port: int) -> None:
         finally:
             sock.close()
 
-    # Once the remote side ended the stream, DATA and a second HEADERS section
-    # must report STREAM_CLOSED. The second HEADERS block intentionally contains
-    # request pseudo-fields so trailer validation cannot mask the state error.
+    # Keep the local response side open by reducing the peer-advertised send
+    # window to zero. Once the remote side ended the stream, DATA and a second
+    # HEADERS section must report a stream-scoped STREAM_CLOSED. The second
+    # HEADERS block intentionally contains request pseudo-fields so trailer
+    # validation cannot mask the state error.
     for second_frame in (DATA, HEADERS):
         sock = connect(host, port)
         try:
             encoder = Encoder()
+            sock.sendall(frame(SETTINGS, 0, 0, struct.pack("!HI", 4, 0)))
+            next_settings_ack(sock)
             sock.sendall(frame(HEADERS, END_HEADERS | END_STREAM, 1, request_block(encoder)))
             if second_frame == DATA:
                 sock.sendall(frame(DATA, END_STREAM, 1, b"x"))
@@ -303,6 +315,22 @@ def probe_stream_state_errors(host: str, port: int) -> None:
             next_error(sock, RST_STREAM, 1, STREAM_CLOSED)
         finally:
             sock.close()
+
+    # Once both sides have ended the stream, RFC 7540 requires a connection
+    # STREAM_CLOSED error for a subsequent HEADERS frame. RFC 9113 permits this
+    # stricter connection-level handling as well.
+    sock = connect(host, port)
+    try:
+        encoder = Encoder()
+        sock.sendall(frame(HEADERS, END_HEADERS | END_STREAM, 1, request_block(encoder)))
+        while True:
+            current = recv_frame(sock)
+            if current.type == DATA and current.stream_id == 1 and current.flags & END_STREAM:
+                break
+        sock.sendall(frame(HEADERS, END_HEADERS | END_STREAM, 1, request_block(encoder, "/closed")))
+        next_error(sock, GOAWAY, 0, STREAM_CLOSED)
+    finally:
+        sock.close()
 
 
 def probe_frame_contracts(host: str, port: int) -> None:

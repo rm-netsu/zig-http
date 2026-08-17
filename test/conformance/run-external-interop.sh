@@ -18,7 +18,7 @@ curl --version | grep -q 'HTTP2' || {
 start_fixture
 "$PYTHON" "$CONFORMANCE_DIR/external_interop.py" --host 127.0.0.1 --port "$PORT"
 body=$(curl --http2-prior-knowledge --silent --show-error --fail --max-time 5 "http://127.0.0.1:$PORT/")
-[ "$body" = "ok" ] || {
+[ "$body" = "zig-http" ] || {
     echo "curl interoperability returned unexpected body: $body" >&2
     exit 1
 }

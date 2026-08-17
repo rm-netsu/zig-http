@@ -92,9 +92,9 @@ def run(host: str, port: int) -> None:
                 send_fragmented(sock, pending)
 
         for stream_id, result in results.items():
-            if result.status != "200" or bytes(result.body) != b"ok":
+            if result.status != "200" or bytes(result.body) != b"zig-http":
                 raise AssertionError(
-                    f"stream {stream_id}: expected status=200 body=b'ok', "
+                    f"stream {stream_id}: expected status=200 body=b'zig-http', "
                     f"got status={result.status!r} body={bytes(result.body)!r}"
                 )
         if not ping_acked:

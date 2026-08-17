@@ -26,10 +26,17 @@ application responses remain outside the library's core API.
 
 The fixture advertises `SETTINGS_MAX_CONCURRENT_STREAMS=32` so h2spec exercises
 its concurrency-limit case instead of skipping it. It always responds to valid
-GET/POST requests with status 200 and a non-empty `ok` body, as required by
-h2spec's server contract. Request body accounting uses the caller-owned
-`http2.fields.BodyLength` helper rather than adding application/message length
-state to every core Session stream.
+GET/POST requests with status 200 and an 8-byte `zig-http` body. Keeping the
+body above four bytes makes h2spec exercise its negative and dynamically
+adjusted flow-control window cases instead of skipping them. Request body
+accounting uses the caller-owned `http2.fields.BodyLength` helper rather than
+adding application/message length state to every core Session stream.
+
+The fixture accepts each connection on a detached worker thread. This is not a
+requirement imposed on the protocol core; it prevents h2spec's helper
+connections (for example `ServerDataLength`) from blocking acceptance of the
+actual testcase connection and also exercises independent Session instances in
+parallel.
 
 ## Commands
 
