@@ -26,9 +26,10 @@ The package does not require one architecture. Pick the highest level that owns
 only state you actually want the HTTP engine to manage:
 
 - HTTP/1 messages on an existing byte stream: `http1.ConnectionDecoder` is the
-  recommended coordinator. Use `http1.head.parseRequest` / `parseResponse`,
-  `http1.head.FramedHeadParser`, `http1.body.ChunkDecoder`, and the writers directly when an existing
-  runtime already owns more of the message state machine.
+  recommended receive coordinator and `http1.MessageWriter` is the recommended
+  send coordinator. Use `http1.head.parseRequest` / `parseResponse`,
+  `http1.head.FramedHeadParser`, `http1.body.ChunkDecoder`, and `http1.write`
+  directly when an existing runtime already owns more of the message state machine.
 - HTTP/2 connection engine: `http2.Session` is the recommended composed path
   over caller-owned HPACK objects and stream storage.
   `Session.init(.{ ... })` uses named configuration and caller-owned state.
@@ -40,7 +41,7 @@ None of these levels opens sockets, performs TLS/DNS, registers timers, or owns
 an event loop.
 
 Public names intentionally follow one path per abstraction level. Composed entry
-points are `http1.ConnectionDecoder` and `http2.Session`; lower-level types live
+points are `http1.ConnectionDecoder`, `http1.MessageWriter`, and `http2.Session`; lower-level types live
 under their owning namespaces (`http1.head`, `http1.body`, `http2.frame`,
 `http2.connection`, `http2.streams`, and so on). Pre-1.0 flat aliases and
 positional compatibility initializers are not retained, so API discovery mirrors
@@ -82,6 +83,40 @@ responses retain that context, HEAD and successful CONNECT use the correct body
 semantics, `101`/successful CONNECT expose the protocol-switch boundary without
 consuming tunnel bytes, and close-delimited completion is reported by
 `finish()` when the caller observes transport EOF.
+
+### HTTP/1 send-side message coordination
+
+`MessageWriter` provides the symmetric send-side state machine without owning a
+transport. It validates the complete head, request semantics, framing, and
+persistence before emitting the first byte; fixed-length overruns are rejected
+before body output, chunk termination/trailers are serialized consistently, and
+partial writer failures poison only this protocol coordinator. Close-delimited
+messages and `Connection: close` transition to `mustClose()` so the same HTTP
+connection cannot be reused accidentally.
+
+```zig
+var message = http.http1.MessageWriter.init();
+const started = try message.beginResponse(
+    out,
+    .http_1_1,
+    200,
+    "OK",
+    "GET", // request method supplies HEAD/CONNECT response context
+    &.{.{ .name = "content-length", .value = "5" }},
+);
+
+if (!started.message_done) {
+    const sent = try message.writeData(out, "hello");
+    _ = sent.message_done; // true after exactly five bytes
+}
+```
+
+For streaming output use `Transfer-Encoding: chunked`; each `writeData` call is
+serialized as one chunk and `finish(out, trailers)` emits the terminal chunk.
+Framing fields are rejected in trailers. Responses whose framing is close-delimited
+require `finish(out, &.{})`, after which the caller must close the transport.
+Successful CONNECT and `101` responses transition to `protocolSwitched()`; tunnel
+bytes intentionally remain outside the HTTP writer.
 
 ## HTTP/1 fast paths
 
@@ -714,7 +749,7 @@ advanced.
 - `http1/semantics.zig` — opt-out request-target/Host and persistence semantics.
 - `http1/connection.zig` — allocation-free receive-side message/connection coordinator over caller-owned buffers and request context.
 - `http1/body.zig` — fixed-length and streaming chunked-body decoding with strict chunk-extension grammar.
-- `http1/write.zig` — HTTP/1.0/1.1 request/response and chunk serialization.
+- `http1/write.zig` — HTTP/1.0/1.1 raw serialization plus allocation-free `MessageWriter` send-side framing/state coordination.
 - `http2/frame.zig` — contiguous, batched, and incremental zero-copy frame parsing plus frame serialization.
 - `http2/connection.zig` — allocation-free connection receive state and complete/fragmented frame integration.
 - `http2/peer.zig` — peer SETTINGS, send-window, outbound constraints, and GOAWAY state.

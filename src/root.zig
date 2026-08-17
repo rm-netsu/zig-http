@@ -16,6 +16,7 @@ test {
     _ = http1.semantics.validateRequest;
     _ = http1.connection.Decoder;
     _ = http1.write.requestHead;
+    _ = http1.MessageWriter;
 
     _ = http2.frame.FrameDecoder;
     _ = http2.settings.Settings;

@@ -56,6 +56,25 @@ pub fn validateRequest(h: head.Head) (head.Error || RequestError)!RequestInfo {
     return .{ .target_form = form, .host = host };
 }
 
+/// Validate request-target and Host semantics directly from caller-owned
+/// fields before serializing a request. Header syntax is validated by the
+/// writer/framing layer; this helper focuses on HTTP request semantics.
+pub fn validateRequestFields(version: head.Version, method: []const u8, target: []const u8, headers: []const common.Header) RequestError!RequestInfo {
+    const form = try classifyRequestTarget(method, target);
+    var host: ?[]const u8 = null;
+    var host_count: u8 = 0;
+    for (headers) |field| {
+        if (!common.eqlHeaderName(field.name, "host")) continue;
+        if (host_count == std.math.maxInt(u8)) return error.MultipleHost;
+        host_count += 1;
+        if (host_count != 1) return error.MultipleHost;
+        if (!validHost(field.value)) return error.InvalidHost;
+        host = field.value;
+    }
+    if (version == .http_1_1 and host_count == 0) return error.MissingHost;
+    return .{ .target_form = form, .host = host };
+}
+
 pub fn classifyRequestTarget(method: []const u8, target: []const u8) RequestError!RequestTargetForm {
     if (target.len == 0) return error.InvalidRequestTarget;
 
@@ -104,6 +123,28 @@ pub fn persistence(h: head.Head) (head.Error || ConnectionError)!Persistence {
     }
 
     return switch (h.version) {
+        .http_1_1 => if (close) .close else .persistent,
+        .http_1_0 => if (keep_alive and !close) .persistent else .close,
+    };
+}
+
+/// Determine persistence directly from caller-owned fields.
+pub fn persistenceFields(version: head.Version, headers: []const common.Header) ConnectionError!Persistence {
+    var close = false;
+    var keep_alive = false;
+    for (headers) |field| {
+        if (!common.eqlHeaderName(field.name, "connection")) continue;
+        var rest = field.value;
+        while (true) {
+            const comma = std.mem.indexOfScalar(u8, rest, ',');
+            const option = common.trimOws(if (comma) |index| rest[0..index] else rest);
+            if (!common.isToken(option)) return error.InvalidConnectionHeader;
+            if (std.ascii.eqlIgnoreCase(option, "close")) close = true;
+            if (std.ascii.eqlIgnoreCase(option, "keep-alive")) keep_alive = true;
+            if (comma) |index| rest = rest[index + 1 ..] else break;
+        }
+    }
+    return switch (version) {
         .http_1_1 => if (close) .close else .persistent,
         .http_1_0 => if (keep_alive and !close) .persistent else .close,
     };

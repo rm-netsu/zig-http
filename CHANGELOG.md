@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add allocation-free HTTP/1 `MessageWriter` send-side composition with preflight request/response semantics, exact Content-Length accounting, chunked/trailer completion, close-delimited reuse prevention, HEAD/CONNECT protocol-switch boundaries, and writer-failure poisoning; raw head writers now validate all fields before emitting any bytes.
+
 ## 0.16.0
 
 - Remove the accumulated pre-1.0 compatibility surface: HTTP/2 low-level types now live only under their owning namespaces, HTTP/1 raw parsers/body primitives likewise use `head`/`body`/`semantics`, `Session.init` accepts only named `Options`, HTTP/1 head writers take an explicit version, and the client preface lives at `http2.preface.bytes`. The composed shortcuts remain `http1.ConnectionDecoder` and `http2.Session`/`Event`/`Role`.

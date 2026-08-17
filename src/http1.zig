@@ -7,4 +7,6 @@ pub const connection = @import("http1/connection.zig");
 /// Recommended composed receive-side HTTP/1 engine. Syntax, framing and body
 /// primitives remain available independently through the namespaces above.
 pub const ConnectionDecoder = connection.Decoder;
+/// Recommended composed send-side HTTP/1 message coordinator.
+pub const MessageWriter = write.MessageWriter;
 pub const Event = connection.Event;

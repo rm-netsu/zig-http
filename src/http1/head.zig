@@ -540,6 +540,62 @@ pub fn requestBodyFraming(head: Head) Error!BodyFraming {
     return .none;
 }
 
+/// Determine request body framing directly from caller-owned header fields.
+/// This is the send-side counterpart to `requestBodyFraming` and performs the
+/// same RFC 9112 validation before any bytes need to be serialized.
+pub fn requestBodyFramingFields(version: Version, headers: []const common.Header) Error!BodyFraming {
+    var content_length: ?u64 = null;
+    var has_te = false;
+    var te: TransferEncodingState = .{};
+    for (headers) |field| {
+        if (!common.isToken(field.name) or !common.isFieldValue(field.value)) return error.InvalidHeader;
+        if (common.eqlHeaderName(field.name, "content-length")) {
+            try mergeContentLength(&content_length, field.value);
+        } else if (common.eqlHeaderName(field.name, "transfer-encoding")) {
+            has_te = true;
+            try te.add(field.value);
+        }
+    }
+    if (has_te and version == .http_1_0) return error.InvalidTransferEncoding;
+    if (has_te and content_length != null) return error.AmbiguousFraming;
+    if (has_te) {
+        if (!te.final_chunked) return error.InvalidTransferEncoding;
+        return .chunked;
+    }
+    if (content_length) |n| return .{ .content_length = n };
+    return .none;
+}
+
+/// Determine response body framing directly from caller-owned header fields.
+/// HEAD, informational, 204, 304, and successful CONNECT responses remain
+/// bodyless regardless of framing fields, matching `responseBodyFraming`.
+pub fn responseBodyFramingFields(version: Version, status: u16, request_method: []const u8, headers: []const common.Header) Error!BodyFraming {
+    if (status < 100 or status > 999) return error.InvalidStatus;
+    if (responseHasNoBody(status, request_method)) {
+        for (headers) |field|
+            if (!common.isToken(field.name) or !common.isFieldValue(field.value)) return error.InvalidHeader;
+        return .none;
+    }
+
+    var content_length: ?u64 = null;
+    var has_te = false;
+    var te: TransferEncodingState = .{};
+    for (headers) |field| {
+        if (!common.isToken(field.name) or !common.isFieldValue(field.value)) return error.InvalidHeader;
+        if (common.eqlHeaderName(field.name, "content-length")) {
+            try mergeContentLength(&content_length, field.value);
+        } else if (common.eqlHeaderName(field.name, "transfer-encoding")) {
+            has_te = true;
+            try te.add(field.value);
+        }
+    }
+    if (has_te and version == .http_1_0) return error.InvalidTransferEncoding;
+    if (has_te and content_length != null) return error.AmbiguousFraming;
+    if (has_te) return if (te.final_chunked) .chunked else .close;
+    if (content_length) |n| return .{ .content_length = n };
+    return .close;
+}
+
 /// Response framing requires request context for HEAD and CONNECT semantics.
 pub fn responseBodyFraming(head: Head, request_method: []const u8) Error!BodyFraming {
     const status = switch (head.start) {

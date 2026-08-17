@@ -775,3 +775,51 @@ test "fuzz HTTP/2 Session is transport-fragmentation invariant" {
         },
     });
 }
+
+fn fuzzHttp1MessageWriterRoundTrip(_: void, smith: *std.testing.Smith) !void {
+    var body_bytes: [64]u8 = undefined;
+    const body_len: usize = smith.valueRangeAtMost(u8, 0, body_bytes.len);
+    smith.bytes(body_bytes[0..body_len]);
+    const chunked = smith.value(bool);
+
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    var message = http1.MessageWriter.init();
+
+    var length_storage: [32]u8 = undefined;
+    const length = try std.fmt.bufPrint(&length_storage, "{d}", .{body_len});
+    const fixed_headers = [_]http.common.Header{.{ .name = "content-length", .value = length }};
+    const chunked_headers = [_]http.common.Header{.{ .name = "transfer-encoding", .value = "chunked" }};
+    const headers: []const http.common.Header = if (chunked) &chunked_headers else &fixed_headers;
+
+    const begin = try message.beginResponse(&wire, .http_1_1, 200, "OK", "GET", headers);
+    if (!begin.message_done) {
+        var pos: usize = 0;
+        while (pos < body_len) {
+            const remaining = body_len - pos;
+            const take: usize = smith.valueRangeAtMost(u8, 1, @intCast(remaining));
+            _ = try message.writeData(&wire, body_bytes[pos .. pos + take]);
+            pos += take;
+        }
+        if (chunked) try message.finish(&wire, &.{});
+    }
+    try std.testing.expect(message.ready());
+
+    const encoded = wire.buffered();
+    const parsed = (try http1.head.parseResponse(encoded, "GET")).?;
+    if (chunked) {
+        try std.testing.expectEqual(http1.head.BodyFraming.chunked, parsed.framing);
+        const decoded = try decodeChunkedForFuzz(encoded[parsed.consumed..], false);
+        try std.testing.expect(decoded.done);
+        try std.testing.expectEqualStrings(body_bytes[0..body_len], decoded.body[0..decoded.body_len]);
+    } else {
+        try std.testing.expectEqual(@as(u64, @intCast(body_len)), parsed.framing.content_length);
+        try std.testing.expectEqualStrings(body_bytes[0..body_len], encoded[parsed.consumed..]);
+    }
+}
+
+test "fuzz HTTP/1 composed message writer round-trips framing" {
+    try std.testing.fuzz({}, fuzzHttp1MessageWriterRoundTrip, .{
+        .corpus = &.{ "", "fixed", "chunked", "\x00\xffbody" },
+    });
+}
