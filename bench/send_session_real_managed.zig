@@ -15,7 +15,7 @@ const Context = struct {
         self.encoder = http.http2.hpack.Encoder.init(allocator, 4096);
         self.store = .{};
         self.next_stream_id = 1;
-        self.session = http.http2.Session.init(.server, .{}, &self.decoder, &self.encoder, &self.header_storage);
+        self.session = http.http2.Session.init(.{ .role = .server, .decoder = &self.decoder, .encoder = &self.encoder, .header_storage = &self.header_storage });
     }
     fn deinit(self: *Context) void {
         self.decoder.deinit();

@@ -1,7 +1,7 @@
 const std = @import("std");
 const http = @import("http");
 
-const FlowWindow = http.http2.FlowWindow;
+const FlowWindow = http.http2.flow.FlowWindow;
 
 const Model = struct {
     value: i64 = 65_535,
@@ -88,20 +88,20 @@ test "fuzz flow window against signed reference model" {
 }
 
 const http1 = http.http1;
-const FrameHeader = http.http2.FrameHeader;
-const FrameDecoder = http.http2.FrameDecoder;
+const FrameHeader = http.http2.frame.FrameHeader;
+const FrameDecoder = http.http2.frame.FrameDecoder;
 
 fn fuzzHttp1RequestFragmentation(_: void, smith: *std.testing.Smith) !void {
     var input_buf: [512]u8 = undefined;
     const len: usize = smith.slice(&input_buf);
     const input = input_buf[0..len];
 
-    const complete = http1.parseRequest(input) catch return;
+    const complete = http1.head.parseRequest(input) catch return;
     const expected = complete orelse return;
     if (expected.consumed > 512) return;
 
     var scratch: [512]u8 = undefined;
-    var parser = http1.FramedHeadParser.init(.request, &scratch);
+    var parser = http1.head.FramedHeadParser.init(.request, &scratch);
     var pos: usize = 0;
     var actual: ?http1.head.FramedHead = null;
     while (pos < expected.consumed) {
@@ -137,11 +137,11 @@ fn fuzzHttp1ResponseFragmentation(_: void, smith: *std.testing.Smith) !void {
     const methods = [_][]const u8{ "GET", "HEAD", "CONNECT" };
     const method = methods[smith.valueRangeAtMost(u2, 0, methods.len - 1)];
 
-    const complete = http1.parseResponse(input, method) catch return;
+    const complete = http1.head.parseResponse(input, method) catch return;
     const expected = complete orelse return;
 
     var scratch: [512]u8 = undefined;
-    var parser = http1.FramedHeadParser.init(.response, &scratch);
+    var parser = http1.head.FramedHeadParser.init(.response, &scratch);
     var pos: usize = 0;
     var actual: ?http1.head.FramedHead = null;
     while (pos < expected.consumed) {
@@ -192,7 +192,7 @@ fn fuzzHttp2FrameFragmentation(_: void, smith: *std.testing.Smith) !void {
     @memcpy(wire[9 .. 9 + actual_payload_len], payload[0..actual_payload_len]);
     const input = wire[0 .. 9 + actual_payload_len];
 
-    const complete = (try http.http2.parseCompleteFrame(input, http.http2.frame.default_max_frame_size)).?;
+    const complete = (try http.http2.frame.parseComplete(input, http.http2.frame.default_max_frame_size)).?;
     try std.testing.expectEqual(header, complete.frame.header);
 
     var decoder = FrameDecoder.init(http.http2.frame.default_max_frame_size);
@@ -241,7 +241,7 @@ const ChunkOutcome = struct {
 
 fn decodeChunkedForFuzz(input: []const u8, one_byte: bool) !ChunkOutcome {
     var line_storage: [256]u8 = undefined;
-    var decoder = http1.ChunkDecoder.init(&line_storage);
+    var decoder = http1.body.ChunkDecoder.init(&line_storage);
     var outcome: ChunkOutcome = .{};
     var pos: usize = 0;
     var spins: usize = 0;
@@ -324,6 +324,15 @@ const SequenceStore = struct {
             }
         }
         return null;
+    }
+
+    pub fn maxActiveSendAdjustment(self: *SequenceStore) i32 {
+        var result: i32 = 0;
+        for (&self.entries) |*entry| {
+            if (!entry.used or !activeState(entry.tracked.stream.state)) continue;
+            result = @max(result, entry.tracked.windows.send.adjustment);
+        }
+        return result;
     }
 };
 
@@ -408,6 +417,361 @@ test "fuzz HTTP/2 stream-manager state sequences preserve aggregate invariants" 
             "\x00\x01\x02\x03\x04\x05\x06\x07",
             "\xff\xff\xff\xff\xff\xff\xff\xff",
             "stream-state-sequence",
+        },
+    });
+}
+
+const SessionSink = struct {
+    fields: u32 = 0,
+
+    pub fn field(self: *SessionSink, _: u31, _: http.http2.fields.Kind, _: http.common.Header) void {
+        self.fields += 1;
+    }
+};
+
+fn expectStoresEqual(a: *const SequenceStore, b: *const SequenceStore) !void {
+    for (a.entries, b.entries) |left, right| {
+        try std.testing.expectEqual(left.used, right.used);
+        if (!left.used) continue;
+        try std.testing.expectEqual(left.id, right.id);
+        try std.testing.expectEqualDeep(left.tracked, right.tracked);
+    }
+}
+
+fn expectSessionsEquivalent(
+    a: *const http.http2.Session,
+    a_store: *const SequenceStore,
+    a_sink: *const SessionSink,
+    b: *const http.http2.Session,
+    b_store: *const SequenceStore,
+    b_sink: *const SessionSink,
+) !void {
+    try std.testing.expectEqual(a.connection.receive_window.value, b.connection.receive_window.value);
+    try std.testing.expectEqual(a.connection.continuation_guard.stream_id, b.connection.continuation_guard.stream_id);
+    try std.testing.expectEqual(a.streams.activeLocal(), b.streams.activeLocal());
+    try std.testing.expectEqual(a.streams.activeRemote(), b.streams.activeRemote());
+    try std.testing.expectEqualDeep(a.peer.settings, b.peer.settings);
+    try std.testing.expectEqual(a.peer.send_window.value, b.peer.send_window.value);
+    try std.testing.expectEqual(a_sink.fields, b_sink.fields);
+    try expectStoresEqual(a_store, b_store);
+}
+
+const FragmentedSession = struct {
+    decoder: http.http2.frame.FrameDecoder = http.http2.frame.FrameDecoder.init(http.http2.frame.default_max_frame_size),
+    header: ?http.http2.frame.FrameHeader = null,
+    payload: [64]u8 = undefined,
+    payload_len: usize = 0,
+
+    fn receive(
+        self: *FragmentedSession,
+        smith: *std.testing.Smith,
+        session: *http.http2.Session,
+        store: *SequenceStore,
+        wire: []const u8,
+        scratch: []u8,
+        sink: *SessionSink,
+    ) !http.http2.Event {
+        var pos: usize = 0;
+        while (pos < wire.len) {
+            const remaining = wire.len - pos;
+            const max_piece = @min(remaining, @as(usize, 7));
+            const piece_len: usize = @max(@as(usize, 1), @as(usize, smith.valueRangeAtMost(u8, 1, @intCast(max_piece))));
+            const result = try self.decoder.next(wire[pos .. pos + piece_len]);
+            if (result.consumed == 0) return error.FragmentationDidNotAdvance;
+            pos += result.consumed;
+            if (result.event) |decoder_event| switch (decoder_event) {
+                .header => |header| {
+                    if (self.header != null) return error.OverlappingFrames;
+                    if (session.connection.check(header) != .none) return error.UnexpectedConnectionViolation;
+                    self.header = header;
+                    self.payload_len = 0;
+                    if (header.length == 0) {
+                        const complete: http.http2.frame.CompleteFrame = .{ .header = header, .payload = &.{} };
+                        self.header = null;
+                        return session.receiveCompleteAssumeConnectionChecked(store, complete, scratch, sink);
+                    }
+                },
+                .payload => |part| {
+                    if (part.bytes.len > self.payload.len - self.payload_len) return error.PayloadTooLarge;
+                    @memcpy(self.payload[self.payload_len .. self.payload_len + part.bytes.len], part.bytes);
+                    self.payload_len += part.bytes.len;
+                    if (part.end_frame) {
+                        const header = self.header orelse return error.PayloadWithoutHeader;
+                        const complete: http.http2.frame.CompleteFrame = .{
+                            .header = header,
+                            .payload = self.payload[0..self.payload_len],
+                        };
+                        self.header = null;
+                        return session.receiveCompleteAssumeConnectionChecked(store, complete, scratch, sink);
+                    }
+                },
+            };
+        }
+        return error.IncompleteGeneratedFrame;
+    }
+};
+
+fn encodeFuzzFrame(out: []u8, header: http.http2.frame.FrameHeader, payload: []const u8) ![]const u8 {
+    if (payload.len != header.length or out.len < 9 + payload.len) return error.InvalidGeneratedFrame;
+    var encoded: [9]u8 = undefined;
+    try header.encode(&encoded);
+    @memcpy(out[0..9], &encoded);
+    @memcpy(out[9 .. 9 + payload.len], payload);
+    return out[0 .. 9 + payload.len];
+}
+
+fn compareSessionFrame(
+    smith: *std.testing.Smith,
+    direct: *http.http2.Session,
+    direct_store: *SequenceStore,
+    direct_sink: *SessionSink,
+    direct_scratch: []u8,
+    fragmented: *http.http2.Session,
+    fragmented_store: *SequenceStore,
+    fragmented_sink: *SessionSink,
+    fragmented_scratch: []u8,
+    fragmented_transport: *FragmentedSession,
+    wire_storage: []u8,
+    header: http.http2.frame.FrameHeader,
+    payload_bytes: []const u8,
+) !void {
+    try header.validate(http.http2.frame.default_max_frame_size);
+    const wire = try encodeFuzzFrame(wire_storage, header, payload_bytes);
+    const direct_event = try direct.receiveComplete(
+        direct_store,
+        .{ .header = header, .payload = payload_bytes },
+        direct_scratch,
+        direct_sink,
+    );
+    const fragmented_event = try fragmented_transport.receive(
+        smith,
+        fragmented,
+        fragmented_store,
+        wire,
+        fragmented_scratch,
+        fragmented_sink,
+    );
+    try std.testing.expectEqualDeep(direct_event, fragmented_event);
+    try expectSessionsEquivalent(
+        direct,
+        direct_store,
+        direct_sink,
+        fragmented,
+        fragmented_store,
+        fragmented_sink,
+    );
+}
+
+fn fuzzSessionFragmentation(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var direct_decoder = http.http2.hpack.Decoder.init(allocator, 4096);
+    defer direct_decoder.deinit();
+    var direct_encoder = http.http2.hpack.Encoder.init(allocator, 4096);
+    defer direct_encoder.deinit();
+    var fragmented_decoder = http.http2.hpack.Decoder.init(allocator, 4096);
+    defer fragmented_decoder.deinit();
+    var fragmented_encoder = http.http2.hpack.Encoder.init(allocator, 4096);
+    defer fragmented_encoder.deinit();
+
+    var direct_headers: [256]u8 = undefined;
+    var fragmented_headers: [256]u8 = undefined;
+    var direct = http.http2.Session.init(.{
+        .role = .server,
+        .decoder = &direct_decoder,
+        .encoder = &direct_encoder,
+        .header_storage = &direct_headers,
+    });
+    var fragmented = http.http2.Session.init(.{
+        .role = .server,
+        .decoder = &fragmented_decoder,
+        .encoder = &fragmented_encoder,
+        .header_storage = &fragmented_headers,
+    });
+    var direct_store: SequenceStore = .{};
+    var fragmented_store: SequenceStore = .{};
+    var direct_sink: SessionSink = .{};
+    var fragmented_sink: SessionSink = .{};
+    var fragmented_transport: FragmentedSession = .{};
+    var direct_scratch: [256]u8 = undefined;
+    var fragmented_scratch: [256]u8 = undefined;
+    var wire_storage: [96]u8 = undefined;
+    var payload_storage: [64]u8 = undefined;
+    var next_stream_id: u31 = 1;
+    var current_stream_id: u31 = 0;
+
+    // Static-table-only HPACK request: :method GET, :scheme https, :path /.
+    const request_block = [_]u8{ 0x82, 0x87, 0x84 };
+
+    var step: u8 = 0;
+    while (step < 64 and !smith.eosWeightedSimple(18, 1)) : (step += 1) {
+        var header: http.http2.frame.FrameHeader = undefined;
+        var payload_bytes: []const u8 = &.{};
+        const operation = smith.valueRangeAtMost(u4, 0, 10);
+
+        if (operation == 9) {
+            if (next_stream_id > 63) continue;
+            current_stream_id = next_stream_id;
+            next_stream_id += 2;
+            const first: http.http2.frame.FrameHeader = .{
+                .length = 1,
+                .type = .headers,
+                .flags = @intFromBool(smith.value(bool)),
+                .stream_id = current_stream_id,
+            };
+            try compareSessionFrame(
+                smith,
+                &direct,
+                &direct_store,
+                &direct_sink,
+                &direct_scratch,
+                &fragmented,
+                &fragmented_store,
+                &fragmented_sink,
+                &fragmented_scratch,
+                &fragmented_transport,
+                &wire_storage,
+                first,
+                request_block[0..1],
+            );
+            const continuation_header: http.http2.frame.FrameHeader = .{
+                .length = request_block.len - 1,
+                .type = .continuation,
+                .flags = 0x04,
+                .stream_id = current_stream_id,
+            };
+            try compareSessionFrame(
+                smith,
+                &direct,
+                &direct_store,
+                &direct_sink,
+                &direct_scratch,
+                &fragmented,
+                &fragmented_store,
+                &fragmented_sink,
+                &fragmented_scratch,
+                &fragmented_transport,
+                &wire_storage,
+                continuation_header,
+                request_block[1..],
+            );
+            continue;
+        }
+
+        if (operation == 10) {
+            std.mem.writeInt(u32, payload_storage[0..4], 0, .big);
+            std.mem.writeInt(u32, payload_storage[4..8], @intFromEnum(http.http2.protocol.ErrorCode.no_error), .big);
+            header = .{ .length = 8, .type = .goaway, .flags = 0, .stream_id = 0 };
+            payload_bytes = payload_storage[0..8];
+        } else {
+            switch (operation) {
+                0, 1 => {
+                    if (next_stream_id > 63) continue;
+                    current_stream_id = next_stream_id;
+                    next_stream_id += 2;
+                    header = .{
+                        .length = request_block.len,
+                        .type = .headers,
+                        .flags = 0x04 | @as(u8, @intFromBool(smith.value(bool))),
+                        .stream_id = current_stream_id,
+                    };
+                    payload_bytes = &request_block;
+                },
+                2 => {
+                    if (current_stream_id == 0) continue;
+                    const len: usize = smith.valueRangeAtMost(u8, 0, 16);
+                    smith.bytes(payload_storage[0..len]);
+                    header = .{
+                        .length = @intCast(len),
+                        .type = .data,
+                        .flags = @intFromBool(smith.value(bool)),
+                        .stream_id = current_stream_id,
+                    };
+                    payload_bytes = payload_storage[0..len];
+                },
+                3 => {
+                    const setting_choice = smith.valueRangeAtMost(u3, 0, 4);
+                    const setting_id: u16 = switch (setting_choice) {
+                        0 => 0x3, // MAX_CONCURRENT_STREAMS
+                        1 => 0x4, // INITIAL_WINDOW_SIZE
+                        2 => 0x5, // MAX_FRAME_SIZE
+                        3 => 0x8, // ENABLE_CONNECT_PROTOCOL
+                        else => 0xf0, // unknown extension setting
+                    };
+                    const setting_value: u32 = switch (setting_choice) {
+                        0 => smith.valueRangeAtMost(u16, 0, 64),
+                        1 => smith.valueRangeAtMost(u16, 0, 65_535),
+                        2 => http.http2.frame.default_max_frame_size + smith.valueRangeAtMost(u16, 0, 4096),
+                        3 => @intFromBool(smith.value(bool)),
+                        else => smith.value(u32),
+                    };
+                    std.mem.writeInt(u16, payload_storage[0..2], setting_id, .big);
+                    std.mem.writeInt(u32, payload_storage[2..6], setting_value, .big);
+                    header = .{ .length = 6, .type = .settings, .flags = 0, .stream_id = 0 };
+                    payload_bytes = payload_storage[0..6];
+                },
+                4 => {
+                    smith.bytes(payload_storage[0..8]);
+                    header = .{ .length = 8, .type = .ping, .flags = smith.value(u8) & 0x01, .stream_id = 0 };
+                    payload_bytes = payload_storage[0..8];
+                },
+                5 => {
+                    const stream_id: u31 = if (smith.value(bool) and current_stream_id != 0) current_stream_id else 0;
+                    const increment: u31 = @intCast(smith.valueRangeAtMost(u16, 1, 4096));
+                    std.mem.writeInt(u32, payload_storage[0..4], increment, .big);
+                    header = .{ .length = 4, .type = .window_update, .flags = 0, .stream_id = stream_id };
+                    payload_bytes = payload_storage[0..4];
+                },
+                6 => {
+                    if (current_stream_id == 0) continue;
+                    @memset(payload_storage[0..5], 0);
+                    header = .{ .length = 5, .type = .priority, .flags = 0, .stream_id = current_stream_id };
+                    payload_bytes = payload_storage[0..5];
+                },
+                7 => {
+                    if (current_stream_id == 0) continue;
+                    std.mem.writeInt(u32, payload_storage[0..4], @intFromEnum(http.http2.protocol.ErrorCode.cancel), .big);
+                    header = .{ .length = 4, .type = .rst_stream, .flags = 0, .stream_id = current_stream_id };
+                    payload_bytes = payload_storage[0..4];
+                },
+                else => {
+                    const len: usize = smith.valueRangeAtMost(u8, 0, 16);
+                    smith.bytes(payload_storage[0..len]);
+                    header = .{
+                        .length = @intCast(len),
+                        .type = @enumFromInt(@as(u8, 0xf0)),
+                        .flags = smith.value(u8),
+                        .stream_id = if (smith.value(bool)) current_stream_id else 0,
+                    };
+                    payload_bytes = payload_storage[0..len];
+                },
+            }
+        }
+
+        try compareSessionFrame(
+            smith,
+            &direct,
+            &direct_store,
+            &direct_sink,
+            &direct_scratch,
+            &fragmented,
+            &fragmented_store,
+            &fragmented_sink,
+            &fragmented_scratch,
+            &fragmented_transport,
+            &wire_storage,
+            header,
+            payload_bytes,
+        );
+    }
+}
+
+test "fuzz HTTP/2 Session is transport-fragmentation invariant" {
+    try std.testing.fuzz({}, fuzzSessionFragmentation, .{
+        .corpus = &.{
+            "",
+            "session-fragmentation",
+            "\x00\x01\x02\x03\x04\x05\x06\x07",
+            "\xff\xff\xff\xff\xff\xff\xff\xff",
         },
     });
 }

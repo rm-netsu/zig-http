@@ -96,7 +96,7 @@ fn respond(session: *h2.Session, store: *Store, out: *std.Io.Writer, stream_id: 
     try out.flush();
 }
 
-fn handleEvent(session: *h2.Session, store: *Store, out: *std.Io.Writer, event: h2.SessionEvent, staging: []u8) !bool {
+fn handleEvent(session: *h2.Session, store: *Store, out: *std.Io.Writer, event: h2.Event, staging: []u8) !bool {
     switch (event) {
         .ignored, .pending, .reset, .goaway, .push_promise, .extension => {},
         .window_update => |update| {
@@ -185,9 +185,9 @@ fn handleConnection(io: std.Io, stream: net.Stream) !void {
     const in = &reader.interface;
     const out = &writer.interface;
 
-    var preface: [h2.client_preface.len]u8 = undefined;
+    var preface: [h2.preface.bytes.len]u8 = undefined;
     in.readSliceAll(&preface) catch return;
-    if (!std.mem.eql(u8, &preface, h2.client_preface)) {
+    if (!std.mem.eql(u8, &preface, h2.preface.bytes)) {
         sendConnectionError(out, .protocol_error) catch {};
         return;
     }
@@ -203,9 +203,9 @@ fn handleConnection(io: std.Io, stream: net.Stream) !void {
     const wire = try allocator.alloc(u8, wire_buffer_size);
     defer allocator.free(wire);
 
-    var session = h2.Session.init(.server, .{ .max_concurrent_streams = max_concurrent_streams }, &decoder, &encoder, header_storage);
+    var session = h2.Session.init(.{ .role = .server, .local_limits = .{ .max_concurrent_streams = max_concurrent_streams }, .decoder = &decoder, .encoder = &encoder, .header_storage = header_storage });
     var store: Store = .{};
-    var settings_sync: h2.SessionSettingsSync = .{};
+    var settings_sync: h2.session.SettingsSync = .{};
     const local_settings = [_]h2.settings.Setting{
         .{ .id = .max_concurrent_streams, .value = max_concurrent_streams },
         .{ .id = .enable_connect_protocol, .value = 1 },
@@ -227,7 +227,7 @@ fn handleConnection(io: std.Io, stream: net.Stream) !void {
         var consumed: usize = 0;
         while (used - consumed >= 9) {
             const header_ptr: *const [9]u8 = wire[consumed..][0..9];
-            const header = h2.FrameHeader.parse(header_ptr);
+            const header = h2.frame.FrameHeader.parse(header_ptr);
             header.validate(h2.frame.default_max_frame_size) catch |validation_error| {
                 const code: h2.protocol.ErrorCode = switch (validation_error) {
                     error.FrameSize => .frame_size_error,

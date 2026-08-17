@@ -28,7 +28,7 @@ fn sendRequest(out: *std.Io.Writer, method: []const u8, path: []const u8, close:
         &[_]http.common.Header{
             .{ .name = "Host", .value = "127.0.0.1" },
         };
-    try h1.write.requestHead(out, method, path, headers);
+    try h1.write.requestHead(out, .http_1_1, method, path, headers);
     try out.flush();
 }
 

@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     var scratch: [16 * 1024]u8 = undefined;
     var store: shared.Store = .{};
     var sink: shared.CountingSink = .{};
-    var session = http.http2.Session.init(.client, .{}, &decoder, &encoder, &header_storage);
+    var session = http.http2.Session.init(.{ .role = .client, .decoder = &decoder, .encoder = &encoder, .header_storage = &header_storage });
 
     var tx: u64 = 0;
     var checksum: u64 = 0;
@@ -30,14 +30,14 @@ pub fn main(init: std.process.Init) !void {
     for (0..shared.rounds) |round| {
         if (round % shared.batch_streams == 0) {
             store.reset();
-            session.streams = http.http2.StreamManager.init(.client, .{});
+            session.streams = http.http2.streams.Manager.init(.client, .{});
             session.connection = .{};
         }
         const id: u31 = @intCast((round % shared.batch_streams) * 2 + 1);
         try session.streams.openLocal(&store, &session.peer, id, true);
         const block = fixture.block(round);
         const end_on_headers = block.body == 0;
-        const header = http.http2.FrameHeader{
+        const header = http.http2.frame.FrameHeader{
             .length = @intCast(block.bytes.len),
             .type = .headers,
             .flags = 0x04 | @as(u8, @intFromBool(end_on_headers)),

@@ -156,7 +156,7 @@ fn encodeHpack(encoder: *hpack.Encoder, fields: []const corpus.Field, storage: [
     return writer.buffered();
 }
 
-fn appendFrame(fixtures: *Fixtures, header: http.http2.FrameHeader, payload: []const u8) !void {
+fn appendFrame(fixtures: *Fixtures, header: http.http2.frame.FrameHeader, payload: []const u8) !void {
     const total = 9 + payload.len;
     if (fixtures.h2_len > fixtures.h2_wire.len or total > fixtures.h2_wire.len - fixtures.h2_len)
         return error.TraceTooLarge;
@@ -244,8 +244,8 @@ fn verifyFixtures(fixtures: *const Fixtures) !void {
     for (fixtures.heads[0..fixtures.head_count]) |fixture| {
         const request_wire = fixture.request[0..fixture.request_len];
         const response_wire = fixture.response[0..fixture.response_len];
-        const request = (try http.http1.parseRequest(request_wire)) orelse return error.IncompleteRequest;
-        const response = (try http.http1.parseResponse(response_wire, fixture.request_method)) orelse return error.IncompleteResponse;
+        const request = (try http.http1.head.parseRequest(request_wire)) orelse return error.IncompleteRequest;
+        const response = (try http.http1.head.parseResponse(response_wire, fixture.request_method)) orelse return error.IncompleteResponse;
         if (request.consumed != request_wire.len or response.consumed != response_wire.len)
             return error.UnconsumedHeadBytes;
     }
@@ -259,7 +259,7 @@ fn verifyFixtures(fixtures: *const Fixtures) !void {
         try response_validator.finish();
     };
 
-    var it = http.http2.CompleteFrameIterator.init(fixtures.h2_wire[0..fixtures.h2_len], http.http2.frame.default_max_frame_size);
+    var it = http.http2.frame.CompleteIterator.init(fixtures.h2_wire[0..fixtures.h2_len], http.http2.frame.default_max_frame_size);
     var frames: u64 = 0;
     while (try it.next()) |frame| {
         frames += 1;
@@ -309,8 +309,8 @@ fn benchHttp1Contiguous(io: Io, fixtures: *const Fixtures, transactions: u64) !R
         const fixture = fixtures.heads[i % fixtures.head_count];
         const request_wire = fixture.request[0..fixture.request_len];
         const response_wire = fixture.response[0..fixture.response_len];
-        const request = (try http.http1.parseRequest(request_wire)).?;
-        const response = (try http.http1.parseResponse(response_wire, fixture.request_method)).?;
+        const request = (try http.http1.head.parseRequest(request_wire)).?;
+        const response = (try http.http1.head.parseResponse(response_wire, fixture.request_method)).?;
         checksum +%= request.head.headers.len + response.head.headers.len + @as(usize, response.head.start.response.status);
         bytes += request_wire.len + response_wire.len;
     }
@@ -321,7 +321,7 @@ fn benchHttp1Contiguous(io: Io, fixtures: *const Fixtures, transactions: u64) !R
 
 const fragment_sizes = [_]usize{ 1, 3, 7, 17, 43, 127, 509, 1536 };
 
-fn parseFragmentedHead(parser: *http.http1.HeadParser, mode: http.http1.head.Mode, wire: []const u8, method: []const u8, seed: usize) !usize {
+fn parseFragmentedHead(parser: *http.http1.head.HeadParser, mode: http.http1.head.Mode, wire: []const u8, method: []const u8, seed: usize) !usize {
     parser.reset(mode);
     var pos: usize = 0;
     var step: usize = seed;
@@ -340,7 +340,7 @@ fn parseFragmentedHead(parser: *http.http1.HeadParser, mode: http.http1.head.Mod
 
 fn benchHttp1Fragmented(io: Io, fixtures: *const Fixtures, transactions: u64) !Result {
     var scratch: [max_head_bytes]u8 = undefined;
-    var parser = http.http1.HeadParser.init(.request, &scratch);
+    var parser = http.http1.head.HeadParser.init(.request, &scratch);
     var checksum: usize = 0;
     var bytes: u64 = 0;
     const start = now(io);
@@ -357,7 +357,7 @@ fn benchHttp1Fragmented(io: Io, fixtures: *const Fixtures, transactions: u64) !R
     return .{ .elapsed = elapsed, .transactions = transactions, .operations = transactions * 2, .bytes = bytes, .checksum = checksum };
 }
 
-fn parseStreamingFramedHead(parser: *http.http1.FramedHeadParser, mode: http.http1.head.Mode, wire: []const u8, method: []const u8, seed: usize) !usize {
+fn parseStreamingFramedHead(parser: *http.http1.head.FramedHeadParser, mode: http.http1.head.Mode, wire: []const u8, method: []const u8, seed: usize) !usize {
     parser.reset(mode);
     var pos: usize = 0;
     var step: usize = seed;
@@ -376,7 +376,7 @@ fn parseStreamingFramedHead(parser: *http.http1.FramedHeadParser, mode: http.htt
 
 fn benchHttp1StreamingFramed(io: Io, fixtures: *const Fixtures, transactions: u64) !Result {
     var scratch: [max_head_bytes]u8 = undefined;
-    var parser = http.http1.FramedHeadParser.init(.request, &scratch);
+    var parser = http.http1.head.FramedHeadParser.init(.request, &scratch);
     var checksum: usize = 0;
     var bytes: u64 = 0;
     const start = now(io);
@@ -423,7 +423,7 @@ fn benchHttp1FixedBodies(io: Io, fixtures: *const Fixtures, bodies: u64) !Result
 
 fn benchHttp1Chunked(io: Io, fixtures: *const Fixtures, bodies: u64) !Result {
     var scratch: [512]u8 = undefined;
-    var decoder = http.http1.ChunkDecoder.init(&scratch);
+    var decoder = http.http1.body.ChunkDecoder.init(&scratch);
     var checksum: usize = 0;
     var bytes: u64 = 0;
     const start = now(io);
@@ -501,7 +501,7 @@ fn benchH2ParseComplete(io: Io, fixtures: *const Fixtures, target_frames: u64) !
         var guard: http.http2.continuation.Guard = .{};
         var pos: usize = 0;
         while (pos < wire.len) {
-            const parsed = (try http.http2.parseCompleteFrame(wire[pos..], http.http2.frame.default_max_frame_size)).?;
+            const parsed = (try http.http2.frame.parseComplete(wire[pos..], http.http2.frame.default_max_frame_size)).?;
             checksum +%= try dispatchFrame(parsed.frame, &guard);
             pos += parsed.consumed;
             frames += 1;
@@ -521,7 +521,7 @@ fn benchH2Complete(io: Io, fixtures: *const Fixtures, target_frames: u64) !Resul
     const start = now(io);
     for (0..loops) |_| {
         var guard: http.http2.continuation.Guard = .{};
-        var it = http.http2.CompleteFrameIterator.init(fixtures.h2_wire[0..fixtures.h2_len], http.http2.frame.default_max_frame_size);
+        var it = http.http2.frame.CompleteIterator.init(fixtures.h2_wire[0..fixtures.h2_len], http.http2.frame.default_max_frame_size);
         while (try it.next()) |frame| {
             checksum +%= try dispatchFrame(frame, &guard);
             frames += 1;
@@ -541,7 +541,7 @@ fn benchH2Fragmented(io: Io, fixtures: *const Fixtures, target_frames: u64) !Res
     var bytes: u64 = 0;
     const start = now(io);
     for (0..loops) |loop_index| {
-        var decoder = http.http2.FrameDecoder.init(http.http2.frame.default_max_frame_size);
+        var decoder = http.http2.frame.FrameDecoder.init(http.http2.frame.default_max_frame_size);
         var pos: usize = 0;
         var step: usize = @intCast(loop_index);
         while (pos < wire.len) : (step += 1) {
@@ -599,11 +599,11 @@ fn runParallelWorker(worker: *ParallelWorker) void {
         const fixture = worker.fixtures.heads[(i + worker.worker_index * 5) % worker.fixtures.head_count];
         const request_wire = fixture.request[0..fixture.request_len];
         const response_wire = fixture.response[0..fixture.response_len];
-        const request = http.http1.parseRequest(request_wire) catch {
+        const request = http.http1.head.parseRequest(request_wire) catch {
             worker.failed = true;
             return;
         };
-        const response = http.http1.parseResponse(response_wire, fixture.request_method) catch {
+        const response = http.http1.head.parseResponse(response_wire, fixture.request_method) catch {
             worker.failed = true;
             return;
         };
@@ -708,12 +708,12 @@ pub fn main(init: std.process.Init) !void {
     try report(out, "parallel mixed headers (4 threads)", try benchParallelMixed(io, &fixtures, 200_000));
 
     try out.print("state sizes: HeadParser={d} FramedHeadParser={d} ChunkDecoder={d} FrameDecoder={d} CompleteFrameIterator={d} FlowWindow={d} Guard={d} Collector={d} H2FieldValidator={d}\n", .{
-        @sizeOf(http.http1.HeadParser),
-        @sizeOf(http.http1.FramedHeadParser),
-        @sizeOf(http.http1.ChunkDecoder),
-        @sizeOf(http.http2.FrameDecoder),
-        @sizeOf(http.http2.CompleteFrameIterator),
-        @sizeOf(http.http2.FlowWindow),
+        @sizeOf(http.http1.head.HeadParser),
+        @sizeOf(http.http1.head.FramedHeadParser),
+        @sizeOf(http.http1.body.ChunkDecoder),
+        @sizeOf(http.http2.frame.FrameDecoder),
+        @sizeOf(http.http2.frame.CompleteIterator),
+        @sizeOf(http.http2.flow.FlowWindow),
         @sizeOf(http.http2.continuation.Guard),
         @sizeOf(http.http2.header_block.Collector),
         @sizeOf(http.http2.fields.Validator),

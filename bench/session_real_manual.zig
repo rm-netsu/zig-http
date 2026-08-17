@@ -16,9 +16,9 @@ pub fn main(init: std.process.Init) !void {
 
     var decoder = http.http2.hpack.Decoder.init(allocator, 4096);
     defer decoder.deinit();
-    var peer = http.http2.PeerState.init(.client);
-    var manager = http.http2.StreamManager.init(.client, .{});
-    var connection: http.http2.ConnectionState = .{};
+    var peer = http.http2.peer.State.init(.client);
+    var manager = http.http2.streams.Manager.init(.client, .{});
+    var connection: http.http2.connection.State = .{};
     var scratch: [16 * 1024]u8 = undefined;
     var store: shared.Store = .{};
     var sink: shared.CountingSink = .{};
@@ -29,14 +29,14 @@ pub fn main(init: std.process.Init) !void {
     for (0..shared.rounds) |round| {
         if (round % shared.batch_streams == 0) {
             store.reset();
-            manager = http.http2.StreamManager.init(.client, .{});
+            manager = http.http2.streams.Manager.init(.client, .{});
             connection = .{};
         }
         const id: u31 = @intCast((round % shared.batch_streams) * 2 + 1);
         try manager.openLocal(&store, &peer, id, true);
         const block = fixture.block(round);
         const end_on_headers = block.body == 0;
-        const header = http.http2.FrameHeader{
+        const header = http.http2.frame.FrameHeader{
             .length = @intCast(block.bytes.len),
             .type = .headers,
             .flags = 0x04 | @as(u8, @intFromBool(end_on_headers)),
@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
         while (left != 0) {
             const n = @min(left, shared.data_chunk);
             left -= n;
-            const data_header = http.http2.FrameHeader{ .length = n, .type = .data, .flags = @intFromBool(left == 0), .stream_id = id };
+            const data_header = http.http2.frame.FrameHeader{ .length = n, .type = .data, .flags = @intFromBool(left == 0), .stream_id = id };
             if (connection.check(data_header) != .none) return error.Protocol;
             if (manager.receiveData(&store, id, n, left == 0) != .accepted) return error.Protocol;
             checksum +%= n;

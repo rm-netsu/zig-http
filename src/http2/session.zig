@@ -293,7 +293,7 @@ pub const Session = struct {
         header_storage: []u8,
     };
 
-    pub fn initOptions(options: Options) Session {
+    pub fn init(options: Options) Session {
         return .{
             .streams = streams_mod.Manager.init(options.role, options.local_limits),
             .peer = peer_mod.State.init(options.role),
@@ -301,24 +301,6 @@ pub const Session = struct {
             .encoder = options.encoder,
             .collector = header_block.Collector.init(options.header_storage),
         };
-    }
-
-    /// Positional compatibility initializer. New call sites can use
-    /// `initOptions(.{ ... })` when named fields are clearer.
-    pub fn init(
-        role: peer_mod.Role,
-        local_limits: streams_mod.LocalLimits,
-        decoder: *hpack.Decoder,
-        encoder: *hpack.Encoder,
-        header_storage: []u8,
-    ) Session {
-        return initOptions(.{
-            .role = role,
-            .local_limits = local_limits,
-            .decoder = decoder,
-            .encoder = encoder,
-            .header_storage = header_storage,
-        });
     }
 
     /// Streams one local field section directly into HEADERS/CONTINUATION
@@ -1320,7 +1302,7 @@ test "session receiveBytes waits for a complete frame and dispatches it" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [256]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [512]u8 = undefined;
@@ -1376,7 +1358,7 @@ test "session decodes request response and trailers without growing Tracked" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [4096]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [4096]u8 = undefined;
@@ -1415,7 +1397,7 @@ test "stream state error takes precedence without desynchronizing HPACK" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [4096]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [4096]u8 = undefined;
@@ -1477,7 +1459,7 @@ test "malformed HEADERS still consume remote stream identifier" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [4096]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [4096]u8 = undefined;
@@ -1520,7 +1502,7 @@ test "session preserves HPACK through continuation and validates 1xx response ph
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [4096]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try session.streams.openLocal(&store, &session.peer, 1, true);
     var sink: NullSink = .{};
@@ -1561,7 +1543,7 @@ test "session decodes PUSH_PROMISE request fields before reserving the stream" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [4096]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try session.streams.openLocal(&store, &session.peer, 1, true);
     var sink: NullSink = .{};
@@ -1593,7 +1575,7 @@ test "session applies SETTINGS header table and stream window effects" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [256]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try session.streams.openLocal(&store, &session.peer, 1, false);
     var sink: NullSink = .{};
@@ -1619,7 +1601,7 @@ test "session requests exact stream scan only after positive send-window growth"
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try session.streams.openLocal(&store, &session.peer, 1, false);
 
@@ -1651,7 +1633,7 @@ test "session drains oversized header list before returning the limit error" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [4096]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try session.streams.openLocal(&store, &session.peer, 1, true);
     var sink: NullSink = .{};
@@ -1688,7 +1670,7 @@ test "session drains malformed field section and preserves HPACK context" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [4096]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try session.streams.openLocal(&store, &session.peer, 1, true);
     var sink: NullSink = .{};
@@ -1725,7 +1707,7 @@ test "session rejects HTTP 101 over HTTP2" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var block_storage: [512]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try session.streams.openLocal(&store, &session.peer, 1, true);
     var sink: NullSink = .{};
@@ -1747,7 +1729,7 @@ test "ignored post GOAWAY DATA still consumes connection credit" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     try session.streams.sentGoAway(0);
     var store: TestStore = .{};
     var sink: NullSink = .{};
@@ -1768,7 +1750,7 @@ test "session surfaces unknown extension frames without owning their semantics" 
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [64]u8 = undefined;
@@ -1792,7 +1774,7 @@ test "session SETTINGS event preserves extension settings for caller inspection"
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [64]u8 = undefined;
@@ -1832,7 +1814,7 @@ test "session streams request HEADERS through continuations" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
 
     const items = [_]hpack.EncodedField{
@@ -1884,7 +1866,7 @@ test "session DATA send obeys flow control and caller backpressure" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
 
     const items = [_]hpack.EncodedField{
@@ -1912,7 +1894,7 @@ test "session DATA send obeys flow control and caller backpressure" {
     try std.testing.expectEqual(stream_mod.State.half_closed_local, store.get(1).?.stream.state);
 
     // A new stream can close with an empty DATA frame even at zero credit.
-    var session2 = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session2 = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store2: TestStore = .{};
     var h2_storage: [512]u8 = undefined;
     var h2 = std.Io.Writer.fixed(&h2_storage);
@@ -1936,7 +1918,7 @@ test "writer failure poisons session send side" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [32]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     const items = [_]hpack.EncodedField{
         .{ .field = .{ .name = ":method", .value = "GET" } },
@@ -1958,7 +1940,7 @@ test "send response tracks informational final and trailers phases" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
 
@@ -1990,7 +1972,7 @@ test "invalid local fields fail before stream or HPACK mutation" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
     const before_state = store.get(1).?.stream.state;
@@ -2013,7 +1995,7 @@ test "session sends PUSH_PROMISE and opens promised response stream" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
 
@@ -2054,7 +2036,7 @@ test "PUSH_PROMISE preflight respects role and peer push setting" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, true));
     _ = try session.peer.applySetting(.{ .id = .enable_push, .value = 0 });
@@ -2082,7 +2064,7 @@ test "Extended CONNECT is gated by negotiated SETTINGS" {
     var client_encoder = hpack.Encoder.init(allocator, 4096);
     defer client_encoder.deinit();
     var client_storage: [256]u8 = undefined;
-    var client = Session.init(.client, .{}, &client_decoder, &client_encoder, &client_storage);
+    var client = Session.init(.{ .role = .client, .decoder = &client_decoder, .encoder = &client_encoder, .header_storage = &client_storage });
     var client_store: TestStore = .{};
     const request = [_]hpack.EncodedField{
         .{ .field = .{ .name = ":method", .value = "CONNECT" } },
@@ -2111,7 +2093,7 @@ test "Extended CONNECT is gated by negotiated SETTINGS" {
     var wire_encoder = hpack.Encoder.init(allocator, 4096);
     defer wire_encoder.deinit();
     var server_storage: [256]u8 = undefined;
-    var server = Session.init(.server, .{}, &server_decoder, &server_encoder, &server_storage);
+    var server = Session.init(.{ .role = .server, .decoder = &server_decoder, .encoder = &server_encoder, .header_storage = &server_storage });
     const request_fields = [_]common.Header{
         .{ .name = ":method", .value = "CONNECT" },
         .{ .name = ":protocol", .value = "websocket" },
@@ -2158,7 +2140,7 @@ test "SETTINGS synchronization tickets follow ACK order" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var sync: SettingsSync = .{};
     var store: TestStore = .{};
     var sink: NullSink = .{};
@@ -2193,7 +2175,7 @@ test "SETTINGS send preflight and writer failure preserve synchronization" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var sync: SettingsSync = .{};
     var storage: [32]u8 = undefined;
     var out = std.Io.Writer.fixed(&storage);
@@ -2219,7 +2201,7 @@ test "session sends HTTP2 control frames with state-aware commits" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
 
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
@@ -2280,7 +2262,7 @@ test "session control preflight is retry safe and writer failure poisons" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
 
@@ -2312,7 +2294,7 @@ test "DATA event exposes full flow-controlled payload length" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
 
@@ -2336,7 +2318,7 @@ test "receive credit helpers replenish connection and stream after release" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
 
@@ -2374,7 +2356,7 @@ test "receive credit helper does not commit released bytes on writer failure" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     session.connection.receive_window.value = 15_535;
     var credit = try flow.ReceiveCredit.init(65_535, 32_767);
     credit.release(50_000);
@@ -2394,7 +2376,7 @@ test "graceful GOAWAY helper performs only the two HTTP2 shutdown phases" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var drain: GracefulGoAway = .{};
 
     var wire_storage: [64]u8 = undefined;
@@ -2425,7 +2407,7 @@ test "graceful GOAWAY helper is server-only and owns no timing policy" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var block_storage: [64]u8 = undefined;
-    var session = Session.init(.client, .{}, &inbound, &outbound, &block_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var drain: GracefulGoAway = .{};
     var wire_storage: [32]u8 = undefined;
     var wire = std.Io.Writer.fixed(&wire_storage);
@@ -2440,7 +2422,7 @@ test "session reports zero stream WINDOW_UPDATE as stream protocol error" {
     var encoder = hpack.Encoder.init(std.testing.allocator, 4096);
     defer encoder.deinit();
     var continuation_storage: [256]u8 = undefined;
-    var session = Session.init(.client, .{}, &decoder, &encoder, &continuation_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &decoder, .encoder = &encoder, .header_storage = &continuation_storage });
     var store: TestStore = .{};
 
     var tracked = stream_mod.Tracked.init(65_535);
@@ -2464,7 +2446,7 @@ test "prechecked Session path does not double-charge connection DATA window" {
     var encoder = hpack.Encoder.init(std.testing.allocator, 4096);
     defer encoder.deinit();
     var continuation_storage: [256]u8 = undefined;
-    var session = Session.init(.client, .{}, &decoder, &encoder, &continuation_storage);
+    var session = Session.init(.{ .role = .client, .decoder = &decoder, .encoder = &encoder, .header_storage = &continuation_storage });
     var store: TestStore = .{};
 
     var tracked = stream_mod.Tracked.init(65_535);
@@ -2491,7 +2473,7 @@ test "session classifies PRIORITY self dependency as stream protocol error" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var header_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &header_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [64]u8 = undefined;
@@ -2512,7 +2494,7 @@ test "session classifies HEADERS priority self dependency as stream protocol err
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var header_storage: [64]u8 = undefined;
-    var session = Session.init(.server, .{}, &inbound, &outbound, &header_storage);
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
     var store: TestStore = .{};
     var sink: NullSink = .{};
     var scratch: [64]u8 = undefined;

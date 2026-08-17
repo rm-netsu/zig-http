@@ -16,13 +16,14 @@ runner and the `test_runner` override from `build.zig`.
 
 ## Current property targets
 
-The fuzz artifact currently contains six independent targets:
+The fuzz artifact currently contains seven independent targets:
 
 1. HTTP/2 `FlowWindow` operations against a signed reference model.
 2. HTTP/1 request parsing: contiguous `parseRequest` versus one-byte-fragmented `FramedHeadParser`.
 3. HTTP/1 response parsing: contiguous `parseResponse` versus one-byte-fragmented parsing with GET/HEAD/CONNECT context.
 4. HTTP/2 complete-frame parsing versus `FrameDecoder` under generated transport fragmentation.
 5. HTTP/1 `ChunkDecoder` contiguous versus one-byte-fragmented decoding, including generated chunk extensions and trailers.
-6. HTTP/2 `StreamManager` mixed client/server lifecycle sequences with caller-owned storage, checking active-stream aggregate invariants after every generated transition.
+6. HTTP/2 `streams.Manager` mixed client/server lifecycle sequences with caller-owned storage, checking active-stream aggregate invariants after every generated transition.
+7. HTTP/2 `Session` versus the fragmented-frame receive path over generated HEADERS/CONTINUATION/DATA/SETTINGS/PING/WINDOW_UPDATE/PRIORITY/RST_STREAM/GOAWAY/extension sequences, checking event and persistent-state equivalence after every frame.
 
 The deterministic replay path is intentionally part of `zig build check`. Coverage-guided runs can be longer-lived and are not required for ordinary consumers or every local build. New protocol bugs found by conformance/interoperability testing should be reduced into deterministic unit/property regressions rather than relying only on a transient fuzz corpus.

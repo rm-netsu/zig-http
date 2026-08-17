@@ -18,7 +18,7 @@ fn writeResponse(out: *std.Io.Writer, method: []const u8, close: bool) !void {
             .{ .name = "Content-Type", .value = "text/plain" },
             .{ .name = "X-Engine", .value = "zig-http" },
         };
-    try h1.write.responseHead(out, 200, "OK", &headers);
+    try h1.write.responseHead(out, .http_1_1, 200, "OK", &headers);
     if (!std.ascii.eqlIgnoreCase(method, "HEAD")) try out.writeAll(response_body);
     try out.flush();
 }
@@ -28,7 +28,7 @@ fn writeBadRequest(out: *std.Io.Writer) void {
         .{ .name = "Content-Length", .value = "0" },
         .{ .name = "Connection", .value = "close" },
     };
-    h1.write.responseHead(out, 400, "Bad Request", &headers) catch return;
+    h1.write.responseHead(out, .http_1_1, 400, "Bad Request", &headers) catch return;
     out.flush() catch {};
 }
 

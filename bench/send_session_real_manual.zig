@@ -4,16 +4,16 @@ const shared = @import("send_session_real.zig");
 
 const Context = struct {
     encoder: http.http2.hpack.Encoder,
-    peer: http.http2.PeerState,
-    manager: http.http2.StreamManager,
+    peer: http.http2.peer.State,
+    manager: http.http2.streams.Manager,
     store: shared.Store = .{},
     next_stream_id: u31 = 1,
 
     fn init(allocator: std.mem.Allocator) Context {
         return .{
             .encoder = http.http2.hpack.Encoder.init(allocator, 4096),
-            .peer = http.http2.PeerState.init(.server),
-            .manager = http.http2.StreamManager.init(.server, .{}),
+            .peer = http.http2.peer.State.init(.server),
+            .manager = http.http2.streams.Manager.init(.server, .{}),
         };
     }
     fn deinit(self: *Context) void {
@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         while (left != 0) {
             const n: u32 = @intCast(@min(@as(usize, left), shared.data_chunk));
             left -= n;
-            const header: http.http2.FrameHeader = .{ .length = n, .type = .data, .flags = @intFromBool(left == 0), .stream_id = id };
+            const header: http.http2.frame.FrameHeader = .{ .length = n, .type = .data, .flags = @intFromBool(left == 0), .stream_id = id };
             try http.http2.frame.writeFrame(&discard.writer, header, shared.body_bytes[0..n]);
             try ctx.peer.consumeSend(n);
             try ctx.manager.localData(&ctx.store, &ctx.peer, id, n, left == 0);

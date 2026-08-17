@@ -119,10 +119,10 @@ fn sendRequests(session: *h2.Session, store: *Store, out: *std.Io.Writer, stagin
 
 fn handleEvent(
     session: *h2.Session,
-    sync: *h2.SessionSettingsSync,
+    sync: *h2.session.SettingsSync,
     out: *std.Io.Writer,
     observed: *Observed,
-    event: h2.SessionEvent,
+    event: h2.Event,
 ) !void {
     switch (event) {
         .ignored, .pending, .window_update, .extension => {},
@@ -209,7 +209,7 @@ fn pump(
     out: *std.Io.Writer,
     session: *h2.Session,
     store: *Store,
-    sync: *h2.SessionSettingsSync,
+    sync: *h2.session.SettingsSync,
     observed: *Observed,
     sink: *Sink,
     scratch: []u8,
@@ -225,7 +225,7 @@ fn pump(
     var consumed: usize = 0;
     while (used.* - consumed >= 9) {
         const header_ptr: *const [9]u8 = wire[consumed..][0..9];
-        const frame_header = h2.FrameHeader.parse(header_ptr);
+        const frame_header = h2.frame.FrameHeader.parse(header_ptr);
         const total = 9 + @as(usize, frame_header.length);
         if (total > wire.len) return error.BufferTooSmall;
         if (used.* - consumed < total) break;
@@ -270,7 +270,7 @@ pub fn main(init: std.process.Init) !void {
     const in = &socket_reader.interface;
     const out = &socket_writer.interface;
 
-    try out.writeAll(h2.client_preface);
+    try out.writeAll(h2.preface.bytes);
 
     var decoder = h2.hpack.Decoder.init(allocator, 4096);
     defer decoder.deinit();
@@ -278,9 +278,9 @@ pub fn main(init: std.process.Init) !void {
     defer encoder.deinit();
     var header_storage: [64 * 1024]u8 = undefined;
     var scratch: [64 * 1024]u8 = undefined;
-    var session = h2.Session.init(.client, .{}, &decoder, &encoder, &header_storage);
+    var session = h2.Session.init(.{ .role = .client, .decoder = &decoder, .encoder = &encoder, .header_storage = &header_storage });
     var store: Store = .{};
-    var sync: h2.SessionSettingsSync = .{};
+    var sync: h2.session.SettingsSync = .{};
     _ = try session.sendSettings(&sync, out, &.{});
     try out.flush();
 

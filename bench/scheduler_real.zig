@@ -53,7 +53,7 @@ pub const Context = struct {
         self.decoder = http.http2.hpack.Decoder.init(allocator, 4096);
         self.encoder = http.http2.hpack.Encoder.init(allocator, 4096);
         self.store = .{};
-        self.session = http.http2.Session.init(.client, .{}, &self.decoder, &self.encoder, &self.header_storage);
+        self.session = http.http2.Session.init(.{ .role = .client, .decoder = &self.decoder, .encoder = &self.encoder, .header_storage = &self.header_storage });
         self.session.peer.send_window.value = 0x7fff_ffff;
 
         var i: usize = 0;

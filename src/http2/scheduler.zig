@@ -159,7 +159,7 @@ test "round robin skips blocked streams and rotates ready work" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var header_storage: [64]u8 = undefined;
-    var session = session_mod.Session.init(.client, .{}, &inbound, &outbound, &header_storage);
+    var session = session_mod.Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
     var store: Store = .{};
     try session.streams.openLocal(&store, &session.peer, 1, false);
     try session.streams.openLocal(&store, &session.peer, 3, false);
@@ -214,7 +214,7 @@ test "round robin schedules empty END_STREAM without flow credit" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var header_storage: [32]u8 = undefined;
-    var session = session_mod.Session.init(.client, .{}, &inbound, &outbound, &header_storage);
+    var session = session_mod.Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
     var store: Store = .{};
     try session.streams.openLocal(&store, &session.peer, 1, false);
     session.peer.send_window.value = 0;
@@ -253,7 +253,7 @@ test "round robin distinguishes idle from flow-control blocking" {
     var outbound = hpack.Encoder.init(allocator, 4096);
     defer outbound.deinit();
     var header_storage: [32]u8 = undefined;
-    var session = session_mod.Session.init(.client, .{}, &inbound, &outbound, &header_storage);
+    var session = session_mod.Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
     var store: Store = .{};
     try session.streams.openLocal(&store, &session.peer, 1, false);
     session.peer.send_window.value = 0;

@@ -14,9 +14,9 @@ fn report(out: *Io.Writer, name: []const u8, elapsed: i96, operations: u64) !voi
     try out.print("{s}: {d} ns total, {d} ops/s\n", .{ name, ns, ops_per_s });
 }
 
-fn benchHttp1Legacy(io: Io, wire: []const u8, operations: u64) !i96 {
+fn benchHttp1Split(io: Io, wire: []const u8, operations: u64) !i96 {
     var storage: [512]u8 = undefined;
-    var parser = http.http1.HeadParser.init(.request, &storage);
+    var parser = http.http1.head.HeadParser.init(.request, &storage);
     var sum: u64 = 0;
     const start = now(io);
     for (0..operations) |_| {
@@ -35,7 +35,7 @@ fn benchHttp1Legacy(io: Io, wire: []const u8, operations: u64) !i96 {
 
 fn benchHttp1IncrementalFast(io: Io, wire: []const u8, operations: u64) !i96 {
     var storage: [512]u8 = undefined;
-    var parser = http.http1.HeadParser.init(.request, &storage);
+    var parser = http.http1.head.HeadParser.init(.request, &storage);
     var sum: u64 = 0;
     const start = now(io);
     for (0..operations) |_| {
@@ -53,7 +53,7 @@ fn benchHttp1IncrementalFast(io: Io, wire: []const u8, operations: u64) !i96 {
 
 fn benchHttp1StreamingFramed(io: Io, wire: []const u8, operations: u64) !i96 {
     var storage: [512]u8 = undefined;
-    var parser = http.http1.FramedHeadParser.init(.request, &storage);
+    var parser = http.http1.head.FramedHeadParser.init(.request, &storage);
     const pieces = [_]usize{ 17, 43, 127 };
     var sum: u64 = 0;
     const start = now(io);
@@ -84,7 +84,7 @@ fn benchHttp1Contiguous(io: Io, wire: []const u8, operations: u64) !i96 {
     var sum: u64 = 0;
     const start = now(io);
     for (0..operations) |_| {
-        const r = (try http.http1.parseRequest(wire)).?;
+        const r = (try http.http1.head.parseRequest(wire)).?;
         sum +%= switch (r.framing) {
             .content_length => |n| n,
             else => 0,
@@ -97,7 +97,7 @@ fn benchHttp1Contiguous(io: Io, wire: []const u8, operations: u64) !i96 {
 
 fn benchChunkDecode(io: Io, wire: []const u8, operations: u64) !i96 {
     var line: [128]u8 = undefined;
-    var decoder = http.http1.ChunkDecoder.init(&line);
+    var decoder = http.http1.body.ChunkDecoder.init(&line);
     var sum: usize = 0;
     const start = now(io);
     for (0..operations) |_| {
@@ -119,7 +119,7 @@ fn benchChunkDecode(io: Io, wire: []const u8, operations: u64) !i96 {
 }
 
 fn benchFrameIncremental(io: Io, wire: []const u8, operations: u64) !i96 {
-    var decoder = http.http2.FrameDecoder.init(http.http2.frame.default_max_frame_size);
+    var decoder = http.http2.frame.FrameDecoder.init(http.http2.frame.default_max_frame_size);
     var sum: usize = 0;
     const start = now(io);
     for (0..operations) |_| {
@@ -137,7 +137,7 @@ fn benchFrameComplete(io: Io, wire: []const u8, operations: u64) !i96 {
     var sum: usize = 0;
     const start = now(io);
     for (0..operations) |_| {
-        const r = (try http.http2.parseCompleteFrame(wire, http.http2.frame.default_max_frame_size)).?;
+        const r = (try http.http2.frame.parseComplete(wire, http.http2.frame.default_max_frame_size)).?;
         sum +%= r.consumed;
         std.mem.doNotOptimizeAway(r.frame.payload.ptr);
     }
@@ -153,7 +153,7 @@ fn benchFrameBatchParse(io: Io, wire: []const u8, frames_per_batch: usize, frame
     for (0..batches) |_| {
         var remaining = wire;
         while (remaining.len != 0) {
-            const r = (try http.http2.parseCompleteFrame(remaining, http.http2.frame.default_max_frame_size)).?;
+            const r = (try http.http2.frame.parseComplete(remaining, http.http2.frame.default_max_frame_size)).?;
             sum +%= r.frame.payload.len;
             remaining = remaining[r.consumed..];
         }
@@ -217,7 +217,7 @@ pub fn main(init: std.process.Init) !void {
     chunked[4] = 'a' + entropy % 26;
 
     var frame_header: [9]u8 = undefined;
-    const header: http.http2.FrameHeader = .{
+    const header: http.http2.frame.FrameHeader = .{
         .length = 32,
         .type = .data,
         .flags = entropy & 1,
@@ -237,7 +237,7 @@ pub fn main(init: std.process.Init) !void {
     const chunk_ops: u64 = 2_000_000;
     const frame_ops: u64 = 10_000_000;
 
-    try report(out, "http1 head legacy+framing", try benchHttp1Legacy(io, &request, head_ops), head_ops);
+    try report(out, "http1 head split+framing", try benchHttp1Split(io, &request, head_ops), head_ops);
     try report(out, "http1 head incremental-fast", try benchHttp1IncrementalFast(io, &request, head_ops), head_ops);
     try report(out, "http1 head streaming-framed", try benchHttp1StreamingFramed(io, &request, head_ops), head_ops);
     try report(out, "http1 head contiguous-fast", try benchHttp1Contiguous(io, &request, head_ops), head_ops);
@@ -249,12 +249,12 @@ pub fn main(init: std.process.Init) !void {
     try report(out, "http2 field validation", try benchH2Fields(io, entropy, head_ops), head_ops);
 
     try out.print("state sizes: HeadParser={d} FramedHeadParser={d} ChunkDecoder={d} FrameDecoder={d} CompleteFrameIterator={d} FlowWindow={d} Guard={d} Collector={d} H2FieldValidator={d}\n", .{
-        @sizeOf(http.http1.HeadParser),
-        @sizeOf(http.http1.FramedHeadParser),
-        @sizeOf(http.http1.ChunkDecoder),
-        @sizeOf(http.http2.FrameDecoder),
-        @sizeOf(http.http2.CompleteFrameIterator),
-        @sizeOf(http.http2.FlowWindow),
+        @sizeOf(http.http1.head.HeadParser),
+        @sizeOf(http.http1.head.FramedHeadParser),
+        @sizeOf(http.http1.body.ChunkDecoder),
+        @sizeOf(http.http2.frame.FrameDecoder),
+        @sizeOf(http.http2.frame.CompleteIterator),
+        @sizeOf(http.http2.flow.FlowWindow),
         @sizeOf(http.http2.continuation.Guard),
         @sizeOf(http.http2.header_block.Collector),
         @sizeOf(http.http2.fields.Validator),

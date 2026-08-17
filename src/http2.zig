@@ -19,43 +19,8 @@ pub const dispatch = @import("http2/dispatch.zig");
 pub const contracts = @import("http2/contracts.zig");
 pub const hpack = @import("hpack");
 
-pub const FrameHeader = frame.FrameHeader;
-pub const FrameDecoder = frame.FrameDecoder;
-pub const CompleteFrame = frame.CompleteFrame;
-pub const CompleteFrameIterator = frame.CompleteIterator;
-pub const parseCompleteFrame = frame.parseComplete;
-pub const Settings = settings.Settings;
-pub const FlowWindow = flow.FlowWindow;
-pub const StreamSendWindow = flow.StreamSendWindow;
-pub const ReceiveCredit = flow.ReceiveCredit;
-pub const ConnectionState = connection.State;
-pub const StreamManager = streams.Manager;
-pub const StreamCursor = streams.Existing;
-pub const DetachedStreamCursor = streams.Detached;
-pub const DetachedStreamResult = streams.DetachedResult;
-pub const StreamEffect = streams.StreamEffect;
-pub const StreamLocalError = streams.StreamLocalError;
-pub const StreamReceiveResult = streams.ReceiveResult;
-pub const StreamAbsentFrame = streams.AbsentFrame;
-pub const StreamDataSendOffer = streams.DataSendOffer;
-pub const ConnectionViolation = connection.Violation;
-pub const PeerState = peer.State;
-pub const Role = peer.Role;
-pub const ConnectionDecoder = connection.Decoder;
-pub const ConnectionCompleteIterator = connection.CompleteIterator;
+/// Recommended composed HTTP/2 connection engine. Lower-level protocol pieces
+/// remain available through their namespaces above.
 pub const Session = session.Session;
-pub const SessionEvent = session.Event;
-pub const SessionSendDataResult = session.SendDataResult;
-pub const SessionSendHeadersResult = session.SendHeadersResult;
-pub const SessionSendPushPromiseResult = session.SendPushPromiseResult;
-pub const SessionSettingsSync = session.SettingsSync;
-pub const SessionSettingsTicket = session.SettingsTicket;
-pub const GracefulGoAway = session.GracefulGoAway;
-pub const DataScheduler = scheduler.RoundRobin;
-pub const DataSchedulerCandidate = scheduler.Candidate;
-pub const DataSchedulerDecision = scheduler.Decision;
-pub const DispatchPrepared = dispatch.Prepared;
-pub const DispatchStreamWork = dispatch.StreamWork;
-pub const DispatchDataSendGrant = dispatch.DataSendGrant;
-
-pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub const Event = session.Event;
+pub const Role = peer.Role;

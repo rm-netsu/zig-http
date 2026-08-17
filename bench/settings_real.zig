@@ -62,14 +62,14 @@ pub fn main(init: std.process.Init) !void {
     var encoder = http.http2.hpack.Encoder.init(allocator, 4096);
     defer encoder.deinit();
     var header_storage: [64]u8 = undefined;
-    var session = http.http2.Session.init(.client, .{}, &decoder, &encoder, &header_storage);
+    var session = http.http2.Session.init(.{ .role = .client, .decoder = &decoder, .encoder = &encoder, .header_storage = &header_storage });
     var store = Store.init();
     var sink: Sink = .{};
     var scratch: [1]u8 = undefined;
 
     const low = settingBytes(32_768);
     const high = settingBytes(65_535);
-    const header: http.http2.FrameHeader = .{ .length = 6, .type = .settings, .flags = 0, .stream_id = 0 };
+    const header: http.http2.frame.FrameHeader = .{ .length = 6, .type = .settings, .flags = 0, .stream_id = 0 };
 
     var checksum: u64 = 0;
     const runtime_seed: usize = @truncate(@as(u96, @bitCast(std.Io.Clock.awake.now(init.io).nanoseconds)));

@@ -26,19 +26,25 @@ The package does not require one architecture. Pick the highest level that owns
 only state you actually want the HTTP engine to manage:
 
 - HTTP/1 messages on an existing byte stream: `http1.ConnectionDecoder` is the
-  recommended coordinator. Use `parseRequest` / `parseResponse`,
-  `FramedHeadParser`, `ChunkDecoder`, and the writers directly when an existing
+  recommended coordinator. Use `http1.head.parseRequest` / `parseResponse`,
+  `http1.head.FramedHeadParser`, `http1.body.ChunkDecoder`, and the writers directly when an existing
   runtime already owns more of the message state machine.
 - HTTP/2 connection engine: `http2.Session` is the recommended composed path
   over caller-owned HPACK objects and stream storage.
-  New code can use `Session.initOptions(.{ ... })` for named configuration;
-  the original positional `Session.init(...)` remains available.
+  `Session.init(.{ ... })` uses named configuration and caller-owned state.
 - HTTP/2 custom/sharded runtimes: compose `connection`, `peer`, `streams`,
   `dispatch`, `send`, frame, flow, and field primitives independently. No
   scheduler, storage layout, queue, or synchronization strategy is mandatory.
 
 None of these levels opens sockets, performs TLS/DNS, registers timers, or owns
 an event loop.
+
+Public names intentionally follow one path per abstraction level. Composed entry
+points are `http1.ConnectionDecoder` and `http2.Session`; lower-level types live
+under their owning namespaces (`http1.head`, `http1.body`, `http2.frame`,
+`http2.connection`, `http2.streams`, and so on). Pre-1.0 flat aliases and
+positional compatibility initializers are not retained, so API discovery mirrors
+the protocol architecture instead of accumulating duplicate spellings.
 
 ## HTTP/1 connection/message coordination
 
@@ -82,7 +88,7 @@ consuming tunnel bytes, and close-delimited completion is reported by
 For a transport buffer that may already contain a complete request head:
 
 ```zig
-if (try http.http1.parseRequest(input)) |parsed| {
+if (try http.http1.head.parseRequest(input)) |parsed| {
     const head = parsed.head;
     const framing = parsed.framing;
     const body_bytes = input[parsed.consumed..];
@@ -99,7 +105,7 @@ if (try http.http1.parseRequest(input)) |parsed| {
 When a complete frame is already available:
 
 ```zig
-if (try http.http2.parseCompleteFrame(input, http.http2.frame.default_max_frame_size)) |parsed| {
+if (try http.http2.frame.parseComplete(input, http.http2.frame.default_max_frame_size)) |parsed| {
     const header = parsed.frame.header;
     const payload = parsed.frame.payload;
     _ = header;
@@ -107,12 +113,12 @@ if (try http.http2.parseCompleteFrame(input, http.http2.frame.default_max_frame_
 }
 ```
 
-The payload slice aliases caller input. Use `FrameDecoder` for fragmented frame headers or payloads.
+The payload slice aliases caller input. Use `http2.frame.FrameDecoder` for fragmented frame headers or payloads.
 
-When a TLS/TCP read contains several complete frames, `CompleteFrameIterator` repeatedly applies the same validated zero-copy complete-frame path while retaining the unconsumed remainder:
+When a TLS/TCP read contains several complete frames, `http2.frame.CompleteIterator` repeatedly applies the same validated zero-copy complete-frame path while retaining the unconsumed remainder:
 
 ```zig
-var frames = http.http2.CompleteFrameIterator.init(
+var frames = http.http2.frame.CompleteIterator.init(
     input,
     http.http2.frame.default_max_frame_size,
 );
@@ -128,7 +134,7 @@ The iterator itself is 32 bytes on x86_64 and does not become part of persistent
 
 ## HTTP/2 connection state
 
-`ConnectionDecoder` layers connection-wide receive rules over the existing frame
+`http2.connection.Decoder` layers connection-wide receive rules over the existing frame
 parsers without owning a stream table. Its persistent state is 28 bytes on
 x86_64: a 20-byte `FrameDecoder` plus 8 bytes for CONTINUATION sequencing and the
 connection receive flow-control window. These mutable connection contexts are
@@ -139,7 +145,7 @@ concurrently.
 Drain complete frames first:
 
 ```zig
-var connection = http.http2.ConnectionDecoder.init(
+var connection = http.http2.connection.Decoder.init(
     http.http2.frame.default_max_frame_size,
 );
 
@@ -276,7 +282,7 @@ frame header, use `prepareAssumeConnectionChecked()` or the typed
 connection state twice:
 
 ```zig
-var frames = http.http2.ConnectionCompleteIterator.init(
+var frames = http.http2.connection.CompleteIterator.init(
     &session.connection,
     input,
     receiver_max_frame_size,
@@ -334,8 +340,8 @@ choice. The composed `Session` additionally asks for
 overflow-validation path.
 
 ```zig
-var manager = http.http2.StreamManager.init(.client, .{});
-var peer = http.http2.PeerState.init(.client);
+var manager = http.http2.streams.Manager.init(.client, .{});
+var peer = http.http2.peer.State.init(.client);
 
 try manager.openLocal(&store, &peer, 1, true);
 const stream = manager.existing(&store, 1).?;
@@ -442,13 +448,12 @@ var encoder = http.http2.hpack.Encoder.init(allocator, 4096);
 defer encoder.deinit();
 var continuation_storage: [16 * 1024]u8 = undefined;
 
-var session = http.http2.Session.init(
-    .client,
-    .{},
-    &decoder,
-    &encoder,
-    &continuation_storage,
-);
+var session = http.http2.Session.init(.{
+    .role = .client,
+    .decoder = &decoder,
+    .encoder = &encoder,
+    .header_storage = &continuation_storage,
+});
 
 if (try session.receiveBytes(
     &store,
@@ -591,7 +596,7 @@ application can attach any policy snapshot to the returned ticket and commit it
 when the corresponding ACK event arrives:
 
 ```zig
-var settings_sync: http.http2.SessionSettingsSync = .{};
+var settings_sync: http.http2.session.SettingsSync = .{};
 const ticket = try session.sendSettings(
     &settings_sync,
     transport_writer,
@@ -622,8 +627,8 @@ Session commits both the WINDOW_UPDATE and the accumulator only after a
 successful writer call:
 
 ```zig
-var connection_credit = try http.http2.ReceiveCredit.init(65_535, 32_767);
-var stream_credit = try http.http2.ReceiveCredit.init(65_535, 32_767);
+var connection_credit = try http.http2.flow.ReceiveCredit.init(65_535, 32_767);
+var stream_credit = try http.http2.flow.ReceiveCredit.init(65_535, 32_767);
 
 // After the application has consumed/copied/discarded this DATA event:
 connection_credit.release(data.flowControlledBytes());
@@ -653,7 +658,7 @@ not start a timer and deliberately does not infer "processed" from frame receipt
 because that depends on whether data reached a higher application layer:
 
 ```zig
-var drain: http.http2.GracefulGoAway = .{};
+var drain: http.http2.session.GracefulGoAway = .{};
 try drain.announce(&session, transport_writer, "maintenance");
 
 // Caller waits according to its own runtime/RTT policy, then supplies the
@@ -672,8 +677,8 @@ list of DATA candidates. It combines connection credit, per-stream credit, and
 peer MAX_FRAME_SIZE without owning buffers, priorities, wakeups, or queues:
 
 ```zig
-var scheduler: http.http2.DataScheduler = .{};
-const candidates = [_]http.http2.DataSchedulerCandidate{
+var scheduler: http.http2.scheduler.RoundRobin = .{};
+const candidates = [_]http.http2.scheduler.Candidate{
     .{ .stream_id = 1, .remaining = body1.len, .end_stream = true },
     .{ .stream_id = 3, .remaining = body2.len, .end_stream = true },
 };

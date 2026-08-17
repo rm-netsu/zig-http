@@ -338,10 +338,10 @@ State sizes on x86_64:
 
 | Type | Size |
 | --- | ---: |
-| `http2.StreamManager` | 36 B |
-| `http2.StreamCursor` | 24 B temporary |
+| `http2.streams.Manager` | 36 B |
+| `http2.streams.Existing` | 24 B temporary |
 | `http2.stream.Tracked` | 12 B per stored stream |
-| `http2.StreamReceiveResult` | 1 B |
+| `http2.streams.ReceiveResult` | 1 B |
 
 The manager performs no heap allocation. Store allocation, tombstone retention,
 and reclamation policy remain outside the protocol core.
@@ -394,10 +394,10 @@ New state sizes on x86_64:
 
 | Type | Size |
 | --- | ---: |
-| `http2.ConnectionState` | 8 B |
-| `http2.ConnectionDecoder` | 28 B |
-| `http2.ConnectionCompleteIterator` | 40 B temporary |
-| `http2.PeerState` | 36 B |
+| `http2.connection.State` | 8 B |
+| `http2.connection.Decoder` | 28 B |
+| `http2.connection.CompleteIterator` | 40 B temporary |
+| `http2.peer.State` | 36 B |
 | `http2.stream.Windows` | 8 B |
 | `http2.stream.Tracked` | 12 B |
 | `http2.settings.StreamDecoder` | 7 B |
@@ -450,15 +450,15 @@ Persistent state on x86_64:
 
 | Type | Size |
 | --- | ---: |
-| `http1.HeadParser` | 24 B |
-| `http1.FramedHeadParser` | 48 B |
-| `http1.ChunkDecoder` | 32 B |
-| `http2.FrameDecoder` | 20 B |
-| `http2.FlowWindow` | 4 B |
+| `http1.head.HeadParser` | 24 B |
+| `http1.head.FramedHeadParser` | 48 B |
+| `http1.body.ChunkDecoder` | 32 B |
+| `http2.frame.FrameDecoder` | 20 B |
+| `http2.flow.FlowWindow` | 4 B |
 | `http2.continuation.Guard` | 4 B |
 | `http2.header_block.Collector` | 24 B |
 | `http2.fields.Validator` | 8 B |
-| `http2.CompleteFrameIterator` | 32 B temporary |
+| `http2.frame.CompleteIterator` | 32 B temporary |
 
 ## 0.4.0 versus 0.3.0
 
@@ -466,7 +466,7 @@ Five consecutive ReleaseFast runs were collected from clean worktrees on the sam
 
 | Benchmark | 0.3.0 | 0.4.0 | Change |
 | --- | ---: | ---: | ---: |
-| HTTP/1 legacy head + separate framing | 2.192 M ops/s | 2.931 M ops/s | 1.34x |
+| HTTP/1 split head + separate framing | 2.192 M ops/s | 2.931 M ops/s | 1.34x |
 | HTTP/1 incremental framed head | 3.443 M ops/s | 4.313 M ops/s | 1.25x |
 | HTTP/1 contiguous framed head | 3.472 M ops/s | 6.494 M ops/s | 1.87x |
 | HTTP/2 incremental frame decoder | 280.4 M ops/s | 275.6 M ops/s | ~flat |
@@ -483,14 +483,14 @@ The optimized common validator keeps two 256-byte read-only byte-class tables: o
 
 | Type | Size on x86_64 Linux |
 | --- | ---: |
-| `http1.HeadParser` | 24 B |
-| `http1.ChunkDecoder` | 32 B |
-| `http2.FrameDecoder` | 20 B |
-| `http2.FlowWindow` | 4 B |
+| `http1.head.HeadParser` | 24 B |
+| `http1.body.ChunkDecoder` | 32 B |
+| `http2.frame.FrameDecoder` | 20 B |
+| `http2.flow.FlowWindow` | 4 B |
 | `http2.continuation.Guard` | 4 B |
 | `http2.header_block.Collector` | 24 B |
 | `http2.fields.Validator` | 8 B |
-| `http2.CompleteFrameIterator` | 32 B temporary |
+| `http2.frame.CompleteIterator` | 32 B temporary |
 
 ## Retained implementation choices
 

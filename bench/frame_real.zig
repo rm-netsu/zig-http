@@ -78,7 +78,7 @@ fn buildWire(wire: *Wire) !void {
         wire.offsets[ordinal] = @intCast(pos);
         if (pos + 9 + d.length > wire.bytes.len) return error.TraceTooLarge;
         var encoded: [9]u8 = undefined;
-        try (http.http2.FrameHeader{
+        try (http.http2.frame.FrameHeader{
             .length = d.length,
             .type = d.type,
             .flags = d.flags,
@@ -113,7 +113,7 @@ pub fn rawComplete(io: Io, wire: *const Wire, target: u64) !Result {
         for (ranges) |range| {
             var guard: http.http2.continuation.Guard = .{};
             const bytes = rangeBytes(wire, range);
-            var it = http.http2.CompleteFrameIterator.init(bytes, http.http2.frame.default_max_frame_size);
+            var it = http.http2.frame.CompleteIterator.init(bytes, http.http2.frame.default_max_frame_size);
             while (try it.next()) |complete| {
                 try guard.observe(complete.header);
                 frames += 1;
@@ -132,7 +132,7 @@ pub fn connectionComplete(io: Io, wire: *const Wire, target: u64) !Result {
     const start = now(io);
     for (0..cycles) |_| {
         for (ranges) |range| {
-            var decoder = http.http2.ConnectionDecoder.init(http.http2.frame.default_max_frame_size);
+            var decoder = http.http2.connection.Decoder.init(http.http2.frame.default_max_frame_size);
             const bytes = rangeBytes(wire, range);
             var it = try decoder.complete(bytes);
             while (try it.next()) |complete| {
@@ -152,7 +152,7 @@ pub fn rawFragmented(io: Io, wire: *const Wire, target: u64) !Result {
     const start = now(io);
     for (0..cycles) |cycle| {
         for (ranges, 0..) |range, range_index| {
-            var decoder = http.http2.FrameDecoder.init(http.http2.frame.default_max_frame_size);
+            var decoder = http.http2.frame.FrameDecoder.init(http.http2.frame.default_max_frame_size);
             const bytes = rangeBytes(wire, range);
             var pos: usize = 0;
             var step: usize = @intCast(cycle + range_index * 3);
@@ -183,7 +183,7 @@ pub fn connectionFragmented(io: Io, wire: *const Wire, target: u64) !Result {
     const start = now(io);
     for (0..cycles) |cycle| {
         for (ranges, 0..) |range, range_index| {
-            var decoder = http.http2.ConnectionDecoder.init(http.http2.frame.default_max_frame_size);
+            var decoder = http.http2.connection.Decoder.init(http.http2.frame.default_max_frame_size);
             const bytes = rangeBytes(wire, range);
             var pos: usize = 0;
             var step: usize = @intCast(cycle + range_index * 3);
@@ -237,9 +237,9 @@ pub fn run(init: std.process.Init, comptime which: Case) !void {
     };
     try report(out, name, result);
     try out.print("state sizes: FrameDecoder={d} ConnectionState={d} ConnectionDecoder={d} ConnectionCompleteIterator={d}\n", .{
-        @sizeOf(http.http2.FrameDecoder),
-        @sizeOf(http.http2.ConnectionState),
-        @sizeOf(http.http2.ConnectionDecoder),
-        @sizeOf(http.http2.ConnectionCompleteIterator),
+        @sizeOf(http.http2.frame.FrameDecoder),
+        @sizeOf(http.http2.connection.State),
+        @sizeOf(http.http2.connection.Decoder),
+        @sizeOf(http.http2.connection.CompleteIterator),
     });
 }
