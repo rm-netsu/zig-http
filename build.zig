@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         "http2_client_core",
         "http2_server_core",
         "http2_priority",
+        "error_handling",
     };
     for (example_sources) |name| {
         const example_mod = b.createModule(.{

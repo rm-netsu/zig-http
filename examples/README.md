@@ -13,6 +13,8 @@ without making sockets, TLS, DNS, or an event loop part of the HTTP core.
   synchronous field sinks, stream storage, response HEADERS, and DATA.
 - `http2_priority.zig` — parse and serialize RFC 9218 Priority values and emit a
   PRIORITY_UPDATE frame without introducing scheduling policy.
+- `error_handling.zig` — exhaustive peer-fault scope mapping plus HTTP/1 writer
+  recovery-state checks; see `docs/operations.md` for the full operational model.
 - `support/fixed_stream_store.zig` — complete minimal `Session` store contract.
 - `support/counting_field_sink.zig` — minimal synchronous field-sink contract.
 

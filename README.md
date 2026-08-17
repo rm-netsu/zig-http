@@ -304,6 +304,13 @@ should abandon that HTTP/2 transport rather than retrying against a potentially
 desynchronized wire/compression state. Transport closure, retry policy, logging,
 and timers remain outside core.
 
+For the complete operational recovery matrix — including HTTP/1 parser failure,
+`MessageWriter` preflight versus poisoning, HTTP/2 stream versus connection
+faults, low-level reset fallback before store insertion, buffer lifetimes, and
+sharded ownership ordering — see [`docs/operations.md`](docs/operations.md). The
+compile-tested `examples/error_handling.zig` keeps the public fault-scope pattern
+in the normal `zig build check` gate.
+
 `stream.Windows` is an 8-byte caller-owned pair of send/receive stream windows.
 This keeps the library allocation-free at the connection layer: applications can
 embed `stream.Tracked` records in a slab, hash table, intrusive map, sharded

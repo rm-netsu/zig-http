@@ -16,6 +16,7 @@
         "CHANGELOG.md",
         "BENCHMARKS.md",
         "FUZZING.md",
+        "docs",
         "build_support",
         "examples",
         "test",
