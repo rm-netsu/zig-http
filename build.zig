@@ -21,6 +21,17 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "hpack", .module = hpack_mod }},
     });
 
+    const conformance_mod = b.createModule(.{
+        .root_source_file = b.path("test/conformance/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "http", .module = mod }},
+    });
+    const conformance_exe = b.addExecutable(.{ .name = "http2-conformance-server", .root_module = conformance_mod });
+    const install_conformance = b.addInstallArtifact(conformance_exe, .{});
+    const conformance_server_step = b.step("conformance-server", "Build the cleartext HTTP/2 conformance fixture server");
+    conformance_server_step.dependOn(&install_conformance.step);
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the HTTP library tests");

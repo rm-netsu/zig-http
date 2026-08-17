@@ -17,7 +17,7 @@ pub fn data(header: frame.FrameHeader, payload: []const u8) error{ FrameSize, Pr
     return payload[1 .. payload.len - pad];
 }
 
-pub fn headers(header: frame.FrameHeader, payload: []const u8) error{ FrameSize, Protocol }!HeadersPayload {
+pub fn headers(header: frame.FrameHeader, payload: []const u8) error{ FrameSize, Protocol, StreamProtocol }!HeadersPayload {
     if (header.type != .headers or payload.len != header.length) return error.FrameSize;
     var start: usize = 0;
     var pad: usize = 0;
@@ -38,11 +38,29 @@ pub fn headers(header: frame.FrameHeader, payload: []const u8) error{ FrameSize,
         result.dependency = @intCast(raw & 0x7fff_ffff);
         result.weight = payload[start + 4];
         start += 5;
-        if (result.dependency.? == header.stream_id) return error.Protocol;
+        if (result.dependency.? == header.stream_id) return error.StreamProtocol;
     }
     if (pad > payload.len - start) return error.Protocol;
     result.fragment = payload[start .. payload.len - pad];
     return result;
+}
+
+pub const PriorityPayload = struct {
+    dependency: u31,
+    exclusive: bool,
+    weight: u8,
+};
+
+pub fn priority(header: frame.FrameHeader, bytes: []const u8) error{ FrameSize, StreamProtocol }!PriorityPayload {
+    if (header.type != .priority or bytes.len != header.length or bytes.len != 5) return error.FrameSize;
+    const raw = std.mem.readInt(u32, bytes[0..4], .big);
+    const dependency: u31 = @intCast(raw & 0x7fff_ffff);
+    if (dependency == header.stream_id) return error.StreamProtocol;
+    return .{
+        .dependency = dependency,
+        .exclusive = (raw & 0x8000_0000) != 0,
+        .weight = bytes[4],
+    };
 }
 
 pub const PushPromisePayload = struct {

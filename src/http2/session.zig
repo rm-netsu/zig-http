@@ -21,12 +21,22 @@ pub const Fault = union(enum) {
 };
 
 pub const HeaderSection = struct {
+    /// Parsed Content-Length value. Consult `contentLength()` rather than this
+    /// field directly because zero is itself a valid Content-Length value.
+    content_length: u64 = 0,
     stream_id: u31,
-    kind: fields.Kind,
-    end_stream: bool,
     field_count: u32,
     /// Non-zero only for response field sections.
     status_code: u16 = 0,
+    kind: fields.Kind,
+    end_stream: bool,
+    has_content_length: bool = false,
+
+    /// The caller can feed DATA byte counts into `fields.BodyLength` without
+    /// Session retaining application-message state per stream.
+    pub inline fn contentLength(self: HeaderSection) ?u64 {
+        return if (self.has_content_length) self.content_length else null;
+    }
 };
 
 pub const PushPromise = struct {
@@ -838,9 +848,18 @@ pub const Session = struct {
             .rst_stream => self.receiveReset(store, complete),
             .goaway => self.receiveGoAway(complete),
             .ping => .{ .ping = .{ .ack = (complete.header.flags & 0x01) != 0, .bytes = complete.payload } },
-            .priority => .ignored,
+            .priority => self.receivePriority(complete),
             else => .ignored,
         };
+    }
+
+    fn receivePriority(self: *Session, complete: frame.CompleteFrame) Event {
+        _ = self;
+        _ = payload.priority(complete.header, complete.payload) catch |err| return switch (err) {
+            error.FrameSize => .{ .fault = .{ .stream = .{ .stream_id = complete.header.stream_id, .code = .frame_size_error } } },
+            error.StreamProtocol => .{ .fault = .{ .stream = .{ .stream_id = complete.header.stream_id, .code = .protocol_error } } },
+        };
+        return .ignored;
     }
 
     fn receiveData(self: *Session, store: anytype, complete: frame.CompleteFrame) Event {
@@ -868,6 +887,7 @@ pub const Session = struct {
         const parsed = payload.headers(complete.header, complete.payload) catch |err| return switch (err) {
             error.FrameSize => .{ .fault = .{ .connection = .frame_size_error } },
             error.Protocol => .{ .fault = .{ .connection = .protocol_error } },
+            error.StreamProtocol => .{ .fault = .{ .stream = .{ .stream_id = complete.header.stream_id, .code = .protocol_error } } },
         };
         const end_headers = (complete.header.flags & 0x04) != 0;
         const end_stream = (complete.header.flags & 0x01) != 0;
@@ -913,6 +933,7 @@ pub const Session = struct {
     }
 
     fn finishBlock(self: *Session, store: anytype, pending: Pending, block: []const u8, scratch: []u8, sink: anytype) hpack.codec.Error!Event {
+        const state_result: ?streams_mod.ReceiveResult = if (pending.isPushPromise()) null else self.streams.classifyHeaders(store, pending.streamId());
         const field_kind: fields.Kind = if (pending.isPushPromise()) .request else self.headerKind(store, pending.streamId());
         var validator = fields.Validator.init(field_kind);
         var it = self.decoder.iterator(block, scratch);
@@ -929,7 +950,11 @@ pub const Session = struct {
             };
             const field = next_field orelse break;
             const header: common.Header = .{ .name = field.name, .value = field.value };
-            if (!invalid) {
+            // HPACK must still be consumed for a field block on a stream whose
+            // state is already erroneous. Defer the stream-state result until
+            // decompression completes, but do not let HTTP field semantics
+            // replace STREAM_CLOSED/connection errors required by section 5.1.
+            if ((state_result == null or state_result.? == .accepted) and !invalid) {
                 validator.field(header) catch {
                     invalid = true;
                     continue;
@@ -941,15 +966,32 @@ pub const Session = struct {
                 field_count +|= 1;
             }
         }
+        if (state_result) |result| {
+            if (result == .ignored_after_goaway) return .ignored;
+            if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
+        }
         if (!invalid) {
             validator.finish() catch {
                 invalid = true;
             };
         }
-        if (invalid) return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
+        if (invalid) {
+            // A malformed field section still consumes the peer stream ID and
+            // performs the corresponding state transition. Otherwise a peer
+            // could provoke a stream error on a high identifier and later
+            // open a numerically smaller stream as if the malformed HEADERS
+            // had never existed. The eventual outbound RST_STREAM can then
+            // close this caller-owned stream state normally.
+            if (!pending.isPushPromise()) {
+                const result = self.streams.receiveHeaders(store, pending.streamId(), pending.endStream());
+                if (result == .ignored_after_goaway) return .ignored;
+                if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
+            }
+            return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
+        }
 
         if (pending.isPushPromise()) return self.commitPushPromise(store, pending, field_count);
-        return self.commitHeaders(store, pending, field_kind, status_code, field_count);
+        return self.commitHeaders(store, pending, field_kind, status_code, field_count, validator.content_length);
     }
 
     fn headerKind(self: *Session, store: anytype, stream_id: u31) fields.Kind {
@@ -958,7 +1000,7 @@ pub const Session = struct {
         return if (self.streams.local_role == .server and self.streams.remoteInitiated(stream_id)) .request else .response;
     }
 
-    fn commitHeaders(self: *Session, store: anytype, pending: Pending, field_kind: fields.Kind, status: u16, field_count: u32) Event {
+    fn commitHeaders(self: *Session, store: anytype, pending: Pending, field_kind: fields.Kind, status: u16, field_count: u32, content_length: ?u64) Event {
         const end_stream = pending.endStream();
         const informational = field_kind == .response and status >= 100 and status < 200;
         if ((field_kind == .response and status == 101) or
@@ -981,6 +1023,8 @@ pub const Session = struct {
             .kind = field_kind,
             .end_stream = end_stream,
             .field_count = field_count,
+            .content_length = content_length orelse 0,
+            .has_content_length = content_length != null,
             .status_code = status,
         } };
     }
@@ -1241,6 +1285,111 @@ test "session decodes request response and trailers without growing Tracked" {
     }, &scratch, &sink);
     try std.testing.expectEqual(fields.Kind.trailers, trailers.headers.kind);
     try std.testing.expectEqual(stream_mod.RemoteHeaders.trailers, store.get(1).?.remote_headers);
+}
+
+test "stream state error takes precedence without desynchronizing HPACK" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var block_storage: [4096]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [4096]u8 = undefined;
+
+    const first_fields = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/first" },
+    };
+    const first_block = try encodedFields(allocator, &wire_encoder, &first_fields);
+    defer allocator.free(first_block);
+    _ = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(first_block.len), .type = .headers, .flags = 0x05, .stream_id = 1 },
+        .payload = first_block,
+    }, &scratch, &sink);
+
+    // This is both illegal on the half-closed(remote) stream and semantically
+    // invalid as trailers because it contains pseudo-fields. STREAM_CLOSED has
+    // precedence, but HPACK still has to consume the entire field block.
+    const closed_fields = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/closed" },
+        .{ .name = "x-dynamic", .value = "retained-context" },
+    };
+    const closed_block = try encodedFields(allocator, &wire_encoder, &closed_fields);
+    defer allocator.free(closed_block);
+    const closed = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(closed_block.len), .type = .headers, .flags = 0x05, .stream_id = 1 },
+        .payload = closed_block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.stream_closed, closed.fault.stream.code);
+    try std.testing.expectEqual(@as(u31, 1), closed.fault.stream.stream_id);
+
+    // Reuse the peer encoder context on a fresh stream. If the rejected block
+    // had not been decompressed, an indexed dynamic-table reference here would
+    // fail with COMPRESSION_ERROR instead of yielding a normal request.
+    const fresh_fields = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/fresh" },
+        .{ .name = "x-dynamic", .value = "retained-context" },
+    };
+    const fresh_block = try encodedFields(allocator, &wire_encoder, &fresh_fields);
+    defer allocator.free(fresh_block);
+    const fresh = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(fresh_block.len), .type = .headers, .flags = 0x05, .stream_id = 3 },
+        .payload = fresh_block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(fields.Kind.request, fresh.headers.kind);
+}
+
+test "malformed HEADERS still consume remote stream identifier" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var block_storage: [4096]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [4096]u8 = undefined;
+
+    const malformed_fields = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "" },
+    };
+    const malformed_block = try encodedFields(allocator, &wire_encoder, &malformed_fields);
+    defer allocator.free(malformed_block);
+    const malformed = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(malformed_block.len), .type = .headers, .flags = 0x05, .stream_id = 5 },
+        .payload = malformed_block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, malformed.fault.stream.code);
+    try std.testing.expect(store.get(5) != null);
+    try std.testing.expectEqual(@as(u31, 5), session.streams.highest_remote_stream_id);
+
+    const valid_fields = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/regressed" },
+    };
+    const valid_block = try encodedFields(allocator, &wire_encoder, &valid_fields);
+    defer allocator.free(valid_block);
+    const regressed = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(valid_block.len), .type = .headers, .flags = 0x05, .stream_id = 3 },
+        .payload = valid_block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, regressed.fault.connection);
 }
 
 test "session preserves HPACK through continuation and validates 1xx response phase" {
@@ -2086,4 +2235,46 @@ test "prechecked Session path does not double-charge connection DATA window" {
     const event = try session.receiveCompleteAssumeConnectionChecked(&store, complete, &.{}, &NullSink{});
     try std.testing.expectEqualStrings("abc", event.data.bytes);
     try std.testing.expectEqual(@as(u31, 65_532), session.connection.receive_window.available());
+}
+
+test "session classifies PRIORITY self dependency as stream protocol error" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var header_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &header_storage);
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [64]u8 = undefined;
+    const priority = [_]u8{ 0, 0, 0, 1, 255 };
+
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = 5, .type = .priority, .flags = 0, .stream_id = 1 },
+        .payload = &priority,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, event.fault.stream.code);
+    try std.testing.expectEqual(@as(u31, 1), event.fault.stream.stream_id);
+}
+
+test "session classifies HEADERS priority self dependency as stream protocol error" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var header_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &header_storage);
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [64]u8 = undefined;
+    const priority = [_]u8{ 0, 0, 0, 1, 255 };
+
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = 5, .type = .headers, .flags = 0x24, .stream_id = 1 },
+        .payload = &priority,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, event.fault.stream.code);
+    try std.testing.expectEqual(@as(u31, 1), event.fault.stream.stream_id);
 }

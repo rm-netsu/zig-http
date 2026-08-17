@@ -12,6 +12,10 @@ pub const Validator = struct {
     authority_seen: bool = false,
     status_seen: bool = false,
     method_connect: bool = false,
+    /// Parsed Content-Length for the current initial field section. Keeping
+    /// this on the ephemeral validator lets Session surface HTTP message
+    /// semantics without adding per-stream storage to the protocol engine.
+    content_length: ?u64 = null,
 
     pub fn init(kind: Kind) Validator {
         return .{ .kind = kind };
@@ -25,7 +29,7 @@ pub const Validator = struct {
             if (self.regular_seen or self.kind == .trailers) return error.InvalidHeader;
             switch (h.name.len) {
                 5 => {
-                    if (!std.mem.eql(u8, h.name, ":path") or self.kind != .request or self.path_seen)
+                    if (!std.mem.eql(u8, h.name, ":path") or self.kind != .request or self.path_seen or h.value.len == 0)
                         return error.InvalidHeader;
                     self.path_seen = true;
                 },
@@ -83,6 +87,15 @@ pub const Validator = struct {
                 if (std.mem.eql(u8, h.name, "connection") or std.mem.eql(u8, h.name, "keep-alive"))
                     return error.InvalidHeader;
             },
+            14 => if (std.mem.eql(u8, h.name, "content-length")) {
+                if (self.kind == .trailers) return error.InvalidHeader;
+                const length = parseContentLength(h.value) orelse return error.InvalidHeader;
+                if (self.content_length) |previous| {
+                    if (previous != length) return error.InvalidHeader;
+                } else {
+                    self.content_length = length;
+                }
+            },
             16 => if (std.mem.eql(u8, h.name, "proxy-connection")) return error.InvalidHeader,
             17 => if (std.mem.eql(u8, h.name, "transfer-encoding")) return error.InvalidHeader,
             else => {},
@@ -102,6 +115,46 @@ pub const Validator = struct {
         }
     }
 };
+
+/// Caller-owned HTTP message-body length validation. HTTP/2 framing knows the
+/// bytes carried by DATA, but retaining application message metadata for every
+/// stream is policy/state ownership that Session deliberately leaves outside
+/// the connection engine. Consumers that care about Content-Length semantics
+/// can keep this tiny helper next to their own stream/application record.
+pub const BodyLength = struct {
+    expected: ?u64 = null,
+    received: u64 = 0,
+
+    pub inline fn init(expected: ?u64) BodyLength {
+        return .{ .expected = expected };
+    }
+
+    pub fn receive(self: *BodyLength, byte_count: usize, end_stream: bool) error{Protocol}!void {
+        const count: u64 = @intCast(byte_count);
+        self.received = std.math.add(u64, self.received, count) catch return error.Protocol;
+        if (self.expected) |expected| {
+            if (self.received > expected) return error.Protocol;
+            if (end_stream and self.received != expected) return error.Protocol;
+        }
+    }
+
+    pub fn finish(self: BodyLength) error{Protocol}!void {
+        if (self.expected) |expected| {
+            if (self.received != expected) return error.Protocol;
+        }
+    }
+};
+
+fn parseContentLength(value: []const u8) ?u64 {
+    if (value.len == 0) return null;
+    var result: u64 = 0;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        result = std.math.mul(u64, result, 10) catch return null;
+        result = std.math.add(u64, result, c - '0') catch return null;
+    }
+    return result;
+}
 
 fn validFieldValue(value: []const u8) bool {
     if (value.len != 0) {
@@ -133,6 +186,13 @@ test "HTTP/2 header validation" {
     try std.testing.expectError(error.InvalidHeader, v.field(.{ .name = ":authority", .value = "late.example" }));
 }
 
+test "HTTP/2 request path cannot be empty" {
+    var v = Validator.init(.request);
+    try v.field(.{ .name = ":method", .value = "GET" });
+    try v.field(.{ .name = ":scheme", .value = "https" });
+    try std.testing.expectError(error.InvalidHeader, v.field(.{ .name = ":path", .value = "" }));
+}
+
 test "CONNECT pseudo-header rules" {
     var v = Validator.init(.request);
     try v.field(.{ .name = ":method", .value = "CONNECT" });
@@ -158,4 +218,39 @@ test "HTTP/2 response status pseudo-header" {
     var v = Validator.init(.response);
     try v.field(.{ .name = ":status", .value = "204" });
     try v.finish();
+}
+
+test "HTTP/2 content-length parsing and duplicate validation" {
+    var v = Validator.init(.request);
+    try v.field(.{ .name = ":method", .value = "POST" });
+    try v.field(.{ .name = ":scheme", .value = "https" });
+    try v.field(.{ .name = ":path", .value = "/" });
+    try v.field(.{ .name = "content-length", .value = "42" });
+    try v.field(.{ .name = "content-length", .value = "42" });
+    try std.testing.expectEqual(@as(?u64, 42), v.content_length);
+    try std.testing.expectError(error.InvalidHeader, v.field(.{ .name = "content-length", .value = "43" }));
+
+    var malformed = Validator.init(.trailers);
+    try std.testing.expectError(error.InvalidHeader, malformed.field(.{ .name = "content-length", .value = "1" }));
+
+    var overflow = Validator.init(.request);
+    try std.testing.expectError(error.InvalidHeader, overflow.field(.{ .name = "content-length", .value = "18446744073709551616" }));
+}
+
+test "HTTP/2 body length validates DATA bytes at end stream" {
+    var exact = BodyLength.init(7);
+    try exact.receive(3, false);
+    try exact.receive(4, true);
+    try exact.finish();
+
+    var too_long = BodyLength.init(1);
+    try std.testing.expectError(error.Protocol, too_long.receive(4, true));
+
+    var too_short = BodyLength.init(5);
+    try too_short.receive(4, false);
+    try std.testing.expectError(error.Protocol, too_short.finish());
+
+    var unrestricted = BodyLength.init(null);
+    try unrestricted.receive(1024, true);
+    try unrestricted.finish();
 }

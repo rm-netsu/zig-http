@@ -3,6 +3,9 @@ const std = @import("std");
 pub const default_max_frame_size: u32 = 16_384;
 pub const max_frame_size: u32 = 16_777_215;
 
+pub const ValidationError = error{ FrameSize, Protocol };
+pub const ErrorScope = enum { connection, stream };
+
 pub const Type = enum(u8) {
     data = 0x0,
     headers = 0x1,
@@ -43,7 +46,21 @@ pub const FrameHeader = struct {
         std.mem.writeInt(u32, out[5..9], self.stream_id, .big);
     }
 
-    pub inline fn validate(self: FrameHeader, peer_max_frame_size: u32) error{ FrameSize, Protocol }!void {
+    /// Classifies a frame-header validation failure at the HTTP/2 error scope.
+    /// RFC 9113 section 4.2 makes most stream-associated frame-size failures
+    /// stream errors, while field-block frames, SETTINGS, RST_STREAM,
+    /// WINDOW_UPDATE, and any connection-scoped frame require a connection
+    /// error. Header-level
+    /// PROTOCOL_ERROR conditions are always connection errors.
+    pub inline fn validationErrorScope(self: FrameHeader, err: ValidationError) ErrorScope {
+        if (err == error.Protocol or self.stream_id == 0) return .connection;
+        return switch (self.type) {
+            .headers, .push_promise, .continuation, .settings, .rst_stream, .window_update => .connection,
+            else => .stream,
+        };
+    }
+
+    pub inline fn validate(self: FrameHeader, peer_max_frame_size: u32) ValidationError!void {
         if (self.length > peer_max_frame_size) return error.FrameSize;
         switch (self.type) {
             .data => {
@@ -300,4 +317,25 @@ test "complete iterator scans frames and leaves an incomplete tail" {
     try std.testing.expectEqualStrings("bc", b.payload);
     try std.testing.expect((try it.next()) == null);
     try std.testing.expectEqual(@as(usize, 21), it.consumed());
+}
+
+test "frame validation exposes RFC error scope" {
+    const oversized_data: FrameHeader = .{ .length = default_max_frame_size + 1, .type = .data, .flags = 0, .stream_id = 1 };
+    try std.testing.expectError(error.FrameSize, oversized_data.validate(default_max_frame_size));
+    try std.testing.expectEqual(ErrorScope.stream, oversized_data.validationErrorScope(error.FrameSize));
+
+    const oversized_headers: FrameHeader = .{ .length = default_max_frame_size + 1, .type = .headers, .flags = 0x04, .stream_id = 1 };
+    try std.testing.expectEqual(ErrorScope.connection, oversized_headers.validationErrorScope(error.FrameSize));
+
+    const short_priority: FrameHeader = .{ .length = 4, .type = .priority, .flags = 0, .stream_id = 1 };
+    try std.testing.expectEqual(ErrorScope.stream, short_priority.validationErrorScope(error.FrameSize));
+
+    const short_reset: FrameHeader = .{ .length = 3, .type = .rst_stream, .flags = 0, .stream_id = 1 };
+    try std.testing.expectEqual(ErrorScope.connection, short_reset.validationErrorScope(error.FrameSize));
+
+    const short_window: FrameHeader = .{ .length = 3, .type = .window_update, .flags = 0, .stream_id = 1 };
+    try std.testing.expectEqual(ErrorScope.connection, short_window.validationErrorScope(error.FrameSize));
+
+    const zero_stream: FrameHeader = .{ .length = 5, .type = .priority, .flags = 0, .stream_id = 0 };
+    try std.testing.expectEqual(ErrorScope.connection, zero_stream.validationErrorScope(error.Protocol));
 }

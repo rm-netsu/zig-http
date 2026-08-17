@@ -626,6 +626,10 @@ HPACK is fetched from `https://github.com/rm-netsu/zig-hpack` and pinned by both
 zig build test
 zig build test -Doptimize=ReleaseFast
 zig build test -Doptimize=ReleaseSafe -Dsanitize-thread=true
+zig build conformance-server
+./test/conformance/run-rfc-smoke.sh
+./test/conformance/run-external-interop.sh
+H2SPEC_BIN=/path/to/h2spec ./test/conformance/run-h2spec.sh
 zig build bench -Doptimize=ReleaseFast
 zig build bench-real -Doptimize=ReleaseFast
 zig build bench-real-frames -Doptimize=ReleaseFast
@@ -638,7 +642,7 @@ zig build bench-real-dispatch -Doptimize=ReleaseFast
 zig build bench-real-send-offer -Doptimize=ReleaseFast
 ```
 
-The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`.
+The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`. HTTP/2 conformance and external interoperability setup is documented in `test/conformance/README.md`.
 
 ## Scope
 

@@ -649,12 +649,30 @@ pub const Manager = struct {
     /// have succeeded. A new idle stream can only be opened by a client, so an
     /// idle server-initiated identifier received by a client is a connection
     /// PROTOCOL_ERROR.
+    pub fn classifyHeaders(self: Manager, store: anytype, stream_id: u31) ReceiveResult {
+        if (stream_id == 0) return .connection_protocol;
+        if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
+        if (store.get(stream_id)) |tracked| {
+            return switch (tracked.stream.state) {
+                .idle, .open, .half_closed_local => .accepted,
+                .reserved_remote => if (self.remoteLimitAvailable()) .accepted else .refused_stream,
+                .half_closed_remote, .closed => .stream_closed,
+                .reserved_local => .connection_protocol,
+            };
+        }
+
+        if (!self.remoteInitiated(stream_id)) return .connection_protocol;
+        if (self.local_role != .server) return .connection_protocol;
+        if (stream_id <= self.highest_remote_stream_id) return .connection_protocol;
+        if (!self.remoteLimitAvailable()) return .refused_stream;
+        return .accepted;
+    }
+
     pub fn receiveHeaders(self: *Manager, store: anytype, stream_id: u31, end_stream: bool) ReceiveResult {
         if (stream_id == 0) return .connection_protocol;
         if (self.ignoredAfterGoAway(stream_id)) return .ignored_after_goaway;
         if (store.get(stream_id)) |tracked| return self.receiveHeadersTracked(stream_id, tracked, end_stream);
 
-        if (self.absentClosed(stream_id)) return .stream_closed;
         if (!self.remoteInitiated(stream_id)) return .connection_protocol;
         // Servers can accept client-created request streams. Clients cannot
         // receive an unsolicited server-created HEADERS stream; server streams
@@ -904,7 +922,16 @@ test "server accepts monotonically increasing client streams and closes skipped 
     const skipped = manager.receiveReset(&store, 3);
     try std.testing.expectEqual(ReceiveResult.accepted, skipped);
     const reused = manager.receiveHeaders(&store, 3, true);
-    try std.testing.expectEqual(ReceiveResult.stream_closed, reused);
+    try std.testing.expectEqual(ReceiveResult.connection_protocol, reused);
+}
+
+test "HEADERS classification observes state without mutating it" {
+    var manager = Manager.init(.server, .{});
+    var store: TestStore = .{};
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.classifyHeaders(&store, 1));
+    try std.testing.expectEqual(ReceiveResult.accepted, manager.receiveHeaders(&store, 1, true));
+    try std.testing.expectEqual(ReceiveResult.stream_closed, manager.classifyHeaders(&store, 1));
+    try std.testing.expectEqual(State.half_closed_remote, store.get(1).?.stream.state);
 }
 
 test "server enforces local concurrent stream limit with REFUSED_STREAM" {
