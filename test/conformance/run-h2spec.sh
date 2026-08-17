@@ -9,6 +9,15 @@ if [ -z "$H2SPEC" ]; then
     exit 2
 fi
 
+H2SPEC_VERSION=$("$H2SPEC" --version 2>&1 || true)
+case "$H2SPEC_VERSION" in
+    *"Version: 2.6.0 "*) ;;
+    *)
+        echo "h2spec v2.6.0 is required; got: ${H2SPEC_VERSION:-unknown version}" >&2
+        exit 2
+        ;;
+esac
+
 # h2spec 2.6.0 invokes terminal cleanup code even when stdout is redirected.
 # A non-interactive CI environment commonly has no TERM, which can turn an
 # otherwise successful run into a spurious non-zero process exit.
