@@ -4,7 +4,7 @@ The package is pre-1.0 and intentionally removes obsolete compatibility surfaces
 rather than carrying aliases indefinitely. Release notes remain authoritative;
 this document highlights source-level migration patterns.
 
-## Current pre-1.0 hardening
+## 0.16.x to 0.17.x
 
 ### Route HTTP/1 requests with `effective_authority`
 
@@ -34,6 +34,8 @@ writing. The raw `http1.write.responseHead()` remains a syntax-level escape hatc
 HTTP/1 request-target and HTTP/2 pseudo-field validation now share `http.uri`.
 Malformed percent escapes, authority syntax, IP literals, and HTTP(S) userinfo
 therefore have one implementation and one behavior across protocol versions.
+
+## 0.17.x to 0.18.x
 
 ### HTTP/2 Session store and field sink contracts
 

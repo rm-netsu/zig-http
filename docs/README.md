@@ -10,6 +10,8 @@ TLS, event-loop, or thread-pool implementation.
   and composition-level selection.
 - [`../examples/README.md`](../examples/README.md) — compile-tested executable
   examples and minimal support types.
+- [`architecture.md`](architecture.md) — protocol/core boundary, composition
+  levels, memory model, and low-level module map.
 - [`http1.md`](http1.md) — HTTP/1.1 receive/send composition and lower-level
   escape hatches.
 - [`http2.md`](http2.md) — HTTP/2 Session, lower-level connection/stream
@@ -41,8 +43,8 @@ operational expectations that cannot be expressed by signatures alone.
 
 - `zig build check` — dependency-light merge gate.
 - `zig build conformance` — HTTP/1 interoperability plus HTTP/2 RFC smoke and bidirectional external interoperability.
-- `H2SPEC_BIN=/path/to/h2spec zig build conformance-h2spec` — strict upstream h2spec.
+- `H2SPEC_BIN=/path/to/h2spec zig build conformance-h2spec` — strict upstream h2spec v2.6.0.
 - `zig build all-checks` — merge gate, generated API docs, and reproducible external conformance.
-- `H2SPEC_BIN=/path/to/h2spec zig build release-checks` — `all-checks` followed serially by strict upstream h2spec; intended as the release gate.
+- `H2SPEC_BIN=/path/to/h2spec zig build release-checks` — `all-checks` followed serially by strict upstream h2spec v2.6.0; intended as the release gate.
 
 Granular conformance scripts and build targets remain available for focused debugging.
