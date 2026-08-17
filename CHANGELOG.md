@@ -2,10 +2,14 @@
 
 ## Unreleased
 
+## 0.18.0
+
 - Make composed HTTP/2 message receive semantics fail-closed with caller-owned `BodyState`: Session now rejects DATA before final response headers, correlates HEAD/CONNECT request methods, validates Content-Length against DATA content octets through END_STREAM/trailers, rejects non-empty DATA for no-content messages, and opens CONNECT tunnel DATA only after a successful response without increasing the 12-byte `Tracked` record.
 - Enforce normalized HTTP/2 `Host` / `:authority` consistency on shared receive/send field validation, including case, default-port, percent-encoding, and IPv6 textual normalization without retaining callback-lifetime HPACK slices.
 - Make the HTTP/2 field-sink contract transactional (`begin` / `field` / `commit` / `abort`) so late semantic/HPACK/stream failures cannot accidentally publish a partial header section.
 - Add `zig build release-checks`, which serializes the normal `all-checks` gate before strict upstream h2spec instead of allowing a release to omit the explicit h2spec target.
+- Replace the oversized root README with a compact package landing page and move architecture/composition details into `docs/architecture.md`; reorganize migration guidance around explicit release-to-release transitions.
+- Verify the strict release fixture against upstream h2spec v2.6.0: 147/147 tests pass with zero skips or failures, and pin the release script to that suite version for reproducible release gates.
 
 ## 0.17.0
 
