@@ -15,9 +15,65 @@ High-performance, allocation-conscious HTTP/1.1 and HTTP/2 protocol primitives f
 - Protocol objects contain no process-global mutable state. Independent connections are naturally shardable across threads; one HTTP/2 connection still has ordered connection/HPACK state and therefore has one logical mutator at a time unless the caller supplies equivalent synchronization.
 - An optional 128-byte `Session` composes complete-frame parsing, HPACK decode, field semantics, stream transitions, peer SETTINGS/GOAWAY, flow accounting, and state-aware outbound control frames without owning either HPACK allocators or the stream table.
 - HTTP/1 bodies and HTTP/2 frame payloads are streamed without whole-message buffering.
+- An optional allocation-free HTTP/1 `ConnectionDecoder` composes head parsing, strict request semantics, message framing, informational/final response sequencing, HEAD/CONNECT handling, trailers, persistence, and close-delimited EOF without owning I/O or a client pipeline queue.
 - Strict HTTP/1 framing checks reject ambiguous `Transfer-Encoding` / `Content-Length` input.
 - HPACK is provided by the standalone `hpack` package, with explicit memory and decode limits.
 - `std.Io.Writer` is used by serialization APIs from Zig 0.16.0.
+
+## Choosing a composition level
+
+The package does not require one architecture. Pick the highest level that owns
+only state you actually want the HTTP engine to manage:
+
+- HTTP/1 messages on an existing byte stream: `http1.ConnectionDecoder` is the
+  recommended coordinator. Use `parseRequest` / `parseResponse`,
+  `FramedHeadParser`, `ChunkDecoder`, and the writers directly when an existing
+  runtime already owns more of the message state machine.
+- HTTP/2 connection engine: `http2.Session` is the recommended composed path
+  over caller-owned HPACK objects and stream storage.
+- HTTP/2 custom/sharded runtimes: compose `connection`, `peer`, `streams`,
+  `dispatch`, `send`, frame, flow, and field primitives independently. No
+  scheduler, storage layout, queue, or synchronization strategy is mandatory.
+
+None of these levels opens sockets, performs TLS/DNS, registers timers, or owns
+an event loop.
+
+## HTTP/1 connection/message coordination
+
+`ConnectionDecoder` connects the HTTP/1 protocol pieces without becoming a
+transport abstraction. Scratch storage is caller-owned and events borrow input
+or scratch bytes:
+
+```zig
+var decoder = http.http1.ConnectionDecoder.initRequest(
+    &head_storage,
+    &chunk_line_storage,
+    .{},
+);
+
+var remaining = input;
+while (remaining.len != 0) {
+    const result = try decoder.feed(remaining);
+    remaining = remaining[result.consumed..];
+    if (result.event) |event| {
+        // HEAD, body DATA, trailers, or message completion.
+        _ = event;
+    }
+    if (result.consumed == 0 and result.event == null) break;
+}
+```
+
+Request mode applies RFC 9112 request-target and Host semantics by default.
+Callers implementing diagnostics, proxies with specialized policy, or other
+low-level tooling can use `.{ .validate_requests = false }` and apply their
+own semantics; the syntax/framing parsers remain independently usable.
+
+Response mode deliberately does not own a request queue. Bind the next response
+to caller-owned request context with `beginResponse(method)`. Informational 1xx
+responses retain that context, HEAD and successful CONNECT use the correct body
+semantics, `101`/successful CONNECT expose the protocol-switch boundary without
+consuming tunnel bytes, and close-delimited completion is reported by
+`finish()` when the caller observes transport EOF.
 
 ## HTTP/1 fast paths
 
@@ -120,6 +176,12 @@ store only their signed adjustment relative to the peer's current
 `SETTINGS_INITIAL_WINDOW_SIZE`, so normal initial-window changes do not mutate
 every stream record. `settings.StreamDecoder` handles SETTINGS values that
 themselves cross transport reads using only seven bytes of state.
+
+RFC 8441 Extended CONNECT is handled as HTTP/2 protocol state rather than as a
+WebSocket abstraction. `SETTINGS_ENABLE_CONNECT_PROTOCOL` is tracked per
+connection, `:protocol` is validated as part of request pseudo-header semantics,
+and Session gates Extended CONNECT on negotiated capability. The selected
+application protocol and tunnel bytes remain entirely caller-owned.
 
 `stream.Windows` is an 8-byte caller-owned pair of send/receive stream windows.
 This keeps the library allocation-free at the connection layer: applications can
@@ -601,8 +663,10 @@ advanced.
 ## Modules
 
 - `http1/head.zig` — contiguous and incremental request/response head parsing with body framing.
-- `http1/body.zig` — fixed-length and streaming chunked-body decoding.
-- `http1/write.zig` — request/response and chunk serialization.
+- `http1/semantics.zig` — opt-out request-target/Host and persistence semantics.
+- `http1/connection.zig` — allocation-free receive-side message/connection coordinator over caller-owned buffers and request context.
+- `http1/body.zig` — fixed-length and streaming chunked-body decoding with strict chunk-extension grammar.
+- `http1/write.zig` — HTTP/1.0/1.1 request/response and chunk serialization.
 - `http2/frame.zig` — contiguous, batched, and incremental zero-copy frame parsing plus frame serialization.
 - `http2/connection.zig` — allocation-free connection receive state and complete/fragmented frame integration.
 - `http2/peer.zig` — peer SETTINGS, send-window, outbound constraints, and GOAWAY state.
@@ -624,9 +688,11 @@ HPACK is fetched from `https://github.com/rm-netsu/zig-hpack` and pinned by both
 
 ```sh
 zig build test
+zig build check
 zig build test -Doptimize=ReleaseFast
 zig build test -Doptimize=ReleaseSafe -Dsanitize-thread=true
-zig build conformance-server
+zig build conformance-fixtures
+./test/conformance/run-http1-interop.sh
 ./test/conformance/run-rfc-smoke.sh
 ./test/conformance/run-external-interop.sh
 H2SPEC_BIN=/path/to/h2spec ./test/conformance/run-h2spec.sh
@@ -642,7 +708,7 @@ zig build bench-real-dispatch -Doptimize=ReleaseFast
 zig build bench-real-send-offer -Doptimize=ReleaseFast
 ```
 
-The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`. HTTP/2 conformance and external interoperability setup is documented in `test/conformance/README.md`.
+The package exports module `http`. Benchmark methodology and current results are documented in `BENCHMARKS.md`. HTTP/1/HTTP/2 conformance and bidirectional external interoperability setup is documented in `test/conformance/README.md`.
 
 ## Scope
 

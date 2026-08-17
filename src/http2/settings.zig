@@ -8,6 +8,7 @@ pub const Id = enum(u16) {
     initial_window_size = 0x4,
     max_frame_size = 0x5,
     max_header_list_size = 0x6,
+    enable_connect_protocol = 0x8,
     _,
 };
 
@@ -80,6 +81,9 @@ pub const Settings = struct {
     initial_window_size: u31 = 65_535,
     max_frame_size: u32 = frame.default_max_frame_size,
     max_header_list_size: u32 = std.math.maxInt(u32),
+    /// RFC 8441 Extended CONNECT capability advertised by the peer. Once
+    /// enabled it is effectively monotonic for the lifetime of a connection.
+    enable_connect_protocol: bool = false,
 
     pub fn apply(self: *Settings, s: Setting) error{ Protocol, FlowControl }!void {
         switch (s.id) {
@@ -99,6 +103,11 @@ pub const Settings = struct {
                 self.max_frame_size = s.value;
             },
             .max_header_list_size => self.max_header_list_size = s.value,
+            .enable_connect_protocol => switch (s.value) {
+                0 => {}, // A peer is forbidden from withdrawing value 1; keep effective state monotonic.
+                1 => self.enable_connect_protocol = true,
+                else => return error.Protocol,
+            },
             else => {},
         }
     }
@@ -114,6 +123,13 @@ test "settings validation" {
     try s.apply(.{ .id = .max_frame_size, .value = 32768 });
     try std.testing.expectEqual(@as(u32, 32768), s.max_frame_size);
     try std.testing.expectError(error.Protocol, s.apply(.{ .id = .enable_push, .value = 2 }));
+    try s.apply(.{ .id = .enable_connect_protocol, .value = 1 });
+    try std.testing.expect(s.enable_connect_protocol);
+    // RFC 8441 makes enablement monotonic. A non-conforming peer cannot make
+    // an already enabled connection lose the capability by sending zero.
+    try s.apply(.{ .id = .enable_connect_protocol, .value = 0 });
+    try std.testing.expect(s.enable_connect_protocol);
+    try std.testing.expectError(error.Protocol, s.apply(.{ .id = .enable_connect_protocol, .value = 2 }));
 }
 
 test "streaming settings decoder handles split setting" {

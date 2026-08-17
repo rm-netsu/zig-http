@@ -23,3 +23,5 @@ body=$(curl --http2-prior-knowledge --silent --show-error --fail --max-time 5 "h
     exit 1
 }
 echo "curl/libnghttp2 interoperability: PASS"
+
+"$CONFORMANCE_DIR/run-external-client-interop.sh"

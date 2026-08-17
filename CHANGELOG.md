@@ -6,6 +6,12 @@
 - Replace naive `Transfer-Encoding` comma splitting with an allocation-free scanner that respects quoted-string commas and validates parameter syntax.
 - Reject `Transfer-Encoding` on HTTP/1.0 requests and responses consistently across contiguous, incremental, and framed parser paths.
 - Add a reproducible Zig 0.16.0 builtin-fuzz workaround using a fuzz-only vendored test runner, plus a stateful `FlowWindow` reference-model fuzz target.
+- Add allocation-free HTTP/1 `ConnectionDecoder` composition over caller-owned storage, including strict request semantics, persistence, informational/final response sequencing, HEAD/CONNECT protocol switches, fixed/chunked/close-delimited bodies, trailers, and pipelined message boundaries without owning I/O or request queues.
+- Add opt-out HTTP/1 request-target/Host validation, strict RFC 9112 chunk-extension grammar, and explicit HTTP/1.0 serialization while keeping the raw syntax/framing APIs independently usable.
+- Expand deterministic fuzz/property coverage to five targets spanning fragmented HTTP/1 request/response parsing, chunk decoding, HTTP/2 frame decoding, and flow-control state.
+- Add bidirectional external interoperability for both HTTP/1 and HTTP/2: curl/Python/hyper-h2 exercise Zig server fixtures and Zig protocol clients exercise independent Python/hyper-h2 servers.
+- Add RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL` and Extended CONNECT `:protocol` semantics with per-connection negotiation; application protocols such as WebSocket remain outside the HTTP core.
+- Add `zig build check` as a dependency-free unit/property/fixture-compilation gate and keep full h2spec/external stacks as explicit optional test commands.
 
 ## 0.15.0
 

@@ -358,6 +358,10 @@ pub const Manager = struct {
     remote_active: u32 = 0,
     local_limits: LocalLimits = .{},
     local_role: Role,
+    // RFC 8441 capability this endpoint has actually advertised on the wire.
+    // It lives here beside local role/policy state and consumes existing
+    // alignment padding rather than growing Session.
+    extended_connect_advertised: bool = false,
     // Bit 31 cannot occur in an HTTP/2 stream identifier and therefore acts as
     // an allocation-free "no local GOAWAY sent" sentinel.
     local_goaway_last_stream_id: u32 = no_goaway,
@@ -384,6 +388,16 @@ pub const Manager = struct {
 
     pub fn init(local_role: Role, local_limits: LocalLimits) Manager {
         return .{ .local_role = local_role, .local_limits = local_limits };
+    }
+
+    pub inline fn extendedConnectAdvertised(self: Manager) bool {
+        return self.extended_connect_advertised;
+    }
+
+    pub inline fn setExtendedConnectAdvertised(self: *Manager, enabled: bool) void {
+        // RFC 8441 capability cannot be withdrawn once value 1 is sent.
+        std.debug.assert(!self.extended_connect_advertised or enabled);
+        self.extended_connect_advertised = enabled;
     }
 
     pub inline fn localInitiated(self: Manager, stream_id: u31) bool {

@@ -1,20 +1,32 @@
 const std = @import("std");
 const common = @import("../common.zig");
+const head = @import("head.zig");
 
 pub const Error = std.Io.Writer.Error || error{InvalidHeader};
 
 pub fn requestHead(w: *std.Io.Writer, method: []const u8, target: []const u8, headers: []const common.Header) Error!void {
+    return requestHeadVersion(w, .http_1_1, method, target, headers);
+}
+
+pub fn requestHeadVersion(w: *std.Io.Writer, version: head.Version, method: []const u8, target: []const u8, headers: []const common.Header) Error!void {
     if (!common.isToken(method) or !validTarget(target)) return error.InvalidHeader;
     try w.writeAll(method);
     try w.writeByte(' ');
     try w.writeAll(target);
-    try w.writeAll(" HTTP/1.1\r\n");
+    try w.writeByte(' ');
+    try writeVersion(w, version);
+    try w.writeAll("\r\n");
     try writeHeaders(w, headers);
 }
 
 pub fn responseHead(w: *std.Io.Writer, status: u16, reason: []const u8, headers: []const common.Header) Error!void {
+    return responseHeadVersion(w, .http_1_1, status, reason, headers);
+}
+
+pub fn responseHeadVersion(w: *std.Io.Writer, version: head.Version, status: u16, reason: []const u8, headers: []const common.Header) Error!void {
     if (status < 100 or status > 999 or !validReason(reason)) return error.InvalidHeader;
-    try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, reason });
+    try writeVersion(w, version);
+    try w.print(" {d} {s}\r\n", .{ status, reason });
     try writeHeaders(w, headers);
 }
 
@@ -50,4 +62,22 @@ fn validTarget(target: []const u8) bool {
 
 fn validReason(reason: []const u8) bool {
     return common.isFieldValue(reason);
+}
+
+fn writeVersion(w: *std.Io.Writer, version: head.Version) std.Io.Writer.Error!void {
+    try w.writeAll(switch (version) {
+        .http_1_0 => "HTTP/1.0",
+        .http_1_1 => "HTTP/1.1",
+    });
+}
+
+test "writers support explicit HTTP/1.0 without changing HTTP/1.1 convenience path" {
+    var storage: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    try requestHeadVersion(&writer, .http_1_0, "GET", "/", &.{});
+    try std.testing.expectEqualStrings("GET / HTTP/1.0\r\n\r\n", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&storage);
+    try responseHead(&writer, 204, "No Content", &.{});
+    try std.testing.expectEqualStrings("HTTP/1.1 204 No Content\r\n\r\n", writer.buffered());
 }

@@ -13,6 +13,8 @@ test {
     _ = http1.head.HeadParser;
     _ = http1.head.FramedHeadParser;
     _ = http1.body.ChunkDecoder;
+    _ = http1.semantics.validateRequest;
+    _ = http1.connection.Decoder;
     _ = http1.write.requestHead;
 
     _ = http2.frame.FrameDecoder;

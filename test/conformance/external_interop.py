@@ -103,10 +103,65 @@ def run(host: str, port: int) -> None:
         sock.close()
 
 
+def run_extended_connect(host: str, port: int) -> None:
+    authority = f"{host}:{port}"
+    conn = H2Connection(config=H2Configuration(client_side=True, header_encoding="utf-8"))
+    sock = socket.create_connection((host, port), timeout=3)
+    sock.settimeout(3)
+    try:
+        conn.initiate_connection()
+        send_fragmented(sock, conn.data_to_send())
+
+        while conn.remote_settings.enable_connect_protocol != 1:
+            wire = sock.recv(65535)
+            if not wire:
+                raise RuntimeError("server closed before advertising Extended CONNECT")
+            conn.receive_data(wire)
+            pending = conn.data_to_send()
+            if pending:
+                send_fragmented(sock, pending)
+
+        headers = [
+            (":method", "CONNECT"),
+            (":protocol", "websocket"),
+            (":scheme", "http"),
+            (":authority", authority),
+            (":path", "/extended"),
+        ]
+        conn.send_headers(1, headers, end_stream=True)
+        send_fragmented(sock, conn.data_to_send())
+
+        result = Result()
+        while not result.ended:
+            wire = sock.recv(65535)
+            if not wire:
+                raise RuntimeError("server closed before Extended CONNECT response completed")
+            for event in conn.receive_data(wire):
+                if isinstance(event, ResponseReceived) and event.stream_id == 1:
+                    result.status = dict(event.headers).get(":status")
+                elif isinstance(event, DataReceived) and event.stream_id == 1:
+                    result.body.extend(event.data)
+                    conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                elif isinstance(event, StreamEnded) and event.stream_id == 1:
+                    result.ended = True
+            pending = conn.data_to_send()
+            if pending:
+                send_fragmented(sock, pending)
+
+        if result.status != "200" or bytes(result.body) != b"zig-http":
+            raise AssertionError(
+                f"Extended CONNECT: expected status=200 body=b'zig-http', "
+                f"got status={result.status!r} body={bytes(result.body)!r}"
+            )
+    finally:
+        sock.close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
     args = parser.parse_args()
     run(args.host, args.port)
-    print("hyper-h2 interoperability: PASS")
+    run_extended_connect(args.host, args.port)
+    print("hyper-h2 interoperability (including RFC 8441 Extended CONNECT): PASS")

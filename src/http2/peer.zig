@@ -37,6 +37,7 @@ pub const State = struct {
         initial_window: InitialWindowChange,
         max_frame_size: u32,
         max_header_list_size: u32,
+        enable_connect_protocol: bool,
     };
 
     pub const StreamWindowUpdate = struct {
@@ -98,6 +99,10 @@ pub const State = struct {
             .max_header_list_size => {
                 try self.settings.apply(setting);
                 return .{ .max_header_list_size = self.settings.max_header_list_size };
+            },
+            .enable_connect_protocol => {
+                try self.settings.apply(setting);
+                return .{ .enable_connect_protocol = self.settings.enable_connect_protocol };
             },
             else => return .none,
         }

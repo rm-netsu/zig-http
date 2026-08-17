@@ -206,7 +206,10 @@ fn handleConnection(io: std.Io, stream: net.Stream) !void {
     var session = h2.Session.init(.server, .{ .max_concurrent_streams = max_concurrent_streams }, &decoder, &encoder, header_storage);
     var store: Store = .{};
     var settings_sync: h2.SessionSettingsSync = .{};
-    const local_settings = [_]h2.settings.Setting{.{ .id = .max_concurrent_streams, .value = max_concurrent_streams }};
+    const local_settings = [_]h2.settings.Setting{
+        .{ .id = .max_concurrent_streams, .value = max_concurrent_streams },
+        .{ .id = .enable_connect_protocol, .value = 1 },
+    };
     _ = try session.sendSettings(&settings_sync, out, &local_settings);
     try out.flush();
 

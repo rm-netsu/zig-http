@@ -32,6 +32,39 @@ pub fn build(b: *std.Build) void {
     const conformance_server_step = b.step("conformance-server", "Build the cleartext HTTP/2 conformance fixture server");
     conformance_server_step.dependOn(&install_conformance.step);
 
+    const conformance_client_mod = b.createModule(.{
+        .root_source_file = b.path("test/conformance/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "http", .module = mod }},
+    });
+    const conformance_client_exe = b.addExecutable(.{ .name = "http2-conformance-client", .root_module = conformance_client_mod });
+    const install_conformance_client = b.addInstallArtifact(conformance_client_exe, .{});
+    const conformance_client_step = b.step("conformance-client", "Build the cleartext HTTP/2 interoperability fixture client");
+    conformance_client_step.dependOn(&install_conformance_client.step);
+
+    const http1_conformance_mod = b.createModule(.{
+        .root_source_file = b.path("test/conformance/http1_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "http", .module = mod }},
+    });
+    const http1_conformance_exe = b.addExecutable(.{ .name = "http1-conformance-server", .root_module = http1_conformance_mod });
+    const install_http1_conformance = b.addInstallArtifact(http1_conformance_exe, .{});
+    const http1_conformance_step = b.step("http1-conformance-server", "Build the cleartext HTTP/1 interoperability fixture server");
+    http1_conformance_step.dependOn(&install_http1_conformance.step);
+
+    const http1_client_mod = b.createModule(.{
+        .root_source_file = b.path("test/conformance/http1_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "http", .module = mod }},
+    });
+    const http1_client_exe = b.addExecutable(.{ .name = "http1-conformance-client", .root_module = http1_client_mod });
+    const install_http1_client = b.addInstallArtifact(http1_client_exe, .{});
+    const http1_client_step = b.step("http1-conformance-client", "Build the cleartext HTTP/1 interoperability fixture client");
+    http1_client_step.dependOn(&install_http1_client.step);
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the HTTP library tests");
@@ -67,6 +100,20 @@ pub fn build(b: *std.Build) void {
     });
     const fuzz_step = b.step("fuzz", "Run HTTP property tests and Zig builtin fuzzing");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    const fixtures_step = b.step("conformance-fixtures", "Compile HTTP/1 and HTTP/2 external-test fixtures");
+    fixtures_step.dependOn(&install_conformance.step);
+    fixtures_step.dependOn(&install_conformance_client.step);
+    fixtures_step.dependOn(&install_http1_conformance.step);
+    fixtures_step.dependOn(&install_http1_client.step);
+
+    // Dependency-free merge gate: unit/property tests plus compilation of every
+    // test-only transport fixture. Full external stacks and h2spec remain shell
+    // commands because they intentionally depend on tools outside Zig.
+    const check_step = b.step("check", "Run unit/property tests and compile conformance fixtures");
+    check_step.dependOn(test_step);
+    check_step.dependOn(fuzz_step);
+    check_step.dependOn(fixtures_step);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),

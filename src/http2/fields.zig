@@ -12,6 +12,7 @@ pub const Validator = struct {
     authority_seen: bool = false,
     status_seen: bool = false,
     method_connect: bool = false,
+    protocol_seen: bool = false,
     /// Parsed Content-Length for the current initial field section. Keeping
     /// this on the ephemeral validator lets Session surface HTTP message
     /// semantics without adding per-stream storage to the protocol engine.
@@ -32,6 +33,11 @@ pub const Validator = struct {
                     if (!std.mem.eql(u8, h.name, ":path") or self.kind != .request or self.path_seen or h.value.len == 0)
                         return error.InvalidHeader;
                     self.path_seen = true;
+                },
+                9 => {
+                    if (!std.mem.eql(u8, h.name, ":protocol") or self.kind != .request or self.protocol_seen or !common.isToken(h.value))
+                        return error.InvalidHeader;
+                    self.protocol_seen = true;
                 },
                 10 => {
                     if (!std.mem.eql(u8, h.name, ":authority") or self.kind != .request or self.authority_seen)
@@ -107,12 +113,24 @@ pub const Validator = struct {
             .request => {
                 if (!self.method_seen) return error.InvalidHeader;
                 if (self.method_connect) {
-                    if (!self.authority_seen or self.scheme_seen or self.path_seen) return error.InvalidHeader;
-                } else if (!self.scheme_seen or !self.path_seen) return error.InvalidHeader;
+                    if (self.protocol_seen) {
+                        // RFC 8441 Extended CONNECT retains normal URI pseudo-
+                        // headers; :protocol itself is single-valued above.
+                        if (!self.scheme_seen or !self.path_seen) return error.InvalidHeader;
+                    } else if (!self.authority_seen or self.scheme_seen or self.path_seen) {
+                        return error.InvalidHeader;
+                    }
+                } else {
+                    if (self.protocol_seen or !self.scheme_seen or !self.path_seen) return error.InvalidHeader;
+                }
             },
             .response => if (!self.status_seen) return error.InvalidHeader,
             .trailers => {},
         }
+    }
+
+    pub inline fn extendedConnect(self: Validator) bool {
+        return self.kind == .request and self.method_connect and self.protocol_seen;
     }
 };
 
@@ -191,6 +209,33 @@ test "HTTP/2 request path cannot be empty" {
     try v.field(.{ .name = ":method", .value = "GET" });
     try v.field(.{ .name = ":scheme", .value = "https" });
     try std.testing.expectError(error.InvalidHeader, v.field(.{ .name = ":path", .value = "" }));
+}
+
+test "Extended CONNECT pseudo-header rules" {
+    var v = Validator.init(.request);
+    try v.field(.{ .name = ":method", .value = "CONNECT" });
+    try v.field(.{ .name = ":protocol", .value = "websocket" });
+    try v.field(.{ .name = ":scheme", .value = "https" });
+    try v.field(.{ .name = ":path", .value = "/chat" });
+    try v.field(.{ .name = ":authority", .value = "example.com" });
+    try v.finish();
+    try std.testing.expect(v.extendedConnect());
+
+    var missing_uri = Validator.init(.request);
+    try missing_uri.field(.{ .name = ":method", .value = "CONNECT" });
+    try missing_uri.field(.{ .name = ":protocol", .value = "websocket" });
+    try std.testing.expectError(error.InvalidHeader, missing_uri.finish());
+
+    var non_connect = Validator.init(.request);
+    try non_connect.field(.{ .name = ":method", .value = "GET" });
+    try non_connect.field(.{ .name = ":protocol", .value = "websocket" });
+    try non_connect.field(.{ .name = ":scheme", .value = "https" });
+    try non_connect.field(.{ .name = ":path", .value = "/" });
+    try std.testing.expectError(error.InvalidHeader, non_connect.finish());
+
+    var bad_protocol = Validator.init(.request);
+    try bad_protocol.field(.{ .name = ":method", .value = "CONNECT" });
+    try std.testing.expectError(error.InvalidHeader, bad_protocol.field(.{ .name = ":protocol", .value = "bad protocol" }));
 }
 
 test "CONNECT pseudo-header rules" {

@@ -31,6 +31,8 @@ pub const HeaderSection = struct {
     kind: fields.Kind,
     end_stream: bool,
     has_content_length: bool = false,
+    /// True for an RFC 8441 CONNECT request carrying the :protocol pseudo-header.
+    extended_connect: bool = false,
 
     /// The caller can feed DATA byte counts into `fields.BodyLength` without
     /// Session retaining application-message state per stream.
@@ -289,7 +291,10 @@ pub const Session = struct {
 
         const existing = store.get(stream_id);
         const kind = self.localHeaderKindTracked(existing, stream_id);
-        const status = try validateLocalFields(kind, end_stream, items);
+        const field_info = try validateLocalFields(kind, end_stream, items);
+        if (field_info.extended_connect and
+            (self.streams.local_role != .client or !self.peer.settings.enable_connect_protocol))
+            return error.Protocol;
         var framer = send_mod.HeaderFramer.init(
             out,
             frame_staging,
@@ -306,7 +311,7 @@ pub const Session = struct {
             tracked = store.get(stream_id) orelse unreachable;
         }
 
-        return self.finishSendHeaders(&framer, tracked.?, kind, status, items);
+        return self.finishSendHeaders(&framer, tracked.?, kind, field_info.status, items);
     }
 
     /// HEADERS fast path for a caller that already resolved a stable stream
@@ -324,7 +329,10 @@ pub const Session = struct {
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
         const kind = self.localHeaderKindTracked(existing.tracked, existing.stream_id);
-        const status = try validateLocalFields(kind, end_stream, items);
+        const field_info = try validateLocalFields(kind, end_stream, items);
+        if (field_info.extended_connect and
+            (self.streams.local_role != .client or !self.peer.settings.enable_connect_protocol))
+            return error.Protocol;
         var framer = send_mod.HeaderFramer.init(
             out,
             frame_staging,
@@ -333,7 +341,7 @@ pub const Session = struct {
             end_stream,
         ) catch return error.BufferTooSmall;
         try self.streams.localHeadersTracked(&self.peer, existing.stream_id, existing.tracked, end_stream);
-        return self.finishSendHeaders(&framer, existing.tracked, kind, status, items);
+        return self.finishSendHeaders(&framer, existing.tracked, kind, field_info.status, items);
     }
 
     fn finishSendHeaders(
@@ -379,7 +387,10 @@ pub const Session = struct {
         items: []const hpack.EncodedField,
     ) SendPushPromiseError!SendPushPromiseResult {
         if (self.pending.poisoned()) return error.SendPoisoned;
-        _ = try validateLocalFields(.request, false, items);
+        const field_info = try validateLocalFields(.request, false, items);
+        // Extended CONNECT is a client-created request stream, never a server
+        // PUSH_PROMISE request template.
+        if (field_info.extended_connect) return error.Protocol;
         var framer = send_mod.HeaderFramer.initPushPromise(
             out,
             frame_staging,
@@ -499,7 +510,11 @@ pub const Session = struct {
     ) SendSettingsError!SettingsTicket {
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (sync.sent == std.math.maxInt(SettingsTicket)) return error.SettingsSequenceExhausted;
-        try validateLocalSettings(self.streams.local_role, items);
+        const next_connect_protocol = try validateLocalSettings(
+            self.streams.local_role,
+            self.streams.extendedConnectAdvertised(),
+            items,
+        );
 
         send_mod.writeSettings(out, items, self.peer.settings.max_frame_size) catch |err| switch (err) {
             error.FrameTooLarge => return error.FrameTooLarge,
@@ -508,7 +523,19 @@ pub const Session = struct {
                 return error.WriteFailed;
             },
         };
+        // Commit local SETTINGS state only after the complete frame write.
+        self.streams.setExtendedConnectAdvertised(next_connect_protocol);
         return sync.recordSent() catch unreachable;
+    }
+
+    /// Whether this endpoint has committed SETTINGS_ENABLE_CONNECT_PROTOCOL=1.
+    pub inline fn extendedConnectAdvertised(self: Session) bool {
+        return self.streams.extendedConnectAdvertised();
+    }
+
+    /// Whether the peer has advertised RFC 8441 Extended CONNECT support.
+    pub inline fn peerSupportsExtendedConnect(self: Session) bool {
+        return self.peer.settings.enable_connect_protocol;
     }
 
     /// Emits the mandatory acknowledgment for a received SETTINGS frame.
@@ -975,6 +1002,11 @@ pub const Session = struct {
                 invalid = true;
             };
         }
+        if (!invalid and validator.extendedConnect()) {
+            // Only clients create Extended CONNECT streams, and only after the
+            // server has advertised the RFC 8441 capability on this connection.
+            if (self.streams.local_role != .server or !self.streams.extendedConnectAdvertised()) invalid = true;
+        }
         if (invalid) {
             // A malformed field section still consumes the peer stream ID and
             // performs the corresponding state transition. Otherwise a peer
@@ -991,7 +1023,7 @@ pub const Session = struct {
         }
 
         if (pending.isPushPromise()) return self.commitPushPromise(store, pending, field_count);
-        return self.commitHeaders(store, pending, field_kind, status_code, field_count, validator.content_length);
+        return self.commitHeaders(store, pending, field_kind, status_code, field_count, validator.content_length, validator.extendedConnect());
     }
 
     fn headerKind(self: *Session, store: anytype, stream_id: u31) fields.Kind {
@@ -1000,7 +1032,7 @@ pub const Session = struct {
         return if (self.streams.local_role == .server and self.streams.remoteInitiated(stream_id)) .request else .response;
     }
 
-    fn commitHeaders(self: *Session, store: anytype, pending: Pending, field_kind: fields.Kind, status: u16, field_count: u32, content_length: ?u64) Event {
+    fn commitHeaders(self: *Session, store: anytype, pending: Pending, field_kind: fields.Kind, status: u16, field_count: u32, content_length: ?u64, extended_connect: bool) Event {
         const end_stream = pending.endStream();
         const informational = field_kind == .response and status >= 100 and status < 200;
         if ((field_kind == .response and status == 101) or
@@ -1025,6 +1057,7 @@ pub const Session = struct {
             .field_count = field_count,
             .content_length = content_length orelse 0,
             .has_content_length = content_length != null,
+            .extended_connect = extended_connect,
             .status_code = status,
         } };
     }
@@ -1112,19 +1145,35 @@ pub const Session = struct {
     }
 };
 
-fn validateLocalSettings(role: peer_mod.Role, items: []const settings.Setting) error{ Protocol, FlowControl }!void {
+fn validateLocalSettings(
+    role: peer_mod.Role,
+    connect_protocol_enabled: bool,
+    items: []const settings.Setting,
+) error{ Protocol, FlowControl }!bool {
+    var next_connect_protocol = connect_protocol_enabled;
     for (items) |item| switch (item.id) {
         .enable_push => {
             if (item.value > 1 or (role == .server and item.value == 1)) return error.Protocol;
+        },
+        .enable_connect_protocol => switch (item.value) {
+            0 => if (next_connect_protocol) return error.Protocol,
+            1 => next_connect_protocol = true,
+            else => return error.Protocol,
         },
         .initial_window_size => if (item.value > 0x7fff_ffff) return error.FlowControl,
         .max_frame_size => if (item.value < frame.default_max_frame_size or item.value > frame.max_frame_size)
             return error.Protocol,
         else => {},
     };
+    return next_connect_protocol;
 }
 
-fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack.EncodedField) error{Protocol}!u16 {
+const LocalFieldInfo = struct {
+    status: u16 = 0,
+    extended_connect: bool = false,
+};
+
+fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack.EncodedField) error{Protocol}!LocalFieldInfo {
     var validator = fields.Validator.init(kind);
     var status: u16 = 0;
     for (items) |item| {
@@ -1140,7 +1189,7 @@ fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack
         const informational = status >= 100 and status < 200;
         if (status == 101 or (informational and end_stream)) return error.Protocol;
     }
-    return status;
+    return .{ .status = status, .extended_connect = validator.extendedConnect() };
 }
 
 fn receiveFault(stream_id: u31, result: streams_mod.ReceiveResult) ?Fault {
@@ -1902,6 +1951,84 @@ test "PUSH_PROMISE preflight respects role and peer push setting" {
     try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
     try std.testing.expect(store.get(2) == null);
     try std.testing.expect(!session.sendPoisoned());
+}
+
+test "Extended CONNECT is gated by negotiated SETTINGS" {
+    const allocator = std.testing.allocator;
+
+    // Client-side sends are rejected before the peer advertises RFC 8441.
+    var client_decoder = hpack.Decoder.init(allocator, 4096);
+    defer client_decoder.deinit();
+    var client_encoder = hpack.Encoder.init(allocator, 4096);
+    defer client_encoder.deinit();
+    var client_storage: [256]u8 = undefined;
+    var client = Session.init(.client, .{}, &client_decoder, &client_encoder, &client_storage);
+    var client_store: TestStore = .{};
+    const request = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "CONNECT" } },
+        .{ .field = .{ .name = ":protocol", .value = "websocket" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":path", .value = "/chat" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+    };
+    var staging: [128]u8 = undefined;
+    var client_wire_storage: [512]u8 = undefined;
+    var client_wire = std.Io.Writer.fixed(&client_wire_storage);
+    try std.testing.expectError(error.Protocol, client.sendHeaders(&client_store, &client_wire, 1, false, &staging, &request));
+    try std.testing.expectEqual(@as(usize, 0), client_wire.buffered().len);
+
+    _ = try client.peer.applySetting(.{ .id = .enable_connect_protocol, .value = 1 });
+    try std.testing.expect(client.peerSupportsExtendedConnect());
+    _ = try client.sendHeaders(&client_store, &client_wire, 1, false, &staging, &request);
+    try std.testing.expect(client_wire.buffered().len != 0);
+
+    // Server-side receive acceptance is tied to a SETTINGS value actually
+    // committed by this Session, not merely to generic field syntax support.
+    var server_decoder = hpack.Decoder.init(allocator, 4096);
+    defer server_decoder.deinit();
+    var server_encoder = hpack.Encoder.init(allocator, 4096);
+    defer server_encoder.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var server_storage: [256]u8 = undefined;
+    var server = Session.init(.server, .{}, &server_decoder, &server_encoder, &server_storage);
+    const request_fields = [_]common.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/chat" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    const block = try encodedFields(allocator, &wire_encoder, &request_fields);
+    defer allocator.free(block);
+    var server_store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [256]u8 = undefined;
+
+    const rejected = try server.receiveComplete(&server_store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 1 },
+        .payload = block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, rejected.fault.stream.code);
+    try std.testing.expectEqual(@as(u31, 1), rejected.fault.stream.stream_id);
+
+    var sync: SettingsSync = .{};
+    var settings_wire_storage: [64]u8 = undefined;
+    var settings_wire = std.Io.Writer.fixed(&settings_wire_storage);
+    const enable = [_]settings.Setting{.{ .id = .enable_connect_protocol, .value = 1 }};
+    _ = try server.sendSettings(&sync, &settings_wire, &enable);
+    try std.testing.expect(server.extendedConnectAdvertised());
+
+    const disable = [_]settings.Setting{.{ .id = .enable_connect_protocol, .value = 0 }};
+    const written = settings_wire.buffered().len;
+    try std.testing.expectError(error.Protocol, server.sendSettings(&sync, &settings_wire, &disable));
+    try std.testing.expectEqual(written, settings_wire.buffered().len);
+
+    const event = try server.receiveComplete(&server_store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 3 },
+        .payload = block,
+    }, &scratch, &sink);
+    try std.testing.expect(event.headers.extended_connect);
 }
 
 test "SETTINGS synchronization tickets follow ACK order" {
