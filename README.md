@@ -251,11 +251,15 @@ understands in wire order. This preserves the HTTP/2 requirement that unknown
 settings remain harmless without making composed Session a closed extension
 surface.
 
-`http2.priority` provides policy-free RFC 9218 constants and wire parsing for
-`SETTINGS_NO_RFC7540_PRIORITIES` and HTTP/2 `PRIORITY_UPDATE`. It intentionally
-does not choose a scheduler, buffer future-stream priorities, or parse Structured
-Fields into an application scheduling policy; those decisions depend on the
-caller's storage and runtime.
+`http2.priority` provides policy-free RFC 9218 support for
+`SETTINGS_NO_RFC7540_PRIORITIES`, HTTP/2 `PRIORITY_UPDATE`, and the Priority
+Structured Field Dictionary. `priority.parseFieldValue()` preserves omission of
+`u`/`i`, ignores unknown or type/range-invalid parameters after validating the
+complete dictionary, and `Parameters.effective()` applies the standard `u=3,
+i=false` defaults when appropriate. `writeFieldValue()`, `writeUpdate()`, and
+`writeUpdateParameters()` provide allocation-free canonical outbound paths.
+Scheduling, buffering priority for future streams, and merging request/response
+signals remain caller-owned policy.
 
 ### Structural contracts and error model
 
