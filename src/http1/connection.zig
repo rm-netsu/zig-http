@@ -4,7 +4,7 @@ const head = @import("head.zig");
 const body = @import("body.zig");
 const semantics = @import("semantics.zig");
 
-pub const Error = head.Error || semantics.RequestError || semantics.ConnectionError ||
+pub const Error = head.Error || semantics.RequestError || semantics.ResponseError || semantics.ConnectionError ||
     error{ InvalidChunk, LineTooLong, ResponseContextRequired, InvalidResponseContext, UnexpectedEof };
 
 pub const Options = struct {
@@ -12,6 +12,10 @@ pub const Options = struct {
     /// Disable only when the caller intentionally wants to inspect malformed or
     /// non-origin traffic and will apply equivalent semantics itself.
     validate_requests: bool = true,
+    /// Apply response status and Upgrade-switch semantics after syntax/framing.
+    /// Raw head parsing remains available for diagnostic tooling that needs to
+    /// inspect invalid HTTP status codes or malformed 101 responses.
+    validate_responses: bool = true,
 };
 
 pub const HeadEvent = struct {
@@ -19,6 +23,10 @@ pub const HeadEvent = struct {
     framing: head.BodyFraming,
     persistence: semantics.Persistence,
     target_form: ?semantics.RequestTargetForm = null,
+    /// Routing authority from the already-completed request semantic pass.
+    /// This borrows `head_storage`, like the rest of `head`, and avoids a
+    /// second header traversal in normal server/proxy routing.
+    effective_authority: ?[]const u8 = null,
     informational: bool = false,
     message_done: bool = false,
     protocol_switched: bool = false,
@@ -145,8 +153,14 @@ pub const Decoder = struct {
         const framed = framed_result.framed orelse return .{ .consumed = framed_result.consumed };
 
         var target_form: ?semantics.RequestTargetForm = null;
+        var effective_authority: ?[]const u8 = null;
         if (self.mode == .request and self.options.validate_requests) {
-            target_form = (try semantics.validateRequest(framed.head)).target_form;
+            const request_info = try semantics.validateRequest(framed.head);
+            target_form = request_info.target_form;
+            effective_authority = request_info.effective_authority;
+        }
+        if (self.mode == .response and self.options.validate_responses) {
+            _ = try semantics.validateResponse(framed.head);
         }
 
         var persistence = try semantics.persistence(framed.head);
@@ -169,6 +183,7 @@ pub const Decoder = struct {
             .framing = framed.framing,
             .persistence = persistence,
             .target_form = target_form,
+            .effective_authority = effective_authority,
             .informational = informational,
             .protocol_switched = switched,
         };
@@ -420,4 +435,60 @@ test "truncated framed bodies fail at EOF" {
     _ = try decoder.feed("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\na");
     _ = try decoder.feed("a");
     try std.testing.expectError(error.UnexpectedEof, decoder.finish());
+}
+
+test "response decoder validates status and Upgrade semantics by default" {
+    var invalid_status_head: [256]u8 = undefined;
+    var invalid_status_chunk: [64]u8 = undefined;
+    var invalid_status = Decoder.initResponse(&invalid_status_head, &invalid_status_chunk, .{});
+    try invalid_status.beginResponse("GET");
+    try std.testing.expectError(error.InvalidStatus, invalid_status.feed("HTTP/1.1 677 Internal Status\r\nContent-Length: 0\r\n\r\n"));
+
+    var invalid_upgrade_head: [256]u8 = undefined;
+    var invalid_upgrade_chunk: [64]u8 = undefined;
+    var invalid_upgrade = Decoder.initResponse(&invalid_upgrade_head, &invalid_upgrade_chunk, .{});
+    try invalid_upgrade.beginResponse("GET");
+    try std.testing.expectError(error.InvalidUpgradeResponse, invalid_upgrade.feed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"));
+}
+
+test "response decoder exposes only validated 101 switch boundaries" {
+    var head_storage: [256]u8 = undefined;
+    var chunk_storage: [64]u8 = undefined;
+    var decoder = Decoder.initResponse(&head_storage, &chunk_storage, .{});
+    try decoder.beginResponse("GET");
+
+    const wire = "HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\nWS";
+    const result = try decoder.feed(wire);
+    try std.testing.expect(result.event.?.head.protocol_switched);
+    try std.testing.expect(result.event.?.head.message_done);
+    try std.testing.expectEqualStrings("WS", wire[result.consumed..]);
+    try std.testing.expect(decoder.protocolSwitched());
+}
+
+test "strict response validation can be explicitly disabled" {
+    var head_storage: [256]u8 = undefined;
+    var chunk_storage: [64]u8 = undefined;
+    var decoder = Decoder.initResponse(&head_storage, &chunk_storage, .{ .validate_responses = false });
+    try decoder.beginResponse("GET");
+
+    const result = try decoder.feed("HTTP/1.1 677 Internal Status\r\nContent-Length: 0\r\n\r\n");
+    try std.testing.expectEqual(@as(u16, 677), result.event.?.head.head.start.response.status);
+}
+
+test "request decoder exposes effective authority without semantic rescan" {
+    var head_storage: [384]u8 = undefined;
+    var chunk_storage: [64]u8 = undefined;
+    var decoder = Decoder.initRequest(&head_storage, &chunk_storage, .{});
+
+    const result = try decoder.feed("GET http://target.example:8080/x HTTP/1.1\r\nHost: wrong.example\r\n\r\n");
+    const event = result.event.?.head;
+    try std.testing.expectEqualStrings("target.example:8080", event.effective_authority.?);
+}
+
+test "composed HTTP1 event layout remains bounded" {
+    // effective_authority intentionally spends one borrowed slice (16 bytes on
+    // x86_64) to avoid a second header traversal on normal routing paths.
+    try std.testing.expect(@sizeOf(HeadEvent) <= 104);
+    try std.testing.expect(@sizeOf(Event) <= 112);
+    try std.testing.expect(@sizeOf(Decoder) <= 120);
 }

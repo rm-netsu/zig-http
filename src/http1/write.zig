@@ -63,7 +63,7 @@ pub const MessageWriter = struct {
         poisoned,
     };
 
-    pub const MessageError = Error || head.Error || semantics.RequestError || semantics.ConnectionError || error{
+    pub const MessageError = Error || head.Error || semantics.RequestError || semantics.ResponseError || semantics.ConnectionError || error{
         InvalidState,
         ContentLengthMismatch,
         TrailersNotAllowed,
@@ -126,6 +126,7 @@ pub const MessageWriter = struct {
     pub fn beginResponse(self: *MessageWriter, w: *std.Io.Writer, version: head.Version, status: u16, reason: []const u8, request_method: []const u8, headers: []const common.Header) MessageError!BeginResult {
         if (self.state != .idle) return error.InvalidState;
         if (status < 100 or status > 999 or !validReason(reason) or !common.isToken(request_method)) return error.InvalidHeader;
+        _ = try semantics.validateResponseFields(version, status, headers);
         try validateResponseFramingFields(status, request_method, headers);
         const framing = try head.responseBodyFramingFields(version, status, request_method, headers);
         const persistence = try semantics.persistenceFields(version, headers);
@@ -535,4 +536,47 @@ test "message writer poisons state after partial output failure" {
 
 test "message writer keeps compact persistent state" {
     try std.testing.expect(@sizeOf(MessageWriter) <= 16);
+}
+
+test "message writer rejects invalid HTTP status and malformed 101 before output" {
+    var storage: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    var message = MessageWriter.init();
+
+    try std.testing.expectError(error.InvalidStatus, message.beginResponse(&writer, .http_1_1, 677, "Internal Status", "GET", &.{}));
+    try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    try std.testing.expect(message.ready());
+
+    try std.testing.expectError(error.InvalidUpgradeResponse, message.beginResponse(&writer, .http_1_1, 101, "Switching Protocols", "GET", &.{
+        .{ .name = "upgrade", .value = "websocket" },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    try std.testing.expect(message.ready());
+}
+
+test "message writer enters tunnel only after a valid 101 handshake" {
+    var storage: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    var message = MessageWriter.init();
+
+    const result = try message.beginResponse(&writer, .http_1_1, 101, "Switching Protocols", "GET", &.{
+        .{ .name = "connection", .value = "Upgrade" },
+        .{ .name = "upgrade", .value = "websocket" },
+    });
+    try std.testing.expect(result.protocol_switched);
+    try std.testing.expect(result.message_done);
+    try std.testing.expect(message.protocolSwitched());
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "connection: Upgrade\r\n") != null);
+}
+
+test "message writer rejects mismatched absolute-form Host before output" {
+    var storage: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    var message = MessageWriter.init();
+
+    try std.testing.expectError(error.MismatchedHost, message.beginRequest(&writer, .http_1_1, "GET", "http://target.example/x", &.{
+        .{ .name = "host", .value = "wrong.example" },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+    try std.testing.expect(message.ready());
 }

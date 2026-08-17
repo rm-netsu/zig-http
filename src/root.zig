@@ -3,12 +3,14 @@
 //! pair these parsers/writers with their own event loop and transport strategy.
 
 pub const common = @import("common.zig");
+pub const uri = @import("uri.zig");
 pub const http1 = @import("http1.zig");
 pub const http2 = @import("http2.zig");
 
 test {
     _ = common.Header;
     _ = common.isFieldValue;
+    _ = uri.validateAbsolute;
 
     _ = http1.head.HeadParser;
     _ = http1.head.FramedHeadParser;
