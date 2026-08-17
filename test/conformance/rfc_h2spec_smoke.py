@@ -450,6 +450,13 @@ def probe_header_semantics(host: str, port: int) -> None:
             (b":method", b"CONNECT"),
             (b":authority", b"example.com"),
         ],
+        [
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"example.com"),
+            (b":path", b"/"),
+            (b"host", b"other.example"),
+        ],
     ]
     for headers in malformed:
         sock = connect(host, port)

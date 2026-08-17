@@ -45,9 +45,11 @@ its dynamic/negative flow-window cases are not skipped. It also advertises
 predates that extension and correctly treats the setting as an ignorable
 extension parameter.
 
-Request Content-Length accounting uses caller-owned `http2.fields.BodyLength`
-rather than adding application-message length state to every Session stream.
-Each fixture connection owns an independent Session; the test server uses worker
+Request Content-Length and no-content response accounting are exercised through
+the composed Session's caller-owned `http2.fields.BodyState`; the fixture no
+longer duplicates those checks in application code. The state stays outside the
+12-byte `stream.Tracked` record. Each fixture connection owns an independent
+Session; the test server uses worker
 threads only so helper/test connections cannot block acceptance of another
 connection. That threading model is not imposed on consumers.
 
@@ -58,6 +60,7 @@ zig build check
 zig build conformance
 H2SPEC_BIN=/path/to/h2spec zig build conformance-h2spec
 zig build all-checks
+H2SPEC_BIN=/path/to/h2spec zig build release-checks
 
 # Focused equivalents remain available:
 ./test/conformance/run-http1-interop.sh

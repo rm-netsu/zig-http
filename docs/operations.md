@@ -154,8 +154,10 @@ providing equivalent ordering externally.
 
 `Session` invokes the caller-owned field sink synchronously while decoding a
 field section. Header name/value slices supplied to the sink may borrow HPACK or
-caller scratch/input storage. A sink that needs fields after the callback must
-copy them into application-owned memory.
+caller scratch/input storage. Session calls `begin()` before delivery and exactly
+one of `commit()`/`abort()` afterward; application-visible mutation should be
+staged until commit. A sink that needs fields after the callback must copy them
+into application-owned memory.
 
 A stream-level semantic rejection still consumes the complete HPACK field block
 when required to preserve compression synchronization. Do not abort transport

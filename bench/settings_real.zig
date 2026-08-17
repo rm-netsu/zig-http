@@ -8,6 +8,7 @@ const Store = struct {
     const Slot = struct {
         used: bool = true,
         value: http.http2.stream.Tracked,
+        body: http.http2.fields.BodyState = .{},
     };
 
     slots: [stream_count]Slot,
@@ -43,10 +44,17 @@ const Store = struct {
         }
         return result;
     }
+
+    pub fn bodyState(_: *Store, _: u31) ?*http.http2.fields.BodyState {
+        return null;
+    }
 };
 
 const Sink = struct {
+    pub inline fn begin(_: *Sink, _: u31, _: http.http2.fields.Kind) void {}
     pub inline fn field(_: *Sink, _: u31, _: http.http2.fields.Kind, _: http.common.Header) void {}
+    pub inline fn commit(_: *Sink, _: u31, _: http.http2.fields.Kind) void {}
+    pub inline fn abort(_: *Sink, _: u31, _: http.http2.fields.Kind) void {}
 };
 
 fn settingBytes(value: u32) [6]u8 {

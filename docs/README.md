@@ -43,5 +43,6 @@ operational expectations that cannot be expressed by signatures alone.
 - `zig build conformance` — HTTP/1 interoperability plus HTTP/2 RFC smoke and bidirectional external interoperability.
 - `H2SPEC_BIN=/path/to/h2spec zig build conformance-h2spec` — strict upstream h2spec.
 - `zig build all-checks` — merge gate, generated API docs, and reproducible external conformance.
+- `H2SPEC_BIN=/path/to/h2spec zig build release-checks` — `all-checks` followed serially by strict upstream h2spec; intended as the release gate.
 
 Granular conformance scripts and build targets remain available for focused debugging.

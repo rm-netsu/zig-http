@@ -62,6 +62,7 @@ pub const Store = struct {
         id: u31 = 0,
         used: bool = false,
         value: http.http2.stream.Tracked = undefined,
+        body: http.http2.fields.BodyState = .{},
     };
     slots: [batch_streams]Slot = [_]Slot{.{}} ** batch_streams,
 
@@ -94,6 +95,12 @@ pub const Store = struct {
         return result;
     }
 
+    pub inline fn bodyState(self: *Store, id: u31) ?*http.http2.fields.BodyState {
+        const slot = &self.slots[index(id)];
+        if (!slot.used or slot.id != id) return null;
+        return &slot.body;
+    }
+
     pub inline fn reset(self: *Store) void {
         for (&self.slots) |*slot| slot.used = false;
     }
@@ -101,8 +108,19 @@ pub const Store = struct {
 
 pub const CountingSink = struct {
     fields: u64 = 0,
+    pending_fields: u64 = 0,
+    pub inline fn begin(self: *CountingSink, _: u31, _: http.http2.fields.Kind) void {
+        self.pending_fields = 0;
+    }
     pub inline fn field(self: *CountingSink, _: u31, _: http.http2.fields.Kind, _: http.common.Header) void {
-        self.fields +%= 1;
+        self.pending_fields +%= 1;
+    }
+    pub inline fn commit(self: *CountingSink, _: u31, _: http.http2.fields.Kind) void {
+        self.fields +%= self.pending_fields;
+        self.pending_fields = 0;
+    }
+    pub inline fn abort(self: *CountingSink, _: u31, _: http.http2.fields.Kind) void {
+        self.pending_fields = 0;
     }
 };
 

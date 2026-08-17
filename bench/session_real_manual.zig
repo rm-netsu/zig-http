@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
         };
         if (connection.check(header) != .none) return error.Protocol;
         var validator = http.http2.fields.Validator.init(.response);
+        sink.begin(id, .response);
         var it = decoder.iterator(block.bytes, &scratch);
         var fields_count: u32 = 0;
         while (try it.next()) |field| {
@@ -54,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try validator.finish();
         if (manager.receiveHeaders(&store, id, end_on_headers) != .accepted) return error.Protocol;
+        sink.commit(id, .response);
         store.get(id).?.remote_headers = .regular;
         checksum +%= fields_count;
 

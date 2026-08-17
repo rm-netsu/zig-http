@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Make composed HTTP/2 message receive semantics fail-closed with caller-owned `BodyState`: Session now rejects DATA before final response headers, correlates HEAD/CONNECT request methods, validates Content-Length against DATA content octets through END_STREAM/trailers, rejects non-empty DATA for no-content messages, and opens CONNECT tunnel DATA only after a successful response without increasing the 12-byte `Tracked` record.
+- Enforce normalized HTTP/2 `Host` / `:authority` consistency on shared receive/send field validation, including case, default-port, percent-encoding, and IPv6 textual normalization without retaining callback-lifetime HPACK slices.
+- Make the HTTP/2 field-sink contract transactional (`begin` / `field` / `commit` / `abort`) so late semantic/HPACK/stream failures cannot accidentally publish a partial header section.
+- Add `zig build release-checks`, which serializes the normal `all-checks` gate before strict upstream h2spec instead of allowing a release to omit the explicit h2spec target.
+
 ## 0.17.0
 
 - Harden HTTP/1 request routing semantics: validate absolute-form with shared RFC 3986 URI rules, expose `effective_authority` from semantic/composed receive APIs, and ensure absolute-form and CONNECT derive routing authority from request-target rather than a conflicting Host field; send-side absolute-form now rejects a Host value not derived from its request-target authority. The composed `HeadEvent`/`Event` intentionally grow by one borrowed slice (88/96 B to 104/112 B on x86_64) to avoid a second header traversal on normal routing paths.

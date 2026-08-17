@@ -34,26 +34,42 @@ pub fn insert(
     value: http2.stream.Tracked,
 ) ?*http2.stream.Tracked;
 pub fn maxActiveSendAdjustment(self: *@This()) i32;
+pub fn bodyState(self: *@This(), id: u31) ?*http2.fields.BodyState;
 ```
 
 The exact storage topology is caller-owned. `examples/support/fixed_stream_store.zig`
 is a small reference implementation, not a required production layout.
 
-A field sink is invoked synchronously while HPACK fields are decoded. The
-minimal shape is:
+A field sink is invoked synchronously while HPACK fields are decoded and is
+transactional at field-section granularity. The minimal shape is:
 
 ```zig
+pub fn begin(self: *@This(), stream_id: u31, kind: http2.fields.Kind) void;
 pub fn field(
     self: *@This(),
     stream_id: u31,
     kind: http2.fields.Kind,
     value: http.common.Header,
 ) void;
+pub fn commit(self: *@This(), stream_id: u31, kind: http2.fields.Kind) void;
+pub fn abort(self: *@This(), stream_id: u31, kind: http2.fields.Kind) void;
 ```
 
-The sink may also return an error; Session propagates it through its receive
-path. Borrowed header slices must be copied if the application keeps them beyond
-the callback.
+`field()` values are provisional. A later malformed field, HPACK failure, or
+stream-state rejection causes `abort()` rather than exposing a partial field
+section as committed application state. Borrowed header slices must still be
+copied if the application keeps them beyond the callback.
+
+The store-owned `BodyState` is reset by Session for each initial inbound request
+or final response. A locally opened request starts in `awaiting_headers`, so DATA
+from the peer cannot precede the final response field section. The state checks
+declared Content-Length against DATA content bytes, validates the count when
+END_STREAM or trailers finish the message, and rejects non-empty DATA for
+messages defined to have no content. Padding remains only flow-control charge
+and is not counted as message content. CONNECT request bytes remain forbidden
+until a successful response establishes tunnel mode. Store insertion/reuse must
+reset the associated `BodyState` to its default value; managed `sendHeaders()`
+also enforces that reset for local request streams.
 
 ## Lower-level connection/stream composition
 

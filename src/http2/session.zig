@@ -199,7 +199,10 @@ pub const SendStreamControlError = std.Io.Writer.Error || streams_mod.LocalError
 pub const SendGoAwayError = std.Io.Writer.Error || streams_mod.LocalError || error{ FrameTooLarge, SendPoisoned };
 
 pub const NullSink = struct {
+    pub inline fn begin(_: *NullSink, _: u31, _: fields.Kind) void {}
     pub inline fn field(_: *NullSink, _: u31, _: fields.Kind, _: common.Header) void {}
+    pub inline fn commit(_: *NullSink, _: u31, _: fields.Kind) void {}
+    pub inline fn abort(_: *NullSink, _: u31, _: fields.Kind) void {}
 };
 
 const Pending = struct {
@@ -265,14 +268,18 @@ const Pending = struct {
 /// objects remain caller-owned because they own allocator-backed dynamic tables;
 /// this type merely holds stable pointers.
 ///
-/// The stream store extends the `StreamManager` contract with one operation:
+/// The stream store extends the `StreamManager` contract with two operations:
 ///
 ///     maxActiveSendAdjustment() i32
+///     bodyState(stream_id: u31) ?*http2.fields.BodyState
 ///
 /// This is consulted only when a rare SETTINGS_INITIAL_WINDOW_SIZE increase
 /// could overflow a stream according to the manager's conservative high-water
 /// mark. Stores can scan, maintain an aggregate, or coordinate shards however
 /// they choose; ordinary SETTINGS changes require no store-wide mutation.
+/// `bodyState` is per-stream caller-owned message-content state used to enforce
+/// Content-Length, no-content, response-ordering, and CONNECT tunnel semantics
+/// without growing Session or the minimal standalone StreamManager record.
 pub const Session = struct {
     connection: connection.State = .{},
     streams: streams_mod.Manager,
@@ -327,6 +334,7 @@ pub const Session = struct {
         const existing = store.get(stream_id);
         const kind = self.localHeaderKindTracked(existing, stream_id);
         const field_info = try validateLocalFields(kind, end_stream, items);
+        try validateLocalResponseContext(kind, field_info, existing);
         if (kind == .trailers and items.len != 0) return error.TrailerPolicyRequired;
         if (field_info.extended_connect and
             (self.streams.local_role != .client or !self.peer.settings.enable_connect_protocol))
@@ -347,7 +355,12 @@ pub const Session = struct {
             tracked = store.get(stream_id) orelse unreachable;
         }
 
-        return self.finishSendHeaders(&framer, tracked.?, kind, field_info.status, items);
+        const result = try self.finishSendHeaders(&framer, tracked.?, kind, field_info.status, field_info.request_method, items);
+        if (kind == .request) {
+            const body = store.bodyState(stream_id) orelse unreachable;
+            body.* = .{ .mode = .awaiting_headers };
+        }
+        return result;
     }
 
     /// HEADERS fast path for a caller that already resolved a stable stream
@@ -366,6 +379,7 @@ pub const Session = struct {
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
         const kind = self.localHeaderKindTracked(existing.tracked, existing.stream_id);
         const field_info = try validateLocalFields(kind, end_stream, items);
+        try validateLocalResponseContext(kind, field_info, existing.tracked);
         if (kind == .trailers and items.len != 0) return error.TrailerPolicyRequired;
         if (field_info.extended_connect and
             (self.streams.local_role != .client or !self.peer.settings.enable_connect_protocol))
@@ -378,7 +392,7 @@ pub const Session = struct {
             end_stream,
         ) catch return error.BufferTooSmall;
         try self.streams.localHeadersTracked(&self.peer, existing.stream_id, existing.tracked, end_stream);
-        return self.finishSendHeaders(&framer, existing.tracked, kind, field_info.status, items);
+        return self.finishSendHeaders(&framer, existing.tracked, kind, field_info.status, field_info.request_method, items);
     }
 
     /// Streams a non-empty trailer field section after caller policy confirms
@@ -417,7 +431,7 @@ pub const Session = struct {
             true,
         ) catch return error.BufferTooSmall;
         try self.streams.localHeadersTracked(&self.peer, stream_id, tracked, true);
-        return self.finishSendHeaders(&framer, tracked, .trailers, 0, items);
+        return self.finishSendHeaders(&framer, tracked, .trailers, 0, .other, items);
     }
 
     /// Trailer fast path for a caller that already holds a stable stream record.
@@ -446,7 +460,7 @@ pub const Session = struct {
             true,
         ) catch return error.BufferTooSmall;
         try self.streams.localHeadersTracked(&self.peer, existing.stream_id, existing.tracked, true);
-        return self.finishSendHeaders(&framer, existing.tracked, .trailers, 0, items);
+        return self.finishSendHeaders(&framer, existing.tracked, .trailers, 0, .other, items);
     }
 
     fn finishSendHeaders(
@@ -455,6 +469,7 @@ pub const Session = struct {
         tracked: *stream_mod.Tracked,
         kind: fields.Kind,
         status: u16,
+        request_method: fields.RequestMethod,
         items: []const hpack.EncodedField,
     ) SendHeadersError!SendHeadersResult {
         for (items) |item| {
@@ -471,6 +486,13 @@ pub const Session = struct {
             tracked.local_headers = .trailers;
         } else if (kind == .request or !(status >= 100 and status < 200)) {
             tracked.local_headers = .regular;
+        }
+        if (kind == .request) {
+            tracked.request_method = request_method;
+        } else if (kind == .response and !(status >= 100 and status < 200) and
+            tracked.request_method == .connect and !(status >= 200 and status < 300))
+        {
+            tracked.request_method = .connect_rejected;
         }
         return result;
     }
@@ -512,10 +534,13 @@ pub const Session = struct {
                 return err;
             };
         }
-        return framer.finish() catch |err| {
+        const result = framer.finish() catch |err| {
             self.pending.poison();
             return err;
         };
+        const promised = store.get(promised_stream_id) orelse unreachable;
+        promised.request_method = field_info.request_method;
+        return result;
     }
 
     /// Probes current DATA send credit without mutating protocol state. This is
@@ -876,6 +901,20 @@ pub const Session = struct {
         end_stream: bool,
         comptime fused_credit: bool,
     ) SendDataError!SendDataResult {
+        // Response DATA cannot precede the final response field section. A
+        // zero-length no-op without END_STREAM emits no frame and remains safe.
+        if (self.streams.local_role == .server and tracked.local_headers == .initial and
+            (bytes.len != 0 or end_stream))
+            return error.Protocol;
+
+        // A CONNECT request has no HTTP message content. On client-created
+        // streams, non-empty DATA becomes tunnel data only after a successful
+        // final response has established the tunnel. A rejected CONNECT never
+        // transitions the request direction into tunnel mode.
+        if (self.streams.local_role == .client and self.streams.localInitiated(stream_id) and bytes.len != 0) {
+            if (tracked.request_method == .connect and tracked.remote_headers == .initial) return error.Protocol;
+            if (tracked.request_method == .connect_rejected) return error.Protocol;
+        }
         const credit = if (fused_credit)
             try self.dataSendCreditTrackedFused(tracked)
         else
@@ -947,10 +986,10 @@ pub const Session = struct {
     }
 
     /// Processes one validated complete frame. The frame payload remains
-    /// caller-owned and zero-copy. `sink.field()` is called synchronously for
-    /// each HPACK field while it is valid; callers should commit side effects
-    /// only after this function returns a successful `.headers` or
-    /// `.push_promise` event because later fields can invalidate the section.
+    /// caller-owned and zero-copy. Header sinks are transactional: Session calls
+    /// `begin`, streams callback-lifetime HPACK fields through `field`, then
+    /// calls `commit` only after the complete section and stream transition are
+    /// valid. Any later validation/codec/state failure calls `abort` instead.
     pub inline fn receiveComplete(
         self: *Session,
         store: anytype,
@@ -1017,9 +1056,32 @@ pub const Session = struct {
             error.Protocol => .{ .fault = .{ .connection = .protocol_error } },
         };
         const end_stream = (complete.header.flags & 0x01) != 0;
+        var body_probe: ?fields.BodyState = null;
+        var body_invalid = false;
+        if (store.get(complete.header.stream_id)) |tracked| {
+            const body = store.bodyState(complete.header.stream_id) orelse unreachable;
+            body_probe = body.*;
+            if (body_probe) |*probe| {
+                // CONNECT request DATA is not message content. The server may
+                // treat it as tunnel bytes only after Session has successfully
+                // sent a 2xx final response; rejected CONNECT requests retain
+                // `connect_rejected` and never take this transition.
+                if (probe.mode == .no_content and tracked.request_method == .connect and
+                    tracked.local_headers == .regular)
+                    probe.mode = .tunnel;
+                probe.data(bytes.len, end_stream) catch {
+                    body_invalid = true;
+                };
+            }
+        }
         const result = self.streams.receiveData(store, complete.header.stream_id, complete.header.length, end_stream);
         if (receiveFault(complete.header.stream_id, result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
+        if (body_invalid) return .{ .fault = .{ .stream = .{ .stream_id = complete.header.stream_id, .code = .protocol_error } } };
+        if (body_probe) |probe| {
+            const body = store.bodyState(complete.header.stream_id) orelse unreachable;
+            body.* = probe;
+        }
         return .{ .data = .{
             .stream_id = complete.header.stream_id,
             .end_stream = end_stream,
@@ -1084,6 +1146,10 @@ pub const Session = struct {
     fn finishBlock(self: *Session, store: anytype, pending: Pending, block: []const u8, scratch: []u8, sink: anytype) hpack.codec.Error!Event {
         const state_result: ?streams_mod.ReceiveResult = if (pending.isPushPromise()) null else self.streams.classifyHeaders(store, pending.streamId());
         const field_kind: fields.Kind = if (pending.isPushPromise()) .request else self.headerKind(store, pending.streamId());
+        const sink_stream_id = if (pending.isPushPromise()) pending.promisedStream() else pending.streamId();
+        var sink_active = state_result == null or state_result.? == .accepted;
+        if (sink_active) sink.begin(sink_stream_id, field_kind);
+        defer if (sink_active) sink.abort(sink_stream_id, field_kind);
         var validator = fields.Validator.init(field_kind);
         var it = self.decoder.iterator(block, scratch);
         var field_count: u32 = 0;
@@ -1111,7 +1177,7 @@ pub const Session = struct {
                 if (field_kind == .response and header.name.len == 7 and std.mem.eql(u8, header.name, ":status")) {
                     status_code = @as(u16, header.value[0] - '0') * 100 + @as(u16, header.value[1] - '0') * 10 + @as(u16, header.value[2] - '0');
                 }
-                sink.field(if (pending.isPushPromise()) pending.promisedStream() else pending.streamId(), field_kind, header);
+                sink.field(sink_stream_id, field_kind, header);
                 field_count +|= 1;
             }
         }
@@ -1144,8 +1210,27 @@ pub const Session = struct {
             return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
         }
 
-        if (pending.isPushPromise()) return self.commitPushPromise(store, pending, field_count);
-        return self.commitHeaders(store, pending, field_kind, status_code, field_count, validator.content_length, validator.extendedConnect());
+        const event = if (pending.isPushPromise())
+            self.commitPushPromise(store, pending, field_count, validator.requestMethod())
+        else
+            self.commitHeaders(
+                store,
+                pending,
+                field_kind,
+                status_code,
+                field_count,
+                validator.content_length,
+                validator.extendedConnect(),
+                validator.requestMethod(),
+            );
+        switch (event) {
+            .headers, .push_promise => {
+                sink.commit(sink_stream_id, field_kind);
+                sink_active = false;
+            },
+            else => {},
+        }
+        return event;
     }
 
     fn headerKind(self: *Session, store: anytype, stream_id: u31) fields.Kind {
@@ -1154,22 +1239,69 @@ pub const Session = struct {
         return if (self.streams.local_role == .server and self.streams.remoteInitiated(stream_id)) .request else .response;
     }
 
-    fn commitHeaders(self: *Session, store: anytype, pending: Pending, field_kind: fields.Kind, status: u16, field_count: u32, content_length: ?u64, extended_connect: bool) Event {
+    fn commitHeaders(
+        self: *Session,
+        store: anytype,
+        pending: Pending,
+        field_kind: fields.Kind,
+        status: u16,
+        field_count: u32,
+        content_length: ?u64,
+        extended_connect: bool,
+        request_method: fields.RequestMethod,
+    ) Event {
         const end_stream = pending.endStream();
         const informational = field_kind == .response and status >= 100 and status < 200;
         if ((field_kind == .response and status == 101) or
             (informational and end_stream) or (field_kind == .trailers and !end_stream))
             return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
 
+        var body_probe: ?fields.BodyState = null;
+        var body_invalid = false;
+        if (field_kind == .trailers) {
+            if (store.get(pending.streamId()) != null) {
+                const body = store.bodyState(pending.streamId()) orelse unreachable;
+                body_probe = body.*;
+                if (body_probe) |probe| probe.finish() catch {
+                    body_invalid = true;
+                };
+            }
+        } else if (!informational) {
+            var probe: fields.BodyState = .{};
+            const tracked = store.get(pending.streamId());
+            const effective_method: fields.RequestMethod = if (field_kind == .request)
+                request_method
+            else if (tracked) |value|
+                value.request_method
+            else
+                .other;
+            probe.begin(content_length, bodyMode(field_kind, status, effective_method), end_stream) catch {
+                body_invalid = true;
+            };
+            body_probe = probe;
+        }
+
         const result = self.streams.receiveHeaders(store, pending.streamId(), end_stream);
         if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
+        if (body_invalid) return .{ .fault = .{ .stream = .{ .stream_id = pending.streamId(), .code = .protocol_error } } };
 
         if (store.get(pending.streamId())) |tracked| {
             if (field_kind == .trailers) {
                 tracked.remote_headers = .trailers;
             } else if (field_kind == .request or !informational) {
                 tracked.remote_headers = .regular;
+            }
+            if (field_kind == .request) {
+                tracked.request_method = request_method;
+            } else if (field_kind == .response and !informational and tracked.request_method == .connect and
+                !(status >= 200 and status < 300))
+            {
+                tracked.request_method = .connect_rejected;
+            }
+            if (body_probe) |probe| {
+                const body = store.bodyState(pending.streamId()) orelse unreachable;
+                body.* = probe;
             }
         }
         return .{ .headers = .{
@@ -1184,11 +1316,13 @@ pub const Session = struct {
         } };
     }
 
-    fn commitPushPromise(self: *Session, store: anytype, pending: Pending, field_count: u32) Event {
+    fn commitPushPromise(self: *Session, store: anytype, pending: Pending, field_count: u32, request_method: fields.RequestMethod) Event {
         const promised_stream_id = pending.promisedStream();
         const result = self.streams.receivePushPromise(store, pending.streamId(), promised_stream_id);
         if (receiveFault(pending.streamId(), result)) |fault| return .{ .fault = fault };
         if (result == .ignored_after_goaway) return .ignored;
+        const tracked = store.get(promised_stream_id) orelse unreachable;
+        tracked.request_method = request_method;
         return .{ .push_promise = .{
             .associated_stream_id = pending.streamId(),
             .promised_stream_id = promised_stream_id,
@@ -1292,7 +1426,9 @@ fn validateLocalSettings(
 
 const LocalFieldInfo = struct {
     status: u16 = 0,
+    content_length: ?u64 = null,
     extended_connect: bool = false,
+    request_method: fields.RequestMethod = .other,
 };
 
 fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack.EncodedField) error{Protocol}!LocalFieldInfo {
@@ -1311,7 +1447,32 @@ fn validateLocalFields(kind: fields.Kind, end_stream: bool, items: []const hpack
         const informational = status >= 100 and status < 200;
         if (status == 101 or (informational and end_stream)) return error.Protocol;
     }
-    return .{ .status = status, .extended_connect = validator.extendedConnect() };
+    return .{
+        .status = status,
+        .content_length = validator.content_length,
+        .extended_connect = validator.extendedConnect(),
+        .request_method = validator.requestMethod(),
+    };
+}
+
+fn validateLocalResponseContext(
+    kind: fields.Kind,
+    info: LocalFieldInfo,
+    tracked: ?*const stream_mod.Tracked,
+) error{Protocol}!void {
+    if (kind != .response or info.status < 200 or info.status >= 300) return;
+    const stream = tracked orelse return;
+    // RFC 9110 forbids Content-Length in a successful CONNECT response; after
+    // this field section DATA is tunnel data rather than HTTP message content.
+    if (stream.request_method == .connect and info.content_length != null) return error.Protocol;
+}
+
+fn bodyMode(kind: fields.Kind, status: u16, request_method: fields.RequestMethod) fields.BodyState.Mode {
+    if (kind == .request) return if (request_method == .connect) .no_content else .unbounded;
+    if (kind != .response) return .unbounded;
+    if (request_method == .head or status == 204 or status == 205 or status == 304) return .no_content;
+    if (request_method == .connect and status >= 200 and status < 300) return .tunnel;
+    return .unbounded;
 }
 
 fn validateTrailerPolicy(items: []const hpack.EncodedField, policy: anytype) error{TrailerRejected}!void {
@@ -1327,7 +1488,12 @@ fn receiveFault(stream_id: u31, result: streams_mod.ReceiveResult) ?Fault {
 }
 
 const TestStore = struct {
-    const Slot = struct { id: u31 = 0, used: bool = false, value: stream_mod.Tracked = undefined };
+    const Slot = struct {
+        id: u31 = 0,
+        used: bool = false,
+        value: stream_mod.Tracked = undefined,
+        body: fields.BodyState = .{},
+    };
     slots: [8]Slot = [_]Slot{.{}} ** 8,
     max_adjustment_scans: u32 = 0,
 
@@ -1348,6 +1514,12 @@ const TestStore = struct {
         return &s.value;
     }
 
+    pub fn bodyState(self: *TestStore, id: u31) ?*fields.BodyState {
+        const s = &self.slots[slot(id)];
+        if (!s.used or s.id != id) return null;
+        return &s.body;
+    }
+
     pub fn maxActiveSendAdjustment(self: *TestStore) i32 {
         self.max_adjustment_scans += 1;
         var result: i32 = 0;
@@ -1359,6 +1531,32 @@ const TestStore = struct {
             }
         }
         return result;
+    }
+};
+
+const TransactionTestSink = struct {
+    pending: u32 = 0,
+    committed: u32 = 0,
+    commits: u32 = 0,
+    aborts: u32 = 0,
+
+    pub fn begin(self: *TransactionTestSink, _: u31, _: fields.Kind) void {
+        std.debug.assert(self.pending == 0);
+    }
+
+    pub fn field(self: *TransactionTestSink, _: u31, _: fields.Kind, _: common.Header) void {
+        self.pending += 1;
+    }
+
+    pub fn commit(self: *TransactionTestSink, _: u31, _: fields.Kind) void {
+        self.committed += self.pending;
+        self.pending = 0;
+        self.commits += 1;
+    }
+
+    pub fn abort(self: *TransactionTestSink, _: u31, _: fields.Kind) void {
+        self.pending = 0;
+        self.aborts += 1;
     }
 };
 
@@ -1422,6 +1620,368 @@ test "session receiveBytes waits for a complete frame and dispatches it" {
     try std.testing.expectEqual(bytes.len, received.consumed);
     try std.testing.expectEqual(fields.Kind.request, received.event.headers.kind);
     try std.testing.expect(received.event.headers.end_stream);
+}
+
+test "session rejects Content-Length mismatch when DATA ends early" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var header_storage: [1024]u8 = undefined;
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [1024]u8 = undefined;
+
+    const request = [_]common.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/upload" },
+        .{ .name = "content-length", .value = "5" },
+    };
+    const block = try encodedFields(allocator, &wire_encoder, &request);
+    defer allocator.free(block);
+    const headers = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 1 },
+        .payload = block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(fields.Kind.request, headers.headers.kind);
+    try std.testing.expectEqual(fields.BodyState.Mode.length, store.bodyState(1).?.mode);
+    try std.testing.expectEqual(@as(u64, 5), store.bodyState(1).?.remaining);
+
+    const data = try session.receiveComplete(&store, .{
+        .header = .{ .length = 4, .type = .data, .flags = 0x01, .stream_id = 1 },
+        .payload = "four",
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, data.fault.stream.code);
+    try std.testing.expectEqual(@as(u31, 1), data.fault.stream.stream_id);
+}
+
+test "session rejects DATA for response defined to have no content" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var header_storage: [1024]u8 = undefined;
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var staging: [128]u8 = undefined;
+    var request_wire_storage: [512]u8 = undefined;
+    var request_wire = std.Io.Writer.fixed(&request_wire_storage);
+    const request = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "HEAD" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+        .{ .field = .{ .name = ":path", .value = "/meta" } },
+    };
+    _ = try session.sendHeaders(&store, &request_wire, 1, true, &staging, &request);
+    try std.testing.expectEqual(fields.RequestMethod.head, store.get(1).?.request_method);
+
+    const response_fields = [_]common.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-length", .value = "123" },
+    };
+    const block = try encodedFields(allocator, &wire_encoder, &response_fields);
+    defer allocator.free(block);
+    var sink: NullSink = .{};
+    var scratch: [1024]u8 = undefined;
+    const response = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 1 },
+        .payload = block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(fields.Kind.response, response.headers.kind);
+    try std.testing.expectEqual(fields.BodyState.Mode.no_content, store.bodyState(1).?.mode);
+
+    const empty = try session.receiveComplete(&store, .{
+        .header = .{ .length = 0, .type = .data, .flags = 0x00, .stream_id = 1 },
+        .payload = "",
+    }, &scratch, &sink);
+    try std.testing.expectEqual(@as(usize, 0), empty.data.bytes.len);
+    try std.testing.expect(!empty.data.end_stream);
+
+    const data = try session.receiveComplete(&store, .{
+        .header = .{ .length = 1, .type = .data, .flags = 0x01, .stream_id = 1 },
+        .payload = "x",
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, data.fault.stream.code);
+}
+
+test "client rejects DATA before final response headers" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var header_storage: [256]u8 = undefined;
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var request_wire_storage: [512]u8 = undefined;
+    var request_wire = std.Io.Writer.fixed(&request_wire_storage);
+    var staging: [128]u8 = undefined;
+    const request = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+        .{ .field = .{ .name = ":path", .value = "/" } },
+    };
+    _ = try session.sendHeaders(&store, &request_wire, 1, true, &staging, &request);
+    try std.testing.expectEqual(fields.BodyState.Mode.awaiting_headers, store.bodyState(1).?.mode);
+
+    var sink: NullSink = .{};
+    var scratch: [64]u8 = undefined;
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = 0, .type = .data, .flags = 0x01, .stream_id = 1 },
+        .payload = "",
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, event.fault.stream.code);
+    try std.testing.expectEqual(@as(u31, 1), event.fault.stream.stream_id);
+}
+
+test "server send path rejects DATA before final response headers" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var header_storage: [512]u8 = undefined;
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [512]u8 = undefined;
+    const request_fields = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+    };
+    const block = try encodedFields(allocator, &wire_encoder, &request_fields);
+    defer allocator.free(block);
+    _ = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x05, .stream_id = 1 },
+        .payload = block,
+    }, &scratch, &sink);
+
+    var wire_storage: [128]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expectError(error.Protocol, session.sendData(&store, &wire, 1, "x", false));
+    try std.testing.expectError(error.Protocol, session.sendData(&store, &wire, 1, "", true));
+    try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
+}
+
+test "transactional field sink aborts malformed authority mismatch" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var header_storage: [1024]u8 = undefined;
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var sink: TransactionTestSink = .{};
+    var scratch: [1024]u8 = undefined;
+    const request = [_]common.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "x-before-host", .value = "visible-only-if-committed" },
+        .{ .name = "host", .value = "other.example" },
+    };
+    const block = try encodedFields(allocator, &wire_encoder, &request);
+    defer allocator.free(block);
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x05, .stream_id = 1 },
+        .payload = block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(protocol.ErrorCode.protocol_error, event.fault.stream.code);
+    try std.testing.expectEqual(@as(u32, 0), sink.committed);
+    try std.testing.expectEqual(@as(u32, 0), sink.commits);
+    try std.testing.expectEqual(@as(u32, 1), sink.aborts);
+}
+
+test "send preflight rejects Host authority mismatch before wire mutation" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var header_storage: [256]u8 = undefined;
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    var staging: [128]u8 = undefined;
+    const request = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+        .{ .field = .{ .name = ":path", .value = "/" } },
+        .{ .field = .{ .name = "host", .value = "other.example" } },
+    };
+    try std.testing.expectError(error.Protocol, session.sendHeaders(&store, &wire, 1, true, &staging, &request));
+    try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
+    try std.testing.expect(store.get(1) == null);
+}
+
+test "CONNECT request DATA becomes tunnel data only after successful response" {
+    const allocator = std.testing.allocator;
+
+    // A server cannot treat bytes following the CONNECT request field section
+    // as message content or tunnel bytes before it has established the tunnel.
+    {
+        var inbound = hpack.Decoder.init(allocator, 4096);
+        defer inbound.deinit();
+        var outbound = hpack.Encoder.init(allocator, 4096);
+        defer outbound.deinit();
+        var wire_encoder = hpack.Encoder.init(allocator, 4096);
+        defer wire_encoder.deinit();
+        var header_storage: [512]u8 = undefined;
+        var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+        var store: TestStore = .{};
+        var sink: NullSink = .{};
+        var scratch: [512]u8 = undefined;
+        const request_fields = [_]common.Header{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":authority", .value = "example.com:443" },
+        };
+        const block = try encodedFields(allocator, &wire_encoder, &request_fields);
+        defer allocator.free(block);
+        _ = try session.receiveComplete(&store, .{
+            .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 1 },
+            .payload = block,
+        }, &scratch, &sink);
+        try std.testing.expectEqual(fields.BodyState.Mode.no_content, store.bodyState(1).?.mode);
+
+        const early = try session.receiveComplete(&store, .{
+            .header = .{ .length = 1, .type = .data, .flags = 0, .stream_id = 1 },
+            .payload = "x",
+        }, &scratch, &sink);
+        try std.testing.expectEqual(protocol.ErrorCode.protocol_error, early.fault.stream.code);
+    }
+
+    // Once a 2xx response has been committed, subsequent client DATA carries
+    // tunnel bytes and is no longer subject to HTTP message-content semantics.
+    {
+        var inbound = hpack.Decoder.init(allocator, 4096);
+        defer inbound.deinit();
+        var outbound = hpack.Encoder.init(allocator, 4096);
+        defer outbound.deinit();
+        var wire_encoder = hpack.Encoder.init(allocator, 4096);
+        defer wire_encoder.deinit();
+        var header_storage: [512]u8 = undefined;
+        var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+        var store: TestStore = .{};
+        var sink: NullSink = .{};
+        var scratch: [512]u8 = undefined;
+        const request_fields = [_]common.Header{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":authority", .value = "example.com:443" },
+        };
+        const block = try encodedFields(allocator, &wire_encoder, &request_fields);
+        defer allocator.free(block);
+        _ = try session.receiveComplete(&store, .{
+            .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 1 },
+            .payload = block,
+        }, &scratch, &sink);
+
+        var response_wire_storage: [256]u8 = undefined;
+        var response_wire = std.Io.Writer.fixed(&response_wire_storage);
+        var staging: [128]u8 = undefined;
+        const response = [_]hpack.EncodedField{.{ .field = .{ .name = ":status", .value = "200" } }};
+        _ = try session.sendHeaders(&store, &response_wire, 1, false, &staging, &response);
+
+        const tunnel = try session.receiveComplete(&store, .{
+            .header = .{ .length = 3, .type = .data, .flags = 0x01, .stream_id = 1 },
+            .payload = "abc",
+        }, &scratch, &sink);
+        try std.testing.expectEqualStrings("abc", tunnel.data.bytes);
+        try std.testing.expectEqual(fields.BodyState.Mode.tunnel, store.bodyState(1).?.mode);
+    }
+}
+
+test "client CONNECT send path rejects early data and opens after 2xx" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var header_storage: [512]u8 = undefined;
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var wire_storage: [1024]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    var staging: [128]u8 = undefined;
+    const request = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "CONNECT" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com:443" } },
+    };
+    _ = try session.sendHeaders(&store, &wire, 1, false, &staging, &request);
+    const before = wire.buffered().len;
+    try std.testing.expectError(error.Protocol, session.sendData(&store, &wire, 1, "early", false));
+    try std.testing.expectEqual(before, wire.buffered().len);
+
+    const response_fields = [_]common.Header{.{ .name = ":status", .value = "200" }};
+    const block = try encodedFields(allocator, &wire_encoder, &response_fields);
+    defer allocator.free(block);
+    var sink: NullSink = .{};
+    var scratch: [512]u8 = undefined;
+    _ = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 1 },
+        .payload = block,
+    }, &scratch, &sink);
+
+    const sent = try session.sendData(&store, &wire, 1, "tunnel", false);
+    try std.testing.expectEqual(@as(usize, 6), sent.consumed);
+}
+
+test "send preflight rejects Content-Length on successful CONNECT response" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var wire_encoder = hpack.Encoder.init(allocator, 4096);
+    defer wire_encoder.deinit();
+    var header_storage: [512]u8 = undefined;
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [512]u8 = undefined;
+
+    const request_fields = [_]common.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.com:443" },
+    };
+    const block = try encodedFields(allocator, &wire_encoder, &request_fields);
+    defer allocator.free(block);
+    _ = try session.receiveComplete(&store, .{
+        .header = .{ .length = @intCast(block.len), .type = .headers, .flags = 0x04, .stream_id = 1 },
+        .payload = block,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(fields.RequestMethod.connect, store.get(1).?.request_method);
+
+    var wire_storage: [256]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    var staging: [128]u8 = undefined;
+    const response = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":status", .value = "200" } },
+        .{ .field = .{ .name = "content-length", .value = "0" } },
+    };
+    try std.testing.expectError(error.Protocol, session.sendHeaders(&store, &wire, 1, false, &staging, &response));
+    try std.testing.expectEqual(@as(usize, 0), wire.buffered().len);
 }
 
 test "session decodes request response and trailers without growing Tracked" {
@@ -2392,6 +2952,8 @@ test "DATA event exposes full flow-controlled payload length" {
     var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &block_storage });
     var store: TestStore = .{};
     try std.testing.expectEqual(streams_mod.ReceiveResult.accepted, session.streams.receiveHeaders(&store, 1, false));
+    // This accounting-only fixture intentionally bypasses HEADERS decoding.
+    store.bodyState(1).?.* = .{ .mode = .unbounded };
 
     const padded = [_]u8{ 2, 'a', 'b', 'c', 0, 0 };
     var scratch: [1]u8 = undefined;
@@ -2548,6 +3110,8 @@ test "prechecked Session path does not double-charge connection DATA window" {
     try tracked.stream.localHeaders(true);
     try tracked.stream.remoteHeaders(false);
     _ = store.insert(1, tracked).?;
+    // This accounting-only fixture intentionally bypasses response HEADERS.
+    store.bodyState(1).?.* = .{ .mode = .unbounded };
     session.streams.local_active = 1;
 
     const complete: frame.CompleteFrame = .{

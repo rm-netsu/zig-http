@@ -1,4 +1,5 @@
 const std = @import("std");
+const fields = @import("fields.zig");
 const flow = @import("flow.zig");
 
 pub const State = enum {
@@ -115,6 +116,10 @@ pub const Tracked = struct {
     stream: Stream = .{},
     remote_headers: RemoteHeaders = .initial,
     local_headers: RemoteHeaders = .initial,
+    /// Request method retained only when it changes response content semantics.
+    /// This occupies the byte that previously padded `Windows` alignment, so
+    /// Tracked remains 12 bytes on 64-bit targets.
+    request_method: fields.RequestMethod = .other,
     windows: Windows,
 
     pub fn init(local_initial_window: u31) Tracked {

@@ -79,6 +79,7 @@ pub const Store = struct {
         id: u31 = 0,
         used: bool = false,
         value: http.http2.stream.Tracked = undefined,
+        body: http.http2.fields.BodyState = .{},
     };
     slots: [store_slots]Slot = [_]Slot{.{}} ** store_slots,
 
@@ -109,6 +110,12 @@ pub const Store = struct {
             }
         }
         return result;
+    }
+
+    pub inline fn bodyState(self: *Store, id: u31) ?*http.http2.fields.BodyState {
+        const slot = &self.slots[index(id)];
+        if (!slot.used or slot.id != id) return null;
+        return &slot.body;
     }
 };
 

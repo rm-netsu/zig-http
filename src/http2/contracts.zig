@@ -41,24 +41,34 @@ pub fn assertStreamStore(comptime T: type) void {
 /// `Session` needs one additional rare-path query when a positive
 /// SETTINGS_INITIAL_WINDOW_SIZE delta could overflow an active stream window.
 pub fn hasSessionStore(comptime T: type) bool {
-    return hasStreamStore(T) and hasDecl(T, "maxActiveSendAdjustment");
+    return hasStreamStore(T) and hasDecl(T, "maxActiveSendAdjustment") and hasDecl(T, "bodyState");
 }
 
 pub fn assertSessionStore(comptime T: type) void {
     assertStreamStore(T);
     if (!hasDecl(T, "maxActiveSendAdjustment"))
         @compileError("zig-http HTTP/2 Session store must provide maxActiveSendAdjustment() i32");
+    if (!hasDecl(T, "bodyState"))
+        @compileError("zig-http HTTP/2 Session store must provide bodyState(stream_id) returning ?*http2.fields.BodyState");
 }
 
-/// Header sinks are deliberately structural and synchronous so callers can
-/// project fields directly into their own request/response representation.
+/// Header sinks are structural, synchronous, and transactional. HPACK field
+/// slices are callback-lifetime borrows, so Session cannot stage them itself;
+/// instead the sink stages application side effects between begin/commit and
+/// rolls them back on abort if a later field invalidates the section.
 pub fn hasFieldSink(comptime T: type) bool {
-    return hasDecl(T, "field");
+    return hasDecl(T, "begin") and hasDecl(T, "field") and hasDecl(T, "commit") and hasDecl(T, "abort");
 }
 
 pub fn assertFieldSink(comptime T: type) void {
+    if (!hasDecl(T, "begin"))
+        @compileError("zig-http HTTP/2 field sink must provide begin(stream_id, kind)");
     if (!hasDecl(T, "field"))
         @compileError("zig-http HTTP/2 field sink must provide field(stream_id, kind, header)");
+    if (!hasDecl(T, "commit"))
+        @compileError("zig-http HTTP/2 field sink must provide commit(stream_id, kind)");
+    if (!hasDecl(T, "abort"))
+        @compileError("zig-http HTTP/2 field sink must provide abort(stream_id, kind)");
 }
 
 /// Trailer policies are caller-owned because core cannot know the semantics of
@@ -84,9 +94,15 @@ test "contract predicates detect required structural declarations" {
         pub fn maxActiveSendAdjustment(_: *@This()) i32 {
             return 0;
         }
+        pub fn bodyState(_: *@This(), _: u31) ?*u8 {
+            return null;
+        }
     };
     const Sink = struct {
+        pub fn begin(_: *@This(), _: u31, _: u8) void {}
         pub fn field(_: *@This(), _: u31, _: u8, _: u8) void {}
+        pub fn commit(_: *@This(), _: u31, _: u8) void {}
+        pub fn abort(_: *@This(), _: u31, _: u8) void {}
     };
     const Incomplete = struct {};
 

@@ -77,9 +77,10 @@ Start with:
 
 The support files are deliberately simple reference implementations rather than
 core-owned storage policy. `support/fixed_stream_store.zig` shows the complete
-Session store surface (`get`, `insert`, and `maxActiveSendAdjustment`) while
-`support/counting_field_sink.zig` demonstrates the synchronous `field` callback
-without retaining borrowed HPACK slices. Production applications can substitute
+Session store surface (`get`, `insert`, `bodyState`, and
+`maxActiveSendAdjustment`) while `support/counting_field_sink.zig` demonstrates
+transactional synchronous `begin`/`field`/`commit`/`abort` callbacks without
+retaining borrowed HPACK slices. Production applications can substitute
 slabs, hash tables, shards, or direct projection into application state.
 
 Public names intentionally follow one path per abstraction level. Composed entry
@@ -331,8 +332,8 @@ caller-owned policy.
 HTTP/2 caller-owned storage remains structurally typed. `http2.contracts`
 provides `hasStreamStore`, `hasSessionStore`, and `hasFieldSink` predicates plus
 `assert*` helpers. The composed `Session` invokes these at its public generic
-boundary so a missing `get`, `insert`, `maxActiveSendAdjustment`, or `field`
-operation fails with a short zig-http-specific compile error rather than a deep
+boundary so a missing `get`, `insert`, `bodyState`, `maxActiveSendAdjustment`,
+`begin`, `field`, `commit`, or `abort` operation fails with a short zig-http-specific compile error rather than a deep
 instantiation trace. These helpers intentionally preflight operation presence;
 ordinary Zig method resolution remains the authority for exact signatures. No
 vtable, allocator, or concrete store type is introduced.
@@ -457,7 +458,8 @@ low-level lookup API needs only `get(id)` and `insert(id, Tracked)`; slab,
 fixed-array, hash-table, intrusive, or sharded storage remains an application
 choice. The composed `Session` additionally asks for
 `maxActiveSendAdjustment()` only on the rare SETTINGS initial-window
-overflow-validation path.
+overflow-validation path and for caller-owned `bodyState(stream_id)` records
+when validating inbound HTTP message-content semantics.
 
 ```zig
 var manager = http.http2.streams.Manager.init(.client, .{});
@@ -609,10 +611,12 @@ Once Session is used for a stream, keep inbound field-section transitions on
 that path rather than mixing manual `StreamManager` HEADERS transitions with
 Session on the same stream.
 
-The field sink is synchronous because HPACK field slices may be invalidated by
-the next decoder step. Treat sink callbacks as provisional and commit application
-side effects only after `receiveComplete()` / `receiveBytes()` returns a successful
-`.headers` or `.push_promise` event. HPACK codec failures are returned directly.
+The field sink is synchronous and transactional because HPACK field slices may be
+invalidated by the next decoder step. Session brackets each accepted field section
+with `begin()`, zero or more `field()` calls, then exactly one `commit()` or
+`abort()`. Stage any application side effects until `commit()`; malformed late
+fields, HPACK failures, and stream-state rejection automatically reach `abort()`.
+HPACK codec failures are returned directly.
 Except for header-list overflow, which Session drains through `Iterator.finish()`,
 callers should treat an undecodable HPACK block as connection-fatal because the
 compression context cannot in general be resumed safely.
@@ -622,9 +626,15 @@ A Session store uses the same caller-owned `get`/`insert` contract as
 O(1) because each stream send window is represented relative to the current peer
 initial window. Only a rare increase that could overflow an active stream asks
 the store for `maxActiveSendAdjustment() i32`; the store can satisfy that query
-with a scan, a maintained aggregate, or shard coordination. Received
-`SETTINGS_HEADER_TABLE_SIZE` updates the caller-owned outbound HPACK encoder's
-allowed table size automatically.
+with a scan, a maintained aggregate, or shard coordination. The store also exposes
+`bodyState(stream_id)`, a caller-owned `http2.fields.BodyState` used by Session to
+check inbound Content-Length totals, no-content semantics, DATA-before-response
+ordering, and CONNECT tunnel establishment while keeping `Tracked` at 12 bytes.
+Store insertion/reuse must reset this state to its default `awaiting_headers` value;
+managed `sendHeaders()` also resets it after a local request is committed.
+`Tracked.request_method` retains only HEAD/CONNECT correlation needed for response
+semantics. Received `SETTINGS_HEADER_TABLE_SIZE` updates the caller-owned outbound
+HPACK encoder's allowed table size automatically.
 
 ## HTTP/2 send-side Session
 

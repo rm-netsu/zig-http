@@ -175,6 +175,16 @@ pub fn build(b: *std.Build) void {
     all_checks_step.dependOn(docs_step);
     all_checks_step.dependOn(conformance_step);
 
+    // Release gate: run the reproducible aggregate first, then upstream h2spec
+    // on the same fixture port. A separate command instance gives the build
+    // graph an explicit ordering edge and avoids racing two fixture servers.
+    const run_release_h2spec = b.addSystemCommand(&.{ "sh", "test/conformance/run-h2spec.sh" });
+    run_release_h2spec.setCwd(b.path("."));
+    run_release_h2spec.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    run_release_h2spec.step.dependOn(all_checks_step);
+    const release_checks_step = b.step("release-checks", "Run all release gates including strict upstream h2spec");
+    release_checks_step.dependOn(&run_release_h2spec.step);
+
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,

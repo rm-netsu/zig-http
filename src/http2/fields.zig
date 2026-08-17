@@ -4,6 +4,11 @@ const uri = @import("../uri.zig");
 
 pub const Kind = enum { request, response, trailers };
 
+/// Request-method semantics retained across a stream only when they affect
+/// response body rules. Keeping the enum intentionally small avoids turning
+/// Session into an application method registry.
+pub const RequestMethod = enum(u2) { other, head, connect, connect_rejected };
+
 pub const RequestTarget = struct {
     const Scheme = enum(u2) { none, http, https, other };
 
@@ -44,6 +49,10 @@ pub const RequestTarget = struct {
 
     pub fn authorityField(self: *RequestTarget, value: []const u8) error{InvalidHeader}!void {
         const info = uri.validateAuthority(value) orelse return error.InvalidHeader;
+        self.setAuthorityInfo(info);
+    }
+
+    fn setAuthorityInfo(self: *RequestTarget, info: uri.AuthorityInfo) void {
         self.authority_seen = true;
         self.authority_empty_host = info.empty_host;
         self.authority_userinfo = info.has_userinfo;
@@ -87,12 +96,15 @@ pub const Validator = struct {
     authority_seen: bool = false,
     status_seen: bool = false,
     method_connect: bool = false,
+    method_head: bool = false,
     protocol_seen: bool = false,
     request_target: RequestTarget = .{},
     /// Parsed Content-Length for the current initial field section. Keeping
     /// this on the ephemeral validator lets Session surface HTTP message
     /// semantics without adding per-stream storage to the protocol engine.
     content_length: ?u64 = null,
+    authority_reference: ?uri.HostAuthorityReference = null,
+    host_seen: bool = false,
 
     pub fn init(kind: Kind) Validator {
         return .{ .kind = kind };
@@ -119,7 +131,9 @@ pub const Validator = struct {
                 10 => {
                     if (!std.mem.eql(u8, h.name, ":authority") or self.kind != .request or self.authority_seen)
                         return error.InvalidHeader;
-                    try self.request_target.authorityField(h.value);
+                    const authority_info = uri.validateAuthority(h.value) orelse return error.InvalidHeader;
+                    self.request_target.setAuthorityInfo(authority_info);
+                    self.authority_reference = uri.HostAuthorityReference.captureValidated(h.value, authority_info);
                     self.authority_seen = true;
                 },
                 7 => switch (h.name[1]) {
@@ -128,6 +142,7 @@ pub const Validator = struct {
                             return error.InvalidHeader;
                         self.method_seen = true;
                         self.method_connect = std.mem.eql(u8, h.value, "CONNECT");
+                        self.method_head = std.mem.eql(u8, h.value, "HEAD");
                         try self.request_target.method(h.value);
                     },
                     's' => switch (h.name[2]) {
@@ -182,6 +197,20 @@ pub const Validator = struct {
                     self.content_length = length;
                 }
             },
+            4 => if (std.mem.eql(u8, h.name, "host")) {
+                if (self.kind != .request or self.host_seen) return error.InvalidHeader;
+                const host_info = uri.validateAuthority(h.value) orelse return error.InvalidHeader;
+                if (host_info.has_userinfo) return error.InvalidHeader;
+                if (self.authority_reference) |authority| {
+                    const scheme: uri.Scheme = switch (self.request_target.scheme) {
+                        .http => .http,
+                        .https => .https,
+                        .none, .other => .other,
+                    };
+                    if (!authority.eqlHostValidated(host_info, scheme)) return error.InvalidHeader;
+                }
+                self.host_seen = true;
+            },
             16 => if (std.mem.eql(u8, h.name, "proxy-connection")) return error.InvalidHeader,
             17 => if (std.mem.eql(u8, h.name, "transfer-encoding")) return error.InvalidHeader,
             else => {},
@@ -213,13 +242,18 @@ pub const Validator = struct {
     pub inline fn extendedConnect(self: Validator) bool {
         return self.kind == .request and self.method_connect and self.protocol_seen;
     }
+
+    pub inline fn requestMethod(self: Validator) RequestMethod {
+        if (self.method_head) return .head;
+        if (self.method_connect) return .connect;
+        return .other;
+    }
 };
 
-/// Caller-owned HTTP message-body length validation. HTTP/2 framing knows the
-/// bytes carried by DATA, but retaining application message metadata for every
-/// stream is policy/state ownership that Session deliberately leaves outside
-/// the connection engine. Consumers that care about Content-Length semantics
-/// can keep this tiny helper next to their own stream/application record.
+/// Standalone caller-owned HTTP message-body length validation for consumers
+/// composing lower-level frame/stream primitives manually. The integrated
+/// `Session` uses `BodyState` through its stream-store contract, so Session
+/// users do not need to maintain this helper in parallel.
 pub const BodyLength = struct {
     expected: ?u64 = null,
     received: u64 = 0,
@@ -241,6 +275,61 @@ pub const BodyLength = struct {
         if (self.expected) |expected| {
             if (self.received != expected) return error.Protocol;
         }
+    }
+};
+
+/// Receive-side message-content state for composed HTTP/2 Session users.
+/// It deliberately stores only the remaining declared content length and the
+/// current semantic mode. Request method correlation lives in `stream.Tracked`
+/// so the same state works for request content and response content.
+pub const BodyState = struct {
+    remaining: u64 = 0,
+    mode: Mode = .awaiting_headers,
+
+    pub const Mode = enum(u3) {
+        /// No final inbound header section has established message semantics.
+        /// Any DATA frame in this phase is malformed, even when empty.
+        awaiting_headers,
+        /// Ordinary message content without a Content-Length field.
+        unbounded,
+        /// Ordinary message content with `remaining` bytes still required.
+        length,
+        /// The message is defined to have no content; non-empty DATA is malformed.
+        no_content,
+        /// DATA belongs to a CONNECT/extended-CONNECT tunnel, not HTTP content.
+        tunnel,
+    };
+
+    pub fn begin(self: *BodyState, content_length: ?u64, mode: Mode, end_stream: bool) error{Protocol}!void {
+        self.* = switch (mode) {
+            .awaiting_headers, .length => unreachable,
+            .unbounded => if (content_length) |length|
+                .{ .remaining = length, .mode = .length }
+            else
+                .{ .mode = .unbounded },
+            .no_content => .{ .mode = .no_content },
+            .tunnel => .{ .mode = .tunnel },
+        };
+        if (end_stream) try self.finish();
+    }
+
+    pub fn data(self: *BodyState, byte_count: usize, end_stream: bool) error{Protocol}!void {
+        switch (self.mode) {
+            .awaiting_headers => return error.Protocol,
+            .unbounded, .tunnel => {},
+            .no_content => if (byte_count != 0) return error.Protocol,
+            .length => {
+                const count: u64 = @intCast(byte_count);
+                if (count > self.remaining) return error.Protocol;
+                self.remaining -= count;
+            },
+        }
+        if (end_stream) try self.finish();
+    }
+
+    pub fn finish(self: BodyState) error{Protocol}!void {
+        if (self.mode == .awaiting_headers) return error.Protocol;
+        if (self.mode == .length and self.remaining != 0) return error.Protocol;
     }
 };
 
@@ -283,6 +372,39 @@ test "HTTP/2 header validation" {
     try v.field(.{ .name = "accept", .value = "*/*" });
     try v.finish();
     try std.testing.expectError(error.InvalidHeader, v.field(.{ .name = ":authority", .value = "late.example" }));
+}
+
+test "HTTP/2 Host and authority use normalized identity" {
+    var matching = Validator.init(.request);
+    try matching.field(.{ .name = ":method", .value = "GET" });
+    try matching.field(.{ .name = ":scheme", .value = "https" });
+    try matching.field(.{ .name = ":authority", .value = "EXAMPLE.com:443" });
+    try matching.field(.{ .name = ":path", .value = "/" });
+    try matching.field(.{ .name = "host", .value = "example.com" });
+    try matching.finish();
+
+    var mismatch = Validator.init(.request);
+    try mismatch.field(.{ .name = ":method", .value = "GET" });
+    try mismatch.field(.{ .name = ":scheme", .value = "https" });
+    try mismatch.field(.{ .name = ":authority", .value = "example.com" });
+    try mismatch.field(.{ .name = ":path", .value = "/" });
+    try std.testing.expectError(error.InvalidHeader, mismatch.field(.{ .name = "host", .value = "other.example" }));
+}
+
+test "HTTP/2 body state enforces declared and forbidden content" {
+    var exact: BodyState = .{};
+    try exact.begin(5, .unbounded, false);
+    try exact.data(2, false);
+    try exact.data(3, true);
+
+    var short: BodyState = .{};
+    try short.begin(5, .unbounded, false);
+    try std.testing.expectError(error.Protocol, short.data(4, true));
+
+    var forbidden: BodyState = .{};
+    try forbidden.begin(99, .no_content, false);
+    try forbidden.data(0, false);
+    try std.testing.expectError(error.Protocol, forbidden.data(1, true));
 }
 
 test "HTTP/2 HTTP-scheme path cannot be empty" {

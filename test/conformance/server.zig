@@ -16,7 +16,7 @@ const Store = struct {
         id: u31 = 0,
         used: bool = false,
         value: h2.stream.Tracked = undefined,
-        body_length: h2.fields.BodyLength = .{},
+        body_state: h2.fields.BodyState = .{},
         response_headers_sent: bool = false,
         response_body_sent: u4 = 0,
     };
@@ -57,6 +57,11 @@ const Store = struct {
         }
         return result;
     }
+
+    pub fn bodyState(self: *Store, id: u31) ?*h2.fields.BodyState {
+        const item = self.entry(id) orelse return null;
+        return &item.body_state;
+    }
 };
 
 fn sendConnectionError(out: *std.Io.Writer, code: h2.protocol.ErrorCode) !void {
@@ -78,14 +83,31 @@ fn sendStreamError(session: *h2.Session, store: *Store, out: *std.Io.Writer, str
 
 fn respond(session: *h2.Session, store: *Store, out: *std.Io.Writer, stream_id: u31, staging: []u8) !void {
     const entry = store.entry(stream_id) orelse return error.Protocol;
-    const response = [_]h2.hpack.EncodedField{
+    const regular_response = [_]h2.hpack.EncodedField{
         .{ .field = .{ .name = ":status", .value = "200" } },
         .{ .field = .{ .name = "content-length", .value = "8" } },
         .{ .field = .{ .name = "content-type", .value = "text/plain" } },
     };
+    const tunnel_response = [_]h2.hpack.EncodedField{
+        .{ .field = .{ .name = ":status", .value = "200" } },
+    };
+    const head = entry.value.request_method == .head;
+    const tunnel = entry.value.request_method == .connect;
     if (!entry.response_headers_sent) {
-        _ = try session.sendHeaders(store, out, stream_id, false, staging, &response);
+        _ = try session.sendHeaders(
+            store,
+            out,
+            stream_id,
+            head,
+            staging,
+            if (tunnel) &tunnel_response else &regular_response,
+        );
         entry.response_headers_sent = true;
+        if (head) {
+            entry.response_body_sent = response_body.len;
+            try out.flush();
+            return;
+        }
     }
 
     const offset: usize = entry.response_body_sent;
@@ -135,34 +157,18 @@ fn handleEvent(session: *h2.Session, store: *Store, out: *std.Io.Writer, event: 
             }
         },
         .headers => |headers| {
-            const entry = store.entry(headers.stream_id) orelse return error.Protocol;
+            _ = store.entry(headers.stream_id) orelse return error.Protocol;
             switch (headers.kind) {
-                .request => {
-                    entry.body_length = h2.fields.BodyLength.init(headers.contentLength());
-                    if (headers.end_stream) {
-                        entry.body_length.finish() catch {
-                            try sendStreamError(session, store, out, headers.stream_id, .protocol_error);
-                            return true;
-                        };
-                        try respond(session, store, out, headers.stream_id, staging);
-                    }
+                .request => if (headers.end_stream) {
+                    try respond(session, store, out, headers.stream_id, staging);
                 },
                 .trailers => if (headers.end_stream) {
-                    entry.body_length.finish() catch {
-                        try sendStreamError(session, store, out, headers.stream_id, .protocol_error);
-                        return true;
-                    };
                     try respond(session, store, out, headers.stream_id, staging);
                 },
                 .response => {},
             }
         },
         .data => |data| {
-            const entry = store.entry(data.stream_id) orelse return error.Protocol;
-            entry.body_length.receive(data.bytes.len, data.end_stream) catch {
-                try sendStreamError(session, store, out, data.stream_id, .protocol_error);
-                return true;
-            };
             if (data.end_stream) try respond(session, store, out, data.stream_id, staging);
         },
     }

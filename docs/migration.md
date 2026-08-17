@@ -35,6 +35,24 @@ HTTP/1 request-target and HTTP/2 pseudo-field validation now share `http.uri`.
 Malformed percent escapes, authority syntax, IP literals, and HTTP(S) userinfo
 therefore have one implementation and one behavior across protocol versions.
 
+### HTTP/2 Session store and field sink contracts
+
+The composed HTTP/2 `Session` now requires each stored stream to expose
+`bodyState(id) ?*http2.fields.BodyState`. Keep that state beside the existing
+`Tracked` record and reset it to `.{}` when a store slot is reused; Session owns
+its protocol transitions but not its allocation/storage. A local request begins
+in `awaiting_headers`, then final response headers establish Content-Length,
+no-content, or tunnel semantics for subsequent DATA.
+
+Field sinks are now transactional. Add no-throw `begin(stream_id, kind)`,
+`commit(stream_id, kind)`, and `abort(stream_id, kind)` methods around the existing
+`field(...)` callback. Stage mutations after `begin`; publish them on `commit`;
+discard them on `abort`. Do not retain borrowed HPACK slices without copying.
+
+HTTP/2 request validation also rejects conflicting `Host` and `:authority` after
+URI normalization, including on send preflight. Applications that deliberately
+need malformed-message inspection should use lower-level HPACK/frame composition.
+
 ## 0.15.x to 0.16.x
 
 ### Prefer owning namespaces

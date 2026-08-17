@@ -10,6 +10,7 @@ const Store = struct {
         id: u31 = 0,
         used: bool = false,
         value: h2.stream.Tracked = undefined,
+        body: h2.fields.BodyState = .{},
     };
     entries: [16]Entry = [_]Entry{.{}} ** 16,
 
@@ -40,6 +41,11 @@ const Store = struct {
         }
         return result;
     }
+
+    pub fn bodyState(self: *Store, id: u31) ?*h2.fields.BodyState {
+        for (&self.entries) |*entry| if (entry.used and entry.id == id) return &entry.body;
+        return null;
+    }
 };
 
 const Observed = struct {
@@ -67,14 +73,28 @@ const Observed = struct {
 
 const Sink = struct {
     observed: *Observed,
+    staged_stream5_trailer: bool = false,
+
+    pub fn begin(self: *Sink, _: u31, _: h2.fields.Kind) void {
+        self.staged_stream5_trailer = false;
+    }
 
     pub fn field(self: *Sink, stream_id: u31, kind: h2.fields.Kind, field_value: http.common.Header) void {
         if (stream_id == 5 and kind == .trailers and
             std.ascii.eqlIgnoreCase(field_value.name, "x-trailer") and
             std.mem.eql(u8, field_value.value, "done"))
         {
-            self.observed.stream5_trailer = true;
+            self.staged_stream5_trailer = true;
         }
+    }
+
+    pub fn commit(self: *Sink, _: u31, _: h2.fields.Kind) void {
+        if (self.staged_stream5_trailer) self.observed.stream5_trailer = true;
+        self.staged_stream5_trailer = false;
+    }
+
+    pub fn abort(self: *Sink, _: u31, _: h2.fields.Kind) void {
+        self.staged_stream5_trailer = false;
     }
 };
 

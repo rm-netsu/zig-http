@@ -304,6 +304,7 @@ const SequenceStore = struct {
         used: bool = false,
         id: u31 = 0,
         tracked: stream_mod.Tracked = undefined,
+        body: http.http2.fields.BodyState = .{},
     };
 
     entries: [32]Entry = [_]Entry{.{}} ** 32,
@@ -333,6 +334,13 @@ const SequenceStore = struct {
             result = @max(result, entry.tracked.windows.send.adjustment);
         }
         return result;
+    }
+
+    pub fn bodyState(self: *SequenceStore, id: u31) ?*http.http2.fields.BodyState {
+        for (&self.entries) |*entry| {
+            if (entry.used and entry.id == id) return &entry.body;
+        }
+        return null;
     }
 };
 
@@ -423,9 +431,23 @@ test "fuzz HTTP/2 stream-manager state sequences preserve aggregate invariants" 
 
 const SessionSink = struct {
     fields: u32 = 0,
+    pending_fields: u32 = 0,
+
+    pub fn begin(self: *SessionSink, _: u31, _: http.http2.fields.Kind) void {
+        self.pending_fields = 0;
+    }
 
     pub fn field(self: *SessionSink, _: u31, _: http.http2.fields.Kind, _: http.common.Header) void {
-        self.fields += 1;
+        self.pending_fields += 1;
+    }
+
+    pub fn commit(self: *SessionSink, _: u31, _: http.http2.fields.Kind) void {
+        self.fields += self.pending_fields;
+        self.pending_fields = 0;
+    }
+
+    pub fn abort(self: *SessionSink, _: u31, _: http.http2.fields.Kind) void {
+        self.pending_fields = 0;
     }
 };
 
@@ -435,6 +457,7 @@ fn expectStoresEqual(a: *const SequenceStore, b: *const SequenceStore) !void {
         if (!left.used) continue;
         try std.testing.expectEqual(left.id, right.id);
         try std.testing.expectEqualDeep(left.tracked, right.tracked);
+        try std.testing.expectEqualDeep(left.body, right.body);
     }
 }
 

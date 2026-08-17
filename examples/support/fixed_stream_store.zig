@@ -12,6 +12,7 @@ pub fn FixedStreamStore(comptime capacity: usize) type {
             id: u31 = 0,
             used: bool = false,
             tracked: h2.stream.Tracked = undefined,
+            body: h2.fields.BodyState = .{},
         };
 
         entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
@@ -44,6 +45,13 @@ pub fn FixedStreamStore(comptime capacity: usize) type {
                 }
             }
             return result;
+        }
+
+        pub fn bodyState(self: *Self, id: u31) ?*h2.fields.BodyState {
+            for (&self.entries) |*entry| {
+                if (entry.used and entry.id == id) return &entry.body;
+            }
+            return null;
         }
     };
 }
