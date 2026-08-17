@@ -280,10 +280,15 @@ surface.
 Structured Field Dictionary. `priority.parseFieldValue()` preserves omission of
 `u`/`i`, ignores unknown or type/range-invalid parameters after validating the
 complete dictionary, and `Parameters.effective()` applies the standard `u=3,
-i=false` defaults when appropriate. `writeFieldValue()`, `writeUpdate()`, and
-`writeUpdateParameters()` provide allocation-free canonical outbound paths.
-Scheduling, buffering priority for future streams, and merging request/response
-signals remain caller-owned policy.
+i=false` defaults when appropriate. `priority.State` is a compact caller-owned
+composition helper: request Priority and PRIORITY_UPDATE replace the effective
+known parameters (so omission uses defaults), while `overlayResponse*()` changes
+only parameters explicitly present in a response Priority field. Whether to apply
+that response overlay at all remains caller policy because RFC 9218 does not
+mandate a client/server merge algorithm. `writeFieldValue()`, `writeUpdate()`,
+and `writeUpdateParameters()` provide allocation-free canonical outbound paths.
+Scheduling and bounded buffering of priority for future streams remain
+caller-owned policy.
 
 ### Structural contracts and error model
 

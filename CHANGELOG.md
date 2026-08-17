@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add caller-owned RFC 9218 priority signal composition state that distinguishes request/update default-reset semantics from response omission overlays without imposing scheduler or client/server merge policy.
 - Add a unified operational error/ownership guide and compile-tested recovery example covering HTTP/1 parser/writer terminal states, HTTP/2 peer-fault scope, local versus poisoned send failures, HPACK/buffer lifetimes, and sharded connection ownership.
 - Add compile-tested, transport-neutral HTTP/1 and HTTP/2 executable examples plus minimal fixed stream-store and synchronous field-sink reference implementations; `zig build check` now runs the examples to catch public API drift.
 - Complete the policy-free RFC 9218 priority surface with allocation-free Structured Fields parsing/serialization for `u`/`i`, preserved omission/default semantics, extension-member validation, duplicate-key handling, and preflighted HTTP/2 PRIORITY_UPDATE writers.

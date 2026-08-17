@@ -11,8 +11,9 @@ without making sockets, TLS, DNS, or an event loop part of the HTTP core.
   store, HPACK codecs, and one request HEADERS block.
 - `http2_server_core.zig` — in-memory client/server Session round-trip showing
   synchronous field sinks, stream storage, response HEADERS, and DATA.
-- `http2_priority.zig` — parse and serialize RFC 9218 Priority values and emit a
-  PRIORITY_UPDATE frame without introducing scheduling policy.
+- `http2_priority.zig` — parse and serialize RFC 9218 Priority values, compose
+  request/response/PRIORITY_UPDATE omission semantics with caller-owned state,
+  and emit a PRIORITY_UPDATE frame without introducing scheduling policy.
 - `error_handling.zig` — exhaustive peer-fault scope mapping plus HTTP/1 writer
   recovery-state checks; see `docs/operations.md` for the full operational model.
 - `support/fixed_stream_store.zig` — complete minimal `Session` store contract.

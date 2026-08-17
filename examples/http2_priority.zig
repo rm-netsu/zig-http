@@ -5,9 +5,19 @@ const priority = http.http2.priority;
 
 pub fn main() !void {
     const parameters = try priority.parseFieldValue("u=1, i, vendor=\"opaque\"");
-    const effective = parameters.effective();
-    std.debug.assert(effective.urgency == 1);
-    std.debug.assert(effective.incremental);
+    var state = priority.State.initRequest(parameters);
+    std.debug.assert(state.effective().urgency == 1);
+    std.debug.assert(state.effective().incremental);
+
+    // Response omission preserves the corresponding client-provided parameter.
+    try state.overlayResponseField("u=0");
+    std.debug.assert(state.effective().urgency == 0);
+    std.debug.assert(state.effective().incremental);
+
+    // PRIORITY_UPDATE is a complete replacement; omitted `i` returns to false.
+    try state.setUpdateField("u=2");
+    std.debug.assert(state.effective().urgency == 2);
+    std.debug.assert(!state.effective().incremental);
 
     var field_storage: [64]u8 = undefined;
     var field_writer = std.Io.Writer.fixed(&field_storage);

@@ -37,6 +37,66 @@ pub const Parameters = struct {
     }
 };
 
+/// Caller-owned effective RFC 9218 priority state for composing the standard
+/// request Priority field, response Priority field, and PRIORITY_UPDATE signal.
+///
+/// Request fields and PRIORITY_UPDATE carry complete standard priority input:
+/// omitted `u`/`i` use their defaults. Response fields have different omission
+/// semantics, so `overlayResponse*` only changes parameters actually present.
+/// Calling the response overlay remains an application/intermediary policy
+/// decision; RFC 9218 does not mandate how client and server preferences merge.
+/// Unknown extension parameters are intentionally outside this compact state.
+pub const State = struct {
+    value: Effective = .{},
+
+    pub inline fn initRequest(parameters: Parameters) State {
+        return .{ .value = parameters.effective() };
+    }
+
+    pub fn initRequestField(field_value: []const u8) FieldError!State {
+        return initRequest(try parseFieldValue(field_value));
+    }
+
+    /// Replaces the effective request priority. Omitted known parameters reset
+    /// to RFC defaults, matching request Priority field semantics.
+    pub inline fn setRequest(self: *State, parameters: Parameters) void {
+        self.value = parameters.effective();
+    }
+
+    pub fn setRequestField(self: *State, field_value: []const u8) FieldError!void {
+        self.setRequest(try parseFieldValue(field_value));
+    }
+
+    /// Mechanically overlays only standard parameters present in a Priority
+    /// response field. The caller chooses whether server input should be merged.
+    pub inline fn overlayResponse(self: *State, parameters: Parameters) void {
+        if (parameters.urgency) |urgency| self.value.urgency = urgency;
+        if (parameters.incremental) |incremental| self.value.incremental = incremental;
+    }
+
+    pub fn overlayResponseField(self: *State, field_value: []const u8) FieldError!void {
+        self.overlayResponse(try parseFieldValue(field_value));
+    }
+
+    /// Replaces the effective state from PRIORITY_UPDATE. The frame carries a
+    /// complete priority value, so omitted known parameters reset to defaults.
+    pub inline fn setUpdate(self: *State, parameters: Parameters) void {
+        self.value = parameters.effective();
+    }
+
+    pub fn setUpdateField(self: *State, field_value: []const u8) FieldError!void {
+        self.setUpdate(try parseFieldValue(field_value));
+    }
+
+    pub fn setParsedUpdate(self: *State, update: Update) FieldError!void {
+        self.setUpdate(try parseUpdateParameters(update));
+    }
+
+    pub inline fn effective(self: State) Effective {
+        return self.value;
+    }
+};
+
 pub const FieldError = error{InvalidStructuredField};
 
 const BareKind = enum { integer, boolean, other };
@@ -50,14 +110,20 @@ const Parser = struct {
     input: []const u8,
     pos: usize = 0,
 
-    fn done(self: Parser) bool { return self.pos == self.input.len; }
-    fn peek(self: Parser) ?u8 { return if (self.done()) null else self.input[self.pos]; }
+    fn done(self: Parser) bool {
+        return self.pos == self.input.len;
+    }
+    fn peek(self: Parser) ?u8 {
+        return if (self.done()) null else self.input[self.pos];
+    }
     fn take(self: *Parser) FieldError!u8 {
         const ch = self.peek() orelse return error.InvalidStructuredField;
         self.pos += 1;
         return ch;
     }
-    fn skipSp(self: *Parser) void { while (self.peek() == ' ') self.pos += 1; }
+    fn skipSp(self: *Parser) void {
+        while (self.peek() == ' ') self.pos += 1;
+    }
     fn skipOws(self: *Parser) void {
         while (self.peek()) |ch| {
             if (ch != ' ' and ch != '\t') break;
@@ -217,7 +283,9 @@ const Parser = struct {
         return .{ .kind = .boolean, .boolean = ch == '1' };
     }
 
-    fn hexLower(ch: u8) bool { return (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'); }
+    fn hexLower(ch: u8) bool {
+        return (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+    }
     fn displayString(self: *Parser) FieldError!Bare {
         self.pos += 1;
         if (try self.take() != '"') return error.InvalidStructuredField;
@@ -378,8 +446,8 @@ test "priority dictionary duplicate keys use final value" {
 
 test "priority field rejects malformed structured dictionary" {
     const malformed = [_][]const u8{
-        "u =1", "U=1", "u=1,", "u=\"unterminated", "x=(1, 2)",
-        "x;bad=()", "u=1234567890123456", "i=?2", "x=:a=:", "x=:YW=J:",
+        "u =1",     "U=1",                "u=1,", "u=\"unterminated", "x=(1, 2)",
+        "x;bad=()", "u=1234567890123456", "i=?2", "x=:a=:",           "x=:YW=J:",
     };
     for (malformed) |value| try std.testing.expectError(error.InvalidStructuredField, parseFieldValue(value));
 }
@@ -389,6 +457,29 @@ test "priority field serialization is canonical" {
     try std.testing.expectEqualStrings("u=0, i", try serializeForTest(.{ .urgency = 0, .incremental = true }, &storage));
     try std.testing.expectEqualStrings("i=?0", try serializeForTest(.{ .incremental = false }, &storage));
     try std.testing.expectEqualStrings("", try serializeForTest(.{}, &storage));
+}
+
+test "priority state composes request response and update omission semantics" {
+    var state = try State.initRequestField("u=5, i");
+    try std.testing.expectEqual(Effective{ .urgency = 5, .incremental = true }, state.effective());
+
+    // A response omitting `i` expresses no interest in changing it.
+    try state.overlayResponseField("u=1");
+    try std.testing.expectEqual(Effective{ .urgency = 1, .incremental = true }, state.effective());
+
+    // PRIORITY_UPDATE is complete: omitted `i` resets to its default false.
+    try state.setUpdateField("u=6");
+    try std.testing.expectEqual(Effective{ .urgency = 6, .incremental = false }, state.effective());
+
+    // An empty request/update value is likewise the complete default priority.
+    try state.setRequestField("");
+    try std.testing.expectEqual(Effective{}, state.effective());
+}
+
+test "priority response overlay ignores invalid known parameter values" {
+    var state = State.initRequest(.{ .urgency = 2, .incremental = true });
+    try state.overlayResponseField("u=9, i=token");
+    try std.testing.expectEqual(Effective{ .urgency = 2, .incremental = true }, state.effective());
 }
 
 test "parse RFC 9218 PRIORITY_UPDATE without imposing scheduling policy" {
