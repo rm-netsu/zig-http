@@ -31,6 +31,8 @@ only state you actually want the HTTP engine to manage:
   runtime already owns more of the message state machine.
 - HTTP/2 connection engine: `http2.Session` is the recommended composed path
   over caller-owned HPACK objects and stream storage.
+  New code can use `Session.initOptions(.{ ... })` for named configuration;
+  the original positional `Session.init(...)` remains available.
 - HTTP/2 custom/sharded runtimes: compose `connection`, `peer`, `streams`,
   `dispatch`, `send`, frame, flow, and field primitives independently. No
   scheduler, storage layout, queue, or synchronization strategy is mandatory.
@@ -182,6 +184,47 @@ WebSocket abstraction. `SETTINGS_ENABLE_CONNECT_PROTOCOL` is tracked per
 connection, `:protocol` is validated as part of request pseudo-header semantics,
 and Session gates Extended CONNECT on negotiated capability. The selected
 application protocol and tunnel bytes remain entirely caller-owned.
+
+### HTTP/2 extension composition
+
+`Session` does not force consumers to abandon the composed path when they add an
+HTTP/2 extension. Unknown/unsupported frame types are returned as a zero-copy
+`.extension` event containing the raw type, flags, stream identifier, and
+caller-owned payload slice. The base Session deliberately performs no
+extension-specific stream mutation. Applications that do not support the frame
+can simply ignore that event.
+
+The `.settings` event likewise retains the already validated raw SETTINGS
+payload. `settings_event.iterator()` lets an application inspect extension
+setting identifiers while Session continues to apply the settings it natively
+understands in wire order. This preserves the HTTP/2 requirement that unknown
+settings remain harmless without making composed Session a closed extension
+surface.
+
+`http2.priority` provides policy-free RFC 9218 constants and wire parsing for
+`SETTINGS_NO_RFC7540_PRIORITIES` and HTTP/2 `PRIORITY_UPDATE`. It intentionally
+does not choose a scheduler, buffer future-stream priorities, or parse Structured
+Fields into an application scheduling policy; those decisions depend on the
+caller's storage and runtime.
+
+### Structural contracts and error model
+
+HTTP/2 caller-owned storage remains structurally typed. `http2.contracts`
+provides `hasStreamStore`, `hasSessionStore`, and `hasFieldSink` predicates plus
+`assert*` helpers. The composed `Session` invokes these at its public generic
+boundary so a missing `get`, `insert`, `maxActiveSendAdjustment`, or `field`
+operation fails with a short zig-http-specific compile error rather than a deep
+instantiation trace. These helpers intentionally preflight operation presence;
+ordinary Zig method resolution remains the authority for exact signatures. No
+vtable, allocator, or concrete store type is introduced.
+
+Protocol failures received from the peer are values (`SessionEvent.fault`) so a
+caller can serialize the required RST_STREAM/GOAWAY through its own transport
+policy. Local invalid operations remain Zig errors. A writer/HPACK failure after
+outbound state may have advanced poisons only the Session send side; callers
+should abandon that HTTP/2 transport rather than retrying against a potentially
+desynchronized wire/compression state. Transport closure, retry policy, logging,
+and timers remain outside core.
 
 `stream.Windows` is an 8-byte caller-owned pair of send/receive stream windows.
 This keeps the library allocation-free at the connection layer: applications can

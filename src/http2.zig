@@ -6,6 +6,7 @@ pub const payload = @import("http2/payload.zig");
 pub const continuation = @import("http2/continuation.zig");
 pub const preface = @import("http2/preface.zig");
 pub const protocol = @import("http2/protocol.zig");
+pub const priority = @import("http2/priority.zig");
 pub const stream = @import("http2/stream.zig");
 pub const streams = @import("http2/streams.zig");
 pub const header_block = @import("http2/header_block.zig");
@@ -15,6 +16,7 @@ pub const session = @import("http2/session.zig");
 pub const send = @import("http2/send.zig");
 pub const scheduler = @import("http2/scheduler.zig");
 pub const dispatch = @import("http2/dispatch.zig");
+pub const contracts = @import("http2/contracts.zig");
 pub const hpack = @import("hpack");
 
 pub const FrameHeader = frame.FrameHeader;

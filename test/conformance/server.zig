@@ -98,7 +98,7 @@ fn respond(session: *h2.Session, store: *Store, out: *std.Io.Writer, stream_id: 
 
 fn handleEvent(session: *h2.Session, store: *Store, out: *std.Io.Writer, event: h2.SessionEvent, staging: []u8) !bool {
     switch (event) {
-        .ignored, .pending, .reset, .goaway, .push_promise => {},
+        .ignored, .pending, .reset, .goaway, .push_promise, .extension => {},
         .window_update => |update| {
             if (update.stream_id != 0) {
                 if (store.entry(update.stream_id)) |entry| {

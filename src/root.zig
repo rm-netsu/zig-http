@@ -28,6 +28,7 @@ test {
     _ = http2.continuation.Guard;
     _ = http2.preface.Parser;
     _ = http2.protocol.ErrorCode;
+    _ = http2.priority.Update;
     _ = http2.stream.Stream;
     _ = http2.stream.Windows;
     _ = http2.stream.Tracked;
@@ -45,5 +46,6 @@ test {
     _ = http2.session.GracefulGoAway;
     _ = http2.dispatch.Prepared;
     _ = http2.dispatch.StreamWork;
+    _ = http2.contracts.hasSessionStore;
     _ = http2.send.HeaderFramer;
 }

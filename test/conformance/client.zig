@@ -125,7 +125,7 @@ fn handleEvent(
     event: h2.SessionEvent,
 ) !void {
     switch (event) {
-        .ignored, .pending, .window_update => {},
+        .ignored, .pending, .window_update, .extension => {},
         .fault => |fault| switch (fault) {
             .connection => |code| {
                 std.log.err("client interoperability connection fault: {t}", .{code});

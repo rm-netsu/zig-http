@@ -2,6 +2,7 @@ const std = @import("std");
 const hpack = @import("hpack");
 const common = @import("../common.zig");
 const connection = @import("connection.zig");
+const contracts = @import("contracts.zig");
 const dispatch = @import("dispatch.zig");
 const fields = @import("fields.zig");
 const frame = @import("frame.zig");
@@ -77,11 +78,19 @@ pub const SettingsSync = struct {
 };
 
 pub const SettingsApplied = struct {
+    /// Raw validated SETTINGS payload. It aliases caller-owned frame input and
+    /// lets composed Session users inspect extension settings without forcing
+    /// Session itself to understand or retain them. Empty for ACK frames.
+    bytes: []const u8,
     ack: bool,
     count: u16,
 
     /// Matches this received ACK to the oldest SETTINGS frame successfully sent
     /// through the same caller-owned synchronization state.
+    pub inline fn iterator(self: SettingsApplied) settings.Iterator {
+        return settings.Iterator.init(self.bytes) catch unreachable;
+    }
+
     pub inline fn acknowledge(self: SettingsApplied, sync: *SettingsSync) ?SettingsTicket {
         if (!self.ack) return null;
         return sync.acknowledge();
@@ -126,6 +135,25 @@ pub const GracefulGoAway = struct {
     }
 };
 
+pub const ExtensionFrame = struct {
+    /// Payload aliases caller-owned frame input. Unknown/unsupported frame
+    /// semantics remain the caller's responsibility; Session intentionally does
+    /// not mutate stream state for extension frames.
+    payload: []const u8,
+    stream_id: u31,
+    type: u8,
+    flags: u8,
+
+    pub inline fn header(self: ExtensionFrame) frame.FrameHeader {
+        return .{
+            .length = @intCast(self.payload.len),
+            .type = @enumFromInt(self.type),
+            .flags = self.flags,
+            .stream_id = self.stream_id,
+        };
+    }
+};
+
 pub const Event = union(enum) {
     ignored,
     pending,
@@ -138,6 +166,7 @@ pub const Event = union(enum) {
     reset: struct { stream_id: u31, error_code: u32 },
     goaway: payload.GoAway,
     ping: struct { ack: bool, bytes: []const u8 },
+    extension: ExtensionFrame,
 };
 
 pub const CompleteResult = struct {
@@ -253,6 +282,29 @@ pub const Session = struct {
     collector: header_block.Collector,
     pending: Pending = .{},
 
+    /// Named initialization form for consumers that prefer a stable, self-
+    /// documenting configuration surface. All storage and HPACK ownership stays
+    /// with the caller; this is configuration only, not a runtime wrapper.
+    pub const Options = struct {
+        role: peer_mod.Role,
+        local_limits: streams_mod.LocalLimits = .{},
+        decoder: *hpack.Decoder,
+        encoder: *hpack.Encoder,
+        header_storage: []u8,
+    };
+
+    pub fn initOptions(options: Options) Session {
+        return .{
+            .streams = streams_mod.Manager.init(options.role, options.local_limits),
+            .peer = peer_mod.State.init(options.role),
+            .decoder = options.decoder,
+            .encoder = options.encoder,
+            .collector = header_block.Collector.init(options.header_storage),
+        };
+    }
+
+    /// Positional compatibility initializer. New call sites can use
+    /// `initOptions(.{ ... })` when named fields are clearer.
     pub fn init(
         role: peer_mod.Role,
         local_limits: streams_mod.LocalLimits,
@@ -260,13 +312,13 @@ pub const Session = struct {
         encoder: *hpack.Encoder,
         header_storage: []u8,
     ) Session {
-        return .{
-            .streams = streams_mod.Manager.init(role, local_limits),
-            .peer = peer_mod.State.init(role),
+        return initOptions(.{
+            .role = role,
+            .local_limits = local_limits,
             .decoder = decoder,
             .encoder = encoder,
-            .collector = header_block.Collector.init(header_storage),
-        };
+            .header_storage = header_storage,
+        });
     }
 
     /// Streams one local field section directly into HEADERS/CONTINUATION
@@ -286,6 +338,7 @@ pub const Session = struct {
         frame_staging: []u8,
         items: []const hpack.EncodedField,
     ) SendHeadersError!SendHeadersResult {
+        comptime contracts.assertStreamStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
 
@@ -386,6 +439,7 @@ pub const Session = struct {
         frame_staging: []u8,
         items: []const hpack.EncodedField,
     ) SendPushPromiseError!SendPushPromiseResult {
+        comptime contracts.assertStreamStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         const field_info = try validateLocalFields(.request, false, items);
         // Extended CONNECT is a client-created request stream, never a server
@@ -420,6 +474,7 @@ pub const Session = struct {
         store: anytype,
         stream_id: u31,
     ) DataSendCreditError!DataSendCredit {
+        comptime contracts.assertStreamStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
         const tracked = store.get(stream_id) orelse return error.StreamClosed;
@@ -476,6 +531,7 @@ pub const Session = struct {
         bytes: []const u8,
         end_stream: bool,
     ) SendDataError!SendDataResult {
+        comptime contracts.assertStreamStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
         const tracked = store.get(stream_id) orelse return error.StreamClosed;
@@ -574,6 +630,7 @@ pub const Session = struct {
         stream_id: u31,
         increment: u31,
     ) SendStreamControlError!void {
+        comptime contracts.assertStreamStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (increment == 0) return error.Protocol;
 
@@ -610,6 +667,7 @@ pub const Session = struct {
         stream_id: u31,
         credit: *flow.ReceiveCredit,
     ) SendStreamControlError!u31 {
+        comptime contracts.assertStreamStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         const tracked = store.get(stream_id) orelse return error.StreamClosed;
         const increment = credit.proposal(tracked.windows.receive) orelse return 0;
@@ -689,6 +747,7 @@ pub const Session = struct {
         stream_id: u31,
         code: protocol.ErrorCode,
     ) SendStreamControlError!void {
+        comptime contracts.assertStreamStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         const tracked = store.get(stream_id) orelse return error.StreamClosed;
         try self.sendResetTracked(out, stream_id, tracked, code);
@@ -826,6 +885,8 @@ pub const Session = struct {
         scratch: []u8,
         sink: anytype,
     ) (hpack.codec.Error || error{ HeaderBlockTooLarge, FrameSize, Protocol })!?CompleteResult {
+        comptime contracts.assertSessionStore(@TypeOf(store));
+        comptime contracts.assertFieldSink(@TypeOf(sink));
         const parsed = (try frame.parseComplete(input, receiver_max_frame_size)) orelse return null;
         return .{
             .consumed = parsed.consumed,
@@ -845,6 +906,8 @@ pub const Session = struct {
         scratch: []u8,
         sink: anytype,
     ) (hpack.codec.Error || error{HeaderBlockTooLarge})!Event {
+        comptime contracts.assertSessionStore(@TypeOf(store));
+        comptime contracts.assertFieldSink(@TypeOf(sink));
         switch (self.connection.check(complete.header)) {
             .none => {},
             .protocol => return .{ .fault = .{ .connection = .protocol_error } },
@@ -865,6 +928,8 @@ pub const Session = struct {
         scratch: []u8,
         sink: anytype,
     ) (hpack.codec.Error || error{HeaderBlockTooLarge})!Event {
+        comptime contracts.assertSessionStore(@TypeOf(store));
+        comptime contracts.assertFieldSink(@TypeOf(sink));
         return switch (complete.header.type) {
             .data => self.receiveData(store, complete),
             .headers => try self.receiveHeaders(store, complete, scratch, sink),
@@ -876,7 +941,12 @@ pub const Session = struct {
             .goaway => self.receiveGoAway(complete),
             .ping => .{ .ping = .{ .ack = (complete.header.flags & 0x01) != 0, .bytes = complete.payload } },
             .priority => self.receivePriority(complete),
-            else => .ignored,
+            else => .{ .extension = .{
+                .payload = complete.payload,
+                .stream_id = complete.header.stream_id,
+                .type = @intFromEnum(complete.header.type),
+                .flags = complete.header.flags,
+            } },
         };
     }
 
@@ -1092,7 +1162,7 @@ pub const Session = struct {
                 else => {},
             }
         }
-        return .{ .settings = .{ .ack = parsed.ack, .count = count } };
+        return .{ .settings = .{ .bytes = complete.payload, .ack = parsed.ack, .count = count } };
     }
 
     fn applyPeerInitialWindow(
@@ -1689,6 +1759,56 @@ test "ignored post GOAWAY DATA still consumes connection credit" {
     }, &scratch, &sink);
     try std.testing.expect(event == .ignored);
     try std.testing.expectEqual(@as(u31, 65_531), session.connection.receive_window.available());
+}
+
+test "session surfaces unknown extension frames without owning their semantics" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [64]u8 = undefined;
+
+    const bytes = "extension-data";
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = bytes.len, .type = @enumFromInt(0xee), .flags = 0xa5, .stream_id = 77 },
+        .payload = bytes,
+    }, &scratch, &sink);
+    try std.testing.expectEqual(@as(u8, 0xee), event.extension.type);
+    try std.testing.expectEqual(@as(u8, 0xa5), event.extension.flags);
+    try std.testing.expectEqual(@as(u31, 77), event.extension.stream_id);
+    try std.testing.expectEqualStrings(bytes, event.extension.payload);
+    try std.testing.expectEqual(@as(u32, bytes.len), event.extension.header().length);
+}
+
+test "session SETTINGS event preserves extension settings for caller inspection" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var block_storage: [64]u8 = undefined;
+    var session = Session.init(.server, .{}, &inbound, &outbound, &block_storage);
+    var store: TestStore = .{};
+    var sink: NullSink = .{};
+    var scratch: [64]u8 = undefined;
+
+    var wire: [6]u8 = undefined;
+    settings.encode(&wire, .{ .id = @enumFromInt(0xf00d), .value = 0x1234_5678 });
+    const event = try session.receiveComplete(&store, .{
+        .header = .{ .length = wire.len, .type = .settings, .flags = 0, .stream_id = 0 },
+        .payload = &wire,
+    }, &scratch, &sink);
+    try std.testing.expectEqualStrings(&wire, event.settings.bytes);
+    var it = event.settings.iterator();
+    const extension = it.next().?;
+    try std.testing.expectEqual(@as(u16, 0xf00d), @intFromEnum(extension.id));
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), extension.value);
+    try std.testing.expect(it.next() == null);
 }
 
 fn settingBytes(setting: @import("settings.zig").Setting) [6]u8 {

@@ -294,3 +294,120 @@ test "fuzz HTTP/1 chunked decoding across fragmentation" {
         .corpus = &.{ "", "chunked", "\xff\x00\x7f" },
     });
 }
+
+const stream_mod = http.http2.stream;
+const streams_mod = http.http2.streams;
+const peer_mod = http.http2.peer;
+
+const SequenceStore = struct {
+    const Entry = struct {
+        used: bool = false,
+        id: u31 = 0,
+        tracked: stream_mod.Tracked = undefined,
+    };
+
+    entries: [32]Entry = [_]Entry{.{}} ** 32,
+
+    pub fn get(self: *SequenceStore, id: u31) ?*stream_mod.Tracked {
+        for (&self.entries) |*entry| {
+            if (entry.used and entry.id == id) return &entry.tracked;
+        }
+        return null;
+    }
+
+    pub fn insert(self: *SequenceStore, id: u31, tracked: stream_mod.Tracked) ?*stream_mod.Tracked {
+        if (self.get(id) != null) return null;
+        for (&self.entries) |*entry| {
+            if (!entry.used) {
+                entry.* = .{ .used = true, .id = id, .tracked = tracked };
+                return &entry.tracked;
+            }
+        }
+        return null;
+    }
+};
+
+fn activeState(state: stream_mod.State) bool {
+    return state == .open or state == .half_closed_local or state == .half_closed_remote;
+}
+
+fn expectManagerCounters(manager: *const streams_mod.Manager, store: *const SequenceStore) !void {
+    var local: u32 = 0;
+    var remote: u32 = 0;
+    for (&store.entries) |*entry| {
+        if (!entry.used or !activeState(entry.tracked.stream.state)) continue;
+        if (manager.localInitiated(entry.id)) local += 1 else remote += 1;
+    }
+    try std.testing.expectEqual(local, manager.activeLocal());
+    try std.testing.expectEqual(remote, manager.activeRemote());
+}
+
+fn sequenceId(smith: *std.testing.Smith, role: peer_mod.Role, local: bool) u31 {
+    const ordinal: u31 = @intCast(smith.valueRangeAtMost(u8, 0, 15));
+    const client_initiated = if (role == .client) local else !local;
+    return ordinal * 2 + (if (client_initiated) @as(u31, 1) else @as(u31, 2));
+}
+
+fn fuzzStreamManagerSequences(_: void, smith: *std.testing.Smith) !void {
+    const role: peer_mod.Role = if (smith.value(bool)) .client else .server;
+    var manager = streams_mod.Manager.init(role, .{ .max_concurrent_streams = 16 });
+    var peer = peer_mod.State.init(role);
+    peer.settings.max_concurrent_streams = 16;
+    var store: SequenceStore = .{};
+
+    var step: u8 = 0;
+    while (step < 128 and !smith.eosWeightedSimple(20, 1)) : (step += 1) {
+        const local_id = sequenceId(smith, role, true);
+        const remote_id = sequenceId(smith, role, false);
+        const amount: u32 = smith.valueRangeAtMost(u16, 0, 2048);
+        const increment: u31 = @intCast(smith.valueRangeAtMost(u16, 0, 4096));
+        const end_stream = smith.value(bool);
+
+        switch (smith.valueRangeAtMost(u4, 0, 11)) {
+            0 => {
+                if (role == .client) manager.openLocal(&store, &peer, local_id, end_stream) catch {};
+            },
+            1 => {
+                if (role == .server) _ = manager.receiveHeaders(&store, remote_id, end_stream);
+            },
+            2 => manager.localHeaders(&store, &peer, local_id, end_stream) catch {},
+            3 => _ = manager.receiveHeaders(&store, local_id, end_stream),
+            4 => manager.localData(&store, &peer, local_id, amount, end_stream) catch {},
+            5 => _ = manager.receiveData(&store, local_id, amount, end_stream),
+            6 => manager.localReset(&store, local_id) catch {},
+            7 => _ = manager.receiveReset(&store, local_id),
+            8 => _ = manager.receiveWindowUpdate(&store, &peer, local_id, increment),
+            9 => {
+                if (increment != 0) {
+                    if (manager.existing(&store, local_id)) |existing| existing.creditReceive(increment) catch {};
+                }
+            },
+            10 => {
+                if (role == .server) {
+                    manager.reserveLocal(&store, &peer, remote_id, local_id) catch {};
+                } else {
+                    _ = manager.receivePushPromise(&store, local_id, remote_id);
+                }
+            },
+            else => {
+                if (role == .server) {
+                    _ = manager.receiveData(&store, remote_id, amount, end_stream);
+                } else {
+                    _ = manager.receiveReset(&store, remote_id);
+                }
+            },
+        }
+        try expectManagerCounters(&manager, &store);
+    }
+}
+
+test "fuzz HTTP/2 stream-manager state sequences preserve aggregate invariants" {
+    try std.testing.fuzz({}, fuzzStreamManagerSequences, .{
+        .corpus = &.{
+            "",
+            "\x00\x01\x02\x03\x04\x05\x06\x07",
+            "\xff\xff\xff\xff\xff\xff\xff\xff",
+            "stream-state-sequence",
+        },
+    });
+}
