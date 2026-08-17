@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.17.0
+
 - Harden HTTP/1 request routing semantics: validate absolute-form with shared RFC 3986 URI rules, expose `effective_authority` from semantic/composed receive APIs, and ensure absolute-form and CONNECT derive routing authority from request-target rather than a conflicting Host field; send-side absolute-form now rejects a Host value not derived from its request-target authority. The composed `HeadEvent`/`Event` intentionally grow by one borrowed slice (88/96 B to 104/112 B on x86_64) to avoid a second header traversal on normal routing paths.
 - Make composed HTTP/1 response handling fail-closed: receive/send coordination rejects non-HTTP 600..999 status codes and malformed 101 Upgrade handshakes before switching protocols, while raw head parsing/serialization remains available for diagnostic tooling; response receive has an explicit `validate_responses = false` escape hatch.
 - Share allocation-free URI authority/path/scheme validation between HTTP/1 and HTTP/2, and distinguish tolerant recipient parsing from strict sender generation for empty `#rule` members in Connection/Upgrade lists.
