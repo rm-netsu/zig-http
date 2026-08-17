@@ -4,6 +4,37 @@ The package is pre-1.0 and intentionally removes obsolete compatibility surfaces
 rather than carrying aliases indefinitely. Release notes remain authoritative;
 this document highlights source-level migration patterns.
 
+## Current pre-1.0 hardening
+
+### Route HTTP/1 requests with `effective_authority`
+
+`http1.semantics.RequestInfo` and composed request `HeadEvent` values now expose
+`effective_authority`. Use it for routing instead of assuming the Host field is
+authoritative. Absolute-form requests use the authority from request-target and
+CONNECT uses authority-form; origin/asterisk requests use Host. Send-side
+`MessageWriter.beginRequest()` now rejects an HTTP/1.1 absolute-form request when
+Host does not match the request-target authority (excluding userinfo).
+
+### Composed HTTP/1 response validation is stricter
+
+`ConnectionDecoder` response mode now validates HTTP response semantics by
+default. Status codes outside 100..599 and structurally invalid 101 Upgrade
+responses fail before a protocol-switch event is exposed. Diagnostic tools that
+intentionally accept non-HTTP responses can set:
+
+```zig
+.{ .validate_responses = false }
+```
+
+`MessageWriter.beginResponse()` always applies the strict send-side checks before
+writing. The raw `http1.write.responseHead()` remains a syntax-level escape hatch.
+
+### Shared URI validation
+
+HTTP/1 request-target and HTTP/2 pseudo-field validation now share `http.uri`.
+Malformed percent escapes, authority syntax, IP literals, and HTTP(S) userinfo
+therefore have one implementation and one behavior across protocol versions.
+
 ## 0.15.x to 0.16.x
 
 ### Prefer owning namespaces

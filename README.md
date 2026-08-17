@@ -115,16 +115,22 @@ while (remaining.len != 0) {
 ```
 
 Request mode applies RFC 9112 request-target and Host semantics by default.
-Callers implementing diagnostics, proxies with specialized policy, or other
-low-level tooling can use `.{ .validate_requests = false }` and apply their
-own semantics; the syntax/framing parsers remain independently usable.
+`HeadEvent.effective_authority` is produced by that same pass, so normal routing
+does not rescan headers: origin/asterisk form uses Host, while absolute-form and
+CONNECT use request-target authority even when Host conflicts. Send-side
+absolute-form additionally rejects a mismatched Host before output. Callers
+implementing diagnostics, proxies with specialized policy, or other low-level
+tooling can use `.{ .validate_requests = false }` and apply their own semantics;
+the syntax/framing parsers remain independently usable.
 
 Response mode deliberately does not own a request queue. Bind the next response
 to caller-owned request context with `beginResponse(method)`. Informational 1xx
 responses retain that context, HEAD and successful CONNECT use the correct body
-semantics, `101`/successful CONNECT expose the protocol-switch boundary without
-consuming tunnel bytes, and close-delimited completion is reported by
-`finish()` when the caller observes transport EOF.
+semantics, and close-delimited completion is reported by `finish()` when the
+caller observes transport EOF. Composed response receive rejects status codes
+outside 100..599 and validates the Upgrade plus Connection handshake before a
+`101` switch is exposed; diagnostic tooling can explicitly disable only this
+semantic layer with `.{ .validate_responses = false }`.
 
 ### HTTP/1 send-side message coordination
 
@@ -166,9 +172,11 @@ policy decision are preflighted before the terminal chunk is written. The raw
 owns all trailer semantics. See `examples/http1_trailers.zig`.
 
 Responses whose framing is close-delimited require `finish(out, &.{})`, after
-which the caller must close the transport. Successful CONNECT and `101` responses
-transition to `protocolSwitched()`; tunnel bytes intentionally remain outside the
-HTTP writer.
+which the caller must close the transport. Successful CONNECT and structurally
+valid `101` responses transition to `protocolSwitched()`; invalid 101/status
+semantics are rejected before any head bytes are emitted. Tunnel bytes
+intentionally remain outside the HTTP writer. The application still validates
+that the protocol selected by 101 was one it offered in the request.
 
 ## HTTP/1 fast paths
 

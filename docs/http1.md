@@ -25,15 +25,32 @@ scratch storage; consume or copy them before reusing that storage. A parse failu
 is terminal for that HTTP/1 transport because searching for a later apparent
 message boundary is unsafe after framing becomes ambiguous.
 
+Request `HeadEvent` values expose `effective_authority` from the same semantic
+pass that validates Host/request-target syntax. For origin-form and asterisk-form
+this is the Host field; for absolute-form and CONNECT it comes from the
+request-target. Route on `effective_authority`, not the raw Host field, so a
+conflicting Host cannot override an absolute request target.
+
 For response decoding, the caller supplies the outstanding request method with
 `beginResponse(method)`. Informational responses keep that context; the final
-response completes it.
+response completes it. Response semantics are strict by default: composed
+receive rejects status codes outside 100..599 and only reports a `101` protocol
+switch after validating the response's Upgrade field and `Connection: Upgrade`
+option. Diagnostic/proxy tooling that deliberately accepts invalid HTTP can opt
+out with `.{ .validate_responses = false }` and apply its own policy.
+
+The protocol selected by a valid 101 still belongs to the application: compare
+it with the Upgrade protocols offered by the corresponding request before
+handing transport bytes to that protocol.
 
 ## Send path
 
 `MessageWriter.beginRequest()` and `beginResponse()` preflight the complete head
-before the first byte is emitted. `writeData()` then enforces the selected body
-framing and exact Content-Length accounting. `finish()` completes fixed/chunked
+before the first byte is emitted. HTTP/1.1 absolute-form requests must provide a
+Host value derived from the request-target authority; a mismatch fails before
+output. Response preflight includes the 100..599 status range and structural 101
+Upgrade handshake. `writeData()` then enforces
+the selected body framing and exact Content-Length accounting. `finish()` completes fixed/chunked
 messages and exposes close/protocol-switch outcomes through writer state.
 
 Non-empty chunked trailers require
@@ -56,5 +73,10 @@ Consumers that deliberately own more protocol state may use:
 - `http1.write` for raw serialization.
 
 Raw writers are escape hatches, not alternate composed state machines. In
-particular, `http1.write.endChunks()` serializes trailers without application
-field-definition policy; the caller then owns that semantic check.
+particular, `http1.write.responseHead()` retains syntax-level support for any
+three-digit status so diagnostic tooling can reproduce invalid wire input, and
+`http1.write.endChunks()` serializes trailers without application field-definition
+policy. Callers using these raw APIs own the corresponding semantic checks.
+
+URI wire-syntax helpers shared by HTTP/1 and HTTP/2 are available under
+`http.uri`; they perform no DNS resolution or normalization.
