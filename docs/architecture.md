@@ -52,9 +52,15 @@ coordinator so diagnostic/proxy tooling can reproduce unusual wire input.
 
 ## HTTP/2 levels
 
-### Session
+### Bootstrap and Session
 
-`http2.Session` is the recommended composed connection engine. It is a small
+`http2.Bootstrap` owns only HTTP/2 connection-preface ordering: client magic,
+initial local SETTINGS, fragmented server-side client-preface parsing, and the
+requirement that the first peer frame is a non-ACK SETTINGS frame. It remains
+transport-neutral and hands established frame processing to `Session`.
+
+`http2.Session` is the recommended composed connection engine after/alongside
+bootstrap. It is a small
 connection object over caller-owned dependencies and composes:
 
 - complete/incremental frame validation;
@@ -94,6 +100,7 @@ make skipped validation visible at the call site.
 
 The lower namespaces remain independently useful:
 
+- `http2.bootstrap` — composed connection-preface and initial SETTINGS ordering;
 - `http2.frame` — zero-copy complete/batched/incremental frame parsing;
 - `http2.connection` — connection receive ordering and complete-frame state;
 - `http2.peer` — peer SETTINGS, outbound limits, send window, and GOAWAY state;

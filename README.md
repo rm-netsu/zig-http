@@ -20,7 +20,7 @@ program, a custom reactor, or a sharded multithreaded server.
 - HTTP/2 frame, stream, SETTINGS, flow-control, HPACK, GOAWAY, server-push,
   Extended CONNECT, RFC 9218 priority, and extension composition.
 - Optional composed APIs (`http1.ConnectionDecoder`, `http1.MessageWriter`,
-  `http2.Session`) over the same independently usable low-level primitives.
+  `http2.Bootstrap`, `http2.Session`) over the same independently usable low-level primitives.
 - Caller-owned buffers and HTTP/2 stream storage. The core does not force a
   slab, hash table, allocator, scheduler, queue, or synchronization strategy.
 - Transactional HTTP/2 header delivery and fail-closed message-body semantics,
@@ -48,10 +48,13 @@ See [the HTTP/1 composition guide](docs/http1.md).
 
 ### HTTP/2
 
-For one ordered connection owner, use `http.http2.Session`. It composes frame
-validation, HPACK, field semantics, stream transitions, peer SETTINGS/GOAWAY,
-flow accounting, and state-aware sends while stream storage and HPACK memory
-remain caller-owned.
+For one ordered connection owner, use `http.http2.Bootstrap` for the connection
+preface/initial SETTINGS handshake and `http.http2.Session` for frame validation,
+HPACK, field semantics, stream transitions, peer SETTINGS/GOAWAY, flow accounting,
+and state-aware sends. Stream storage and HPACK memory remain caller-owned.
+
+Local send failures keep compact hot-path errors; opt-in Session diagnostics explain
+header/SETTINGS/DATA preflight failures when development tooling needs a reason.
 
 Custom or sharded runtimes can instead compose `http2.connection`,
 `http2.streams`, `http2.dispatch`, `http2.send`, `http2.flow`, and the frame and

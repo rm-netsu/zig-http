@@ -2,7 +2,7 @@
 
 ## Recommended composed API
 
-Use `http.http2.Session` when one ordered connection owner should compose frame
+Use `http.http2.Bootstrap` plus `http.http2.Session` when one ordered connection owner should compose connection establishment and frame
 validation, HPACK, field semantics, stream transitions, SETTINGS/GOAWAY, flow
 control, and state-aware sends while retaining caller-owned stream storage and
 I/O.
@@ -22,9 +22,61 @@ examples/support/counting_field_sink.zig
 allocator. Its HPACK encoder/decoder and continuation storage are explicitly
 provided connection-owned dependencies.
 
+
+## Connection bootstrap
+
+`http2.Bootstrap` removes the manual glue between `http2.preface.Parser`,
+`preface.bytes`, and the first SETTINGS frame while still owning no socket.
+Create it with the same role as the Session:
+
+```zig
+var bootstrap = http.http2.Bootstrap.init(.client);
+var sync: http.http2.session.SettingsSync = .{};
+_ = try bootstrap.start(&session, &sync, out, &initial_settings);
+
+const result = try bootstrap.receiveBytes(
+    &session, &store, input, http.http2.frame.default_max_frame_size,
+    scratch, &sink,
+);
+```
+
+For clients, `start()` writes the 24-byte client magic and initial SETTINGS. For
+servers it writes only initial SETTINGS. Local settings are validated before any
+preface byte is emitted. Receive-side bootstrap accepts a fragmented client
+magic on servers and requires the peer's first frame to be a non-ACK SETTINGS
+frame before forwarding later frames to Session. Writer failure poisons the
+Bootstrap; discard the connection.
+
+The low-level `http2.preface` parser/bytes remain available when a runtime owns
+connection establishment itself.
+
+## Preflight diagnostics
+
+Normal Session send APIs intentionally keep compact error sets. For logging,
+tests, configuration UIs, or development builds, use the opt-in diagnostic
+companions before a send:
+
+```zig
+if (session.diagnoseSendHeaders(&store, id, end_stream, &fields)) |problem| {
+    // e.g. .field{ .index = 4, .reason = .authority_host_mismatch }
+}
+if (session.diagnoseSettings(&settings)) |problem| {
+    // problem.index + a SettingsPreflightReason
+}
+if (session.diagnoseSendData(&store, id, payload.len, end_stream)) |problem| {
+    // e.g. .response_headers_not_sent or .connect_tunnel_not_established
+}
+```
+
+These APIs do not mutate Session, HPACK, stream state, or the writer. The
+header diagnostic uses the production validator for acceptance and classifies
+only failures, so richer reporting is not part of the hot path. Arbitrary store
+capacity cannot be predicted without a store-specific non-mutating probe;
+`StoreFull` therefore remains a send-time result.
+
 ## Structural contracts
 
-A Session stream store provides the operations diagnosed by `http2.contracts`:
+A Session stream store provides the operations checked by `http2.contracts`:
 
 ```zig
 pub fn get(self: *@This(), id: u31) ?*http2.stream.Tracked;
@@ -37,7 +89,7 @@ pub fn maxActiveSendAdjustment(self: *@This()) i32;
 pub fn bodyState(self: *@This(), id: u31) ?*http2.fields.BodyState;
 ```
 
-The exact storage topology is caller-owned. `examples/support/fixed_stream_store.zig`
+The contract predicates validate complete method signatures (receiver, arguments, and return type), so malformed adapters fail at the API boundary instead of later in generic instantiation. The exact storage topology is caller-owned. `examples/support/fixed_stream_store.zig`
 is a small reference implementation, not a required production layout.
 
 A field sink is invoked synchronously while HPACK fields are decoded and is

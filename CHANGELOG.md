@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add transport-neutral `http2.Bootstrap` composition for client/server connection prefaces and initial SETTINGS ordering, including fragmented client-magic receive, strict first-peer-SETTINGS enforcement, and a preflight-before-wire `start()` path.
+- Make HTTP/2 structural contracts validate complete method signatures for stream/session stores, transactional field sinks, and trailer policies instead of only checking declaration names.
+- Add opt-in HTTP/2 local preflight diagnostics for HEADERS, DATA, and SETTINGS, including field/setting indices and semantic reasons, while preserving the compact production send error sets and validator hot path.
+
 ## 0.18.0
 
 - Make composed HTTP/2 message receive semantics fail-closed with caller-owned `BodyState`: Session now rejects DATA before final response headers, correlates HEAD/CONNECT request methods, validates Content-Length against DATA content octets through END_STREAM/trailers, rejects non-empty DATA for no-content messages, and opens CONNECT tunnel DATA only after a successful response without increasing the 12-byte `Tracked` record.

@@ -15,6 +15,7 @@ wire state may already have advanced**. They require different recovery.
 | `MessageWriter` returns a writer error and `failed()` is true | A HTTP/1 head/body/chunk may be partially on the wire | Close the transport; do not send another HTTP message | No |
 | `MessageWriter.mustClose()` | The completed HTTP/1 message selected close semantics | Close after the message; do not start another message | No further HTTP messages |
 | `MessageWriter.protocolSwitched()` or `ConnectionDecoder.protocolSwitched()` | HTTP/1 switched to a tunnel/protocol after `101` or successful CONNECT | Hand remaining transport bytes to the tunneled protocol | HTTP state is finished |
+| `http2.Bootstrap.receiveBytes()` returns `InvalidPreface` | Peer did not send the required client magic / bootstrap is already failed | Close the HTTP/2 transport; GOAWAY may be omitted for invalid magic | No |
 | `http2.Event.fault.connection` | Peer violated a connection-level HTTP/2 rule | Send GOAWAY when possible, then stop the HTTP/2 transport | No |
 | `http2.Event.fault.stream` | Peer violated a stream-level HTTP/2 rule | Send RST_STREAM for that stream; keep the connection when the write succeeds | Other streams: yes |
 | HTTP/2 send method returns local `Protocol`, `StreamClosed`, `FlowControl`, `PeerLimit`, `StoreFull`, or `GoAway` | Local operation cannot legally be performed in current protocol/application state | Correct policy/state; do not treat this as a peer fault | Usually yes |
@@ -112,7 +113,10 @@ recovery.
 ## HTTP/2 local errors
 
 Errors from outbound Session methods describe the caller's attempted operation,
-not a newly observed peer violation.
+not a newly observed peer violation. When a compact `Protocol`/state result is
+not descriptive enough, `diagnoseSendHeaders`, `diagnoseSendData`, and
+`diagnoseSettings` provide a non-mutating reason pass intended for development
+and observability rather than the hot path.
 
 Common examples:
 
