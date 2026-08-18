@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
     const example_sources = [_][]const u8{
         "http1_client_core",
         "http1_high_level",
+        "http1_expect_upgrade",
         "http1_server_core",
         "http1_trailers",
         "http2_client_core",
@@ -88,6 +89,7 @@ pub fn build(b: *std.Build) void {
         "http2_server_core",
         "http2_trailers",
         "http2_priority",
+        "http2_scheduler",
         "error_handling",
     };
     for (example_sources) |name| {
