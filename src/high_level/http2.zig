@@ -86,9 +86,11 @@ pub const Config = struct {
 /// Session, HPACK contexts, a bounded stream store, a copying transactional
 /// field collector, SETTINGS synchronization, and common scratch buffers.
 ///
-/// The wrapper performs one allocator allocation for its connection-owned
-/// state so the public handle is safely movable even though Session contains
-/// pointers into that state. Wire buffers and transports remain caller-owned.
+/// By default the wrapper performs one allocator allocation for its fixed
+/// connection state so the public handle is safely movable even though Session
+/// contains pointers into that state. `init*InPlace` removes that allocation by
+/// binding the handle to stable caller-owned Storage. Wire buffers and transports
+/// remain caller-owned.
 pub fn Connection(comptime config: Config) type {
     if (config.max_streams == 0) @compileError("high_level.http2 Connection max_streams must be non-zero");
     if (config.header_block_bytes == 0) @compileError("high_level.http2 Connection header_block_bytes must be non-zero");
@@ -103,9 +105,12 @@ pub fn Connection(comptime config: Config) type {
         pub const FieldCollector = h2.storage.FixedFieldCollector(config.collected_fields, config.collected_field_bytes);
 
         allocator: std.mem.Allocator,
-        state: *State,
+        owns_storage: bool = true,
+        state: *Storage,
 
-        const State = struct {
+        /// Caller-owned fixed storage for in-place initialization. Once bound
+        /// to a Connection, its address must remain stable until `deinit`.
+        pub const Storage = struct {
             decoder: h2.hpack.Decoder,
             encoder: h2.hpack.Encoder,
             header_storage: [config.header_block_bytes]u8 = undefined,
@@ -123,11 +128,12 @@ pub fn Connection(comptime config: Config) type {
             next_request_stream_id: u32 = 1,
             connection_credit: h2.flow.ReceiveCredit = undefined,
             receive_failed: bool = false,
+            graceful_goaway: h2.session.GracefulGoAway = .{},
         };
 
-        /// Size of the single fixed connection-state allocation for this
-        /// configuration, excluding HPACK dynamic-table allocations.
-        pub const state_bytes = @sizeOf(State);
+        /// Size of the fixed connection state for this configuration, excluding
+        /// HPACK dynamic-table allocations.
+        pub const state_bytes = @sizeOf(Storage);
 
         pub const FieldSection = struct {
             stream_id: u31,
@@ -170,51 +176,68 @@ pub fn Connection(comptime config: Config) type {
             StreamIdExhausted,
         };
         pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{NotServer};
+        pub const SendTrailersError = h2.session.SendHeadersWithinPeerLimitError;
         pub const ReceiveError = h2.bootstrap.Bootstrap.ReceiveError || error{ HeaderCollectionOverflow, LocalSettingsFlowControl, ReceiveFailed };
         pub const SendControlError = h2.session.SendSimpleControlError || h2.session.SendStreamControlError || h2.session.SendGoAwayError;
 
         pub fn initClient(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
-            return initRole(allocator, .client);
+            return initOwned(allocator, .client);
         }
 
         pub fn initServer(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
-            return initRole(allocator, .server);
+            return initOwned(allocator, .server);
         }
 
-        fn initRole(allocator: std.mem.Allocator, endpoint_role: h2.Role) error{OutOfMemory}!Self {
-            const state = try allocator.create(State);
+        /// Bind the high-level client to stable caller-owned fixed storage. HPACK
+        /// dynamic-table allocations still use `allocator`.
+        pub fn initClientInPlace(storage: *Storage, allocator: std.mem.Allocator) Self {
+            return initInPlace(storage, allocator, .client, false);
+        }
+
+        /// Server counterpart to `initClientInPlace`.
+        pub fn initServerInPlace(storage: *Storage, allocator: std.mem.Allocator) Self {
+            return initInPlace(storage, allocator, .server, false);
+        }
+
+        fn initOwned(allocator: std.mem.Allocator, endpoint_role: h2.Role) error{OutOfMemory}!Self {
+            const storage = try allocator.create(Storage);
+            return initInPlace(storage, allocator, endpoint_role, true);
+        }
+
+        fn initInPlace(storage: *Storage, allocator: std.mem.Allocator, endpoint_role: h2.Role, owns_storage: bool) Self {
             // A reduction is not enforceable until the peer ACKs the initial
             // SETTINGS; before that it may still legally encode with the RFC
             // default table size. Increases are safe to accept eagerly.
-            state.decoder = h2.hpack.Decoder.init(allocator, @max(@as(u32, 4096), config.local_settings.header_table_size));
-            if (config.local_settings.max_header_list_size) |limit| state.decoder.setMaxHeaderListSize(limit);
-            state.encoder = h2.hpack.Encoder.init(allocator, 4096);
-            state.bootstrap = h2.Bootstrap.init(endpoint_role);
-            state.settings_sync = .{};
-            state.store = .{};
-            state.collector = .{};
-            state.next_request_stream_id = 1;
-            state.initial_settings_ticket = null;
-            state.local_settings_active = false;
-            state.connection_credit = h2.flow.ReceiveCredit.init(65_535, 32_767) catch unreachable;
-            state.receive_failed = false;
-            state.session = h2.Session.init(.{
+            storage.decoder = h2.hpack.Decoder.init(allocator, @max(@as(u32, 4096), config.local_settings.header_table_size));
+            if (config.local_settings.max_header_list_size) |limit| storage.decoder.setMaxHeaderListSize(limit);
+            storage.encoder = h2.hpack.Encoder.init(allocator, 4096);
+            storage.bootstrap = h2.Bootstrap.init(endpoint_role);
+            storage.settings_sync = .{};
+            storage.store = .{};
+            storage.collector = .{};
+            storage.next_request_stream_id = 1;
+            storage.initial_settings_ticket = null;
+            storage.local_settings_active = false;
+            storage.connection_credit = h2.flow.ReceiveCredit.init(65_535, 32_767) catch unreachable;
+            storage.receive_failed = false;
+            storage.graceful_goaway = .{};
+            storage.session = h2.Session.init(.{
                 .role = endpoint_role,
                 // Restrictions advertised by initial SETTINGS become binding
                 // only after their ACK. Until then the peer is entitled to the
                 // RFC defaults.
                 .local_limits = .{},
-                .decoder = &state.decoder,
-                .encoder = &state.encoder,
-                .header_storage = &state.header_storage,
+                .decoder = &storage.decoder,
+                .encoder = &storage.encoder,
+                .header_storage = &storage.header_storage,
             });
-            return .{ .allocator = allocator, .state = state };
+            return .{ .allocator = allocator, .owns_storage = owns_storage, .state = storage };
         }
 
         pub fn deinit(self: *Self) void {
             self.state.decoder.deinit();
             self.state.encoder.deinit();
-            self.allocator.destroy(self.state);
+            if (self.owns_storage) self.allocator.destroy(self.state);
             self.* = undefined;
         }
 
@@ -423,6 +446,20 @@ pub fn Connection(comptime config: Config) type {
             return self.state.session.sendData(&self.state.store, out, stream_id, bytes, end_stream);
         }
 
+        /// Serialize a final trailer section with the same bounded staging and
+        /// optional peer header-list preflight used by ordinary high-level sends.
+        pub fn sendTrailers(
+            self: *Self,
+            out: *std.Io.Writer,
+            stream_id: u31,
+            items: []const h2.hpack.EncodedField,
+            policy: anytype,
+        ) SendTrailersError!h2.session.SendHeadersResult {
+            if (config.enforce_peer_header_list_size and self.state.session.diagnosePeerHeaderList(items) != null)
+                return error.PeerHeaderListTooLarge;
+            return self.state.session.sendTrailers(&self.state.store, out, stream_id, &self.state.frame_staging, items, policy);
+        }
+
         /// Emit a control response suggested by `ReceiveResult.control`. The
         /// action is transport-neutral and never writes implicitly from receive().
         pub fn sendControl(self: *Self, out: *std.Io.Writer, action: ControlAction) SendControlError!void {
@@ -494,10 +531,65 @@ pub fn Connection(comptime config: Config) type {
             return self.state.session.sendGoAway(out, last_stream_id, code, debug_data);
         }
 
+        /// Start the RFC 9113 two-phase graceful server shutdown sequence. No
+        /// timer is owned; the caller decides when to call `finishGracefulGoAway`.
+        pub inline fn announceGracefulGoAway(self: *Self, out: *std.Io.Writer, debug_data: []const u8) h2.session.SendGoAwayError!void {
+            return self.state.graceful_goaway.announce(&self.state.session, out, debug_data);
+        }
+
+        /// Send the final graceful GOAWAY cutoff after the caller-selected grace
+        /// interval. `last_stream_id` is application-processed, not merely parsed.
+        pub inline fn finishGracefulGoAway(self: *Self, out: *std.Io.Writer, last_stream_id: u31, debug_data: []const u8) h2.session.SendGoAwayError!void {
+            return self.state.graceful_goaway.finish(&self.state.session, out, last_stream_id, debug_data);
+        }
+
+        pub inline fn gracefulGoAwayPhase(self: *const Self) h2.session.GracefulGoAway.Phase {
+            return self.state.graceful_goaway.phase;
+        }
+
         pub inline fn reclaimClosed(self: *Self) usize {
             return self.state.store.reclaimClosed();
         }
     };
+}
+
+test "high-level HTTP2 supports caller-owned fixed storage" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var storage: Conn.Storage = undefined;
+    var conn = Conn.initClientInPlace(&storage, std.testing.allocator);
+    defer conn.deinit();
+
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try conn.start(&wire);
+    const sent = try conn.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/"), &.{}, true);
+    try std.testing.expectEqual(@as(u31, 1), sent.stream_id);
+}
+
+test "high-level HTTP2 forwards trailers and graceful GOAWAY" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+    var wire_storage: [2048]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.start(&wire);
+    const sent = try client.sendRequest(&wire, h2.message.RequestFields.init("POST", "https", "example.com", "/"), &.{}, false);
+    const Allow = struct {
+        pub fn allows(_: @This(), _: []const u8) bool {
+            return true;
+        }
+    };
+    _ = try client.sendTrailers(&wire, sent.stream_id, &.{h2.message.header("x-checksum", "ok")}, Allow{});
+
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+    var server_wire_storage: [512]u8 = undefined;
+    var server_wire = std.Io.Writer.fixed(&server_wire_storage);
+    _ = try server.start(&server_wire);
+    try server.announceGracefulGoAway(&server_wire, "drain");
+    try std.testing.expectEqual(h2.session.GracefulGoAway.Phase.announced, server.gracefulGoAwayPhase());
+    try server.finishGracefulGoAway(&server_wire, 0, "done");
+    try std.testing.expectEqual(h2.session.GracefulGoAway.Phase.final, server.gracefulGoAwayPhase());
 }
 
 test "high-level HTTP2 connection owns defaults and emits typed request" {
@@ -516,6 +608,22 @@ test "high-level HTTP2 connection owns defaults and emits typed request" {
     );
     try std.testing.expectEqual(@as(u31, 1), sent.stream_id);
     try std.testing.expect(conn.store().get(1) != null);
+}
+
+test "high-level HTTP2 reclaims closed bounded stream slots" {
+    const Conn = Connection(.{ .max_streams = 1, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var storage: Conn.Storage = undefined;
+    var conn = Conn.initClientInPlace(&storage, std.testing.allocator);
+    defer conn.deinit();
+
+    var wire_storage: [2048]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try conn.start(&wire);
+    const first = try conn.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/one"), &.{}, false);
+    try conn.resetStream(&wire, first.stream_id, .cancel);
+    try std.testing.expectEqual(@as(usize, 1), conn.reclaimClosed());
+    const second = try conn.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/two"), &.{}, true);
+    try std.testing.expectEqual(@as(u31, 3), second.stream_id);
 }
 
 test "high-level HTTP2 drain processes multiple complete control frames" {

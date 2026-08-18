@@ -53,8 +53,8 @@ pub fn Connection(comptime config: Config) type {
             }
         };
 
-        allocator: std.mem.Allocator,
-        state: *State,
+        allocator: ?std.mem.Allocator = null,
+        state: *Storage,
 
         const Queue = struct {
             items: [config.max_in_flight]PendingRequest = undefined,
@@ -91,7 +91,9 @@ pub fn Connection(comptime config: Config) type {
             }
         };
 
-        const State = struct {
+        /// Caller-owned fixed storage for in-place initialization. Once bound
+        /// to a Connection, its address must remain stable until `deinit`.
+        pub const Storage = struct {
             role: Role,
             head_storage: [config.head_bytes]u8 = undefined,
             chunk_line_storage: [config.chunk_line_bytes]u8 = undefined,
@@ -103,7 +105,7 @@ pub fn Connection(comptime config: Config) type {
             sending_final_response: bool = false,
         };
 
-        pub const state_bytes = @sizeOf(State);
+        pub const state_bytes = @sizeOf(Storage);
 
         pub const ReceiveError = h1.connection.Error || error{
             NoOutstandingRequest,
@@ -128,29 +130,46 @@ pub fn Connection(comptime config: Config) type {
         pub const DrainResult = hl_common.DrainResult;
 
         pub fn initClient(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
-            return initRole(allocator, .client);
+            return initOwned(allocator, .client);
         }
 
         pub fn initServer(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
-            return initRole(allocator, .server);
+            return initOwned(allocator, .server);
         }
 
-        fn initRole(allocator: std.mem.Allocator, endpoint_role: Role) error{OutOfMemory}!Self {
-            const state = try allocator.create(State);
-            state.role = endpoint_role;
-            state.writer = h1.MessageWriter.init();
-            state.pending = .{};
-            state.receive_at_message_start = true;
-            state.sending_final_response = false;
-            state.decoder = switch (endpoint_role) {
-                .client => h1.ConnectionDecoder.initResponse(&state.head_storage, &state.chunk_line_storage, config.decoder_options),
-                .server => h1.ConnectionDecoder.initRequest(&state.head_storage, &state.chunk_line_storage, config.decoder_options),
+        /// Initialize a fully allocation-free high-level HTTP/1 connection in
+        /// caller-owned storage. `storage` must not move until `deinit`.
+        pub fn initClientInPlace(storage: *Storage) Self {
+            return initInPlace(storage, .client);
+        }
+
+        /// Server counterpart to `initClientInPlace`.
+        pub fn initServerInPlace(storage: *Storage) Self {
+            return initInPlace(storage, .server);
+        }
+
+        fn initOwned(allocator: std.mem.Allocator, endpoint_role: Role) error{OutOfMemory}!Self {
+            const storage = try allocator.create(Storage);
+            var result = initInPlace(storage, endpoint_role);
+            result.allocator = allocator;
+            return result;
+        }
+
+        fn initInPlace(storage: *Storage, endpoint_role: Role) Self {
+            storage.role = endpoint_role;
+            storage.writer = h1.MessageWriter.init();
+            storage.pending = .{};
+            storage.receive_at_message_start = true;
+            storage.sending_final_response = false;
+            storage.decoder = switch (endpoint_role) {
+                .client => h1.ConnectionDecoder.initResponse(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
+                .server => h1.ConnectionDecoder.initRequest(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
             };
-            return .{ .allocator = allocator, .state = state };
+            return .{ .state = storage };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.destroy(self.state);
+            if (self.allocator) |allocator| allocator.destroy(self.state);
             self.* = undefined;
         }
 
@@ -369,6 +388,19 @@ pub fn Connection(comptime config: Config) type {
     };
 }
 
+test "high-level HTTP1 supports allocation-free in-place state" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var storage: Conn.Storage = undefined;
+    var conn = Conn.initClientInPlace(&storage);
+    defer conn.deinit();
+
+    try std.testing.expectEqual(Role.client, conn.role());
+    var wire_storage: [256]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try conn.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/", "example.com"), &.{});
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingResponses());
+}
+
 test "high-level HTTP1 client pipelines response semantics without borrowed methods" {
     const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 4, .outbound_fields = 8 });
     var conn = try Conn.initClient(std.testing.allocator);
@@ -389,6 +421,29 @@ test "high-level HTTP1 client pipelines response semantics without borrowed meth
     const body = try conn.receive("ok");
     try std.testing.expect(body.event.?.data.message_done);
     try std.testing.expectEqual(@as(usize, 0), conn.pendingResponses());
+}
+
+test "high-level HTTP1 bounded client queue reuses slots across many cycles" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 3, .outbound_fields = 8 });
+    var storage: Conn.Storage = undefined;
+    var conn = Conn.initClientInPlace(&storage);
+    defer conn.deinit();
+
+    var wire_storage: [16 * 1024]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    var cycle: usize = 0;
+    while (cycle < 12) : (cycle += 1) {
+        for (0..3) |index| {
+            const method = if ((cycle + index) % 3 == 0) "HEAD" else "GET";
+            _ = try conn.sendRequest(&wire, h1.message.RequestFields.origin(method, "/", "example.com"), &.{});
+        }
+        try std.testing.expectEqual(@as(usize, 3), conn.pendingResponses());
+        for (0..3) |_| {
+            const result = try conn.receive("HTTP/1.1 204 No Content\r\n\r\n");
+            try std.testing.expect(result.event.? == .head);
+        }
+        try std.testing.expectEqual(@as(usize, 0), conn.pendingResponses());
+    }
 }
 
 test "high-level HTTP1 server enforces response order and queue backpressure" {

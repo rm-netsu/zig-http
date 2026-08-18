@@ -19,6 +19,20 @@ pub fn fieldSectionSize(items: []const hpack.EncodedField) u64 {
     return total;
 }
 
+/// Allocation-free holder for a canonical HTTP/2 Content-Length field.
+/// HTTP/2 has no chunked transfer coding; DATA framing remains Session-owned.
+pub const ContentLength = struct {
+    value: common.DecimalValue,
+
+    pub inline fn init(length: u64) ContentLength {
+        return .{ .value = common.DecimalValue.init(length) };
+    }
+
+    pub inline fn field(self: *const ContentLength) hpack.EncodedField {
+        return header("content-length", self.value.slice());
+    }
+};
+
 /// Concise regular-field constructor for typed HTTP/2 message builders.
 pub inline fn header(name: []const u8, value: []const u8) hpack.EncodedField {
     return .{ .field = .{ .name = name, .value = value } };
@@ -215,4 +229,11 @@ test "field section size follows RFC accounting" {
         header("x", "abc"),
     };
     try std.testing.expectEqual(@as(u64, 7 + 3 + 32 + 1 + 3 + 32), fieldSectionSize(&items));
+}
+
+test "HTTP2 content length helper owns decimal bytes" {
+    var length = ContentLength.init(9876543210);
+    const item = length.field();
+    try std.testing.expectEqualStrings("content-length", item.field.name);
+    try std.testing.expectEqualStrings("9876543210", item.field.value);
 }

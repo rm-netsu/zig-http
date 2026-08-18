@@ -5,6 +5,34 @@ pub const Header = struct {
     value: []const u8,
 };
 
+/// Small allocation-free decimal value holder for numeric HTTP fields such as
+/// Content-Length. The returned slice borrows this value, so keep the holder
+/// alive until the enclosing header section has been serialized.
+pub const DecimalValue = struct {
+    bytes: [20]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn init(value: u64) DecimalValue {
+        var result: DecimalValue = .{};
+        var remaining = value;
+        var at: usize = result.bytes.len;
+        while (true) {
+            at -= 1;
+            result.bytes[at] = @intCast('0' + (remaining % 10));
+            remaining /= 10;
+            if (remaining == 0) break;
+        }
+        const count = result.bytes.len - at;
+        std.mem.copyForwards(u8, result.bytes[0..count], result.bytes[at..]);
+        result.len = @intCast(count);
+        return result;
+    }
+
+    pub inline fn slice(self: *const DecimalValue) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 pub fn eqlHeaderName(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
@@ -83,4 +111,11 @@ test "field value validation rejects controls" {
     try std.testing.expect(!isFieldValue("bad\x01value"));
     try std.testing.expect(!isFieldValue("bad\x7fvalue"));
     try std.testing.expect(!isFieldValue("0123456789abcdef\x01tail"));
+}
+
+test "decimal HTTP value formats full u64 range" {
+    var zero = DecimalValue.init(0);
+    try std.testing.expectEqualStrings("0", zero.slice());
+    var max = DecimalValue.init(std.math.maxInt(u64));
+    try std.testing.expectEqualStrings("18446744073709551615", max.slice());
 }

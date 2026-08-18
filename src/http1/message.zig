@@ -113,6 +113,25 @@ pub const ResponseFields = struct {
     }
 };
 
+/// Allocation-free holder for a canonical Content-Length field.
+pub const ContentLength = struct {
+    value: common.DecimalValue,
+
+    pub inline fn init(length: u64) ContentLength {
+        return .{ .value = common.DecimalValue.init(length) };
+    }
+
+    pub inline fn header(self: *const ContentLength) common.Header {
+        return .{ .name = "content-length", .value = self.value.slice() };
+    }
+};
+
+/// Canonical HTTP/1 chunked transfer-coding field. MessageWriter remains the
+/// authority for whether chunked framing is legal for a particular message.
+pub inline fn chunked() common.Header {
+    return .{ .name = "transfer-encoding", .value = "chunked" };
+}
+
 pub inline fn header(name: []const u8, value: []const u8) common.Header {
     return .{ .name = name, .value = value };
 }
@@ -170,4 +189,11 @@ test "Expect and Upgrade helpers generate canonical fields" {
     try std.testing.expectEqualStrings("Upgrade", fields[0].value);
     try std.testing.expectEqualStrings("upgrade", fields[1].name);
     try std.testing.expectEqualStrings("websocket", fields[1].value);
+}
+
+test "body framing helpers format canonical fields" {
+    var length = ContentLength.init(123456);
+    try std.testing.expectEqualStrings("content-length", length.header().name);
+    try std.testing.expectEqualStrings("123456", length.header().value);
+    try std.testing.expectEqualStrings("chunked", chunked().value);
 }
