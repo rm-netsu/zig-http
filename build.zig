@@ -77,15 +77,17 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Generate and install the HTTP API reference");
     docs_step.dependOn(&install_api_docs.step);
 
-    const examples_step = b.step("examples", "Build and run transport-neutral HTTP usage examples");
+    const examples_step = b.step("examples", "Build and run HTTP usage examples");
     const example_sources = [_][]const u8{
         "http1_client_core",
         "http1_high_level",
+        "http1_tcp_client_server",
         "http1_expect_upgrade",
         "http1_server_core",
         "http1_trailers",
         "http2_client_core",
         "http2_high_level",
+        "http2_tcp_client_server",
         "http2_server_core",
         "http2_trailers",
         "http2_priority",
@@ -105,6 +107,13 @@ pub fn build(b: *std.Build) void {
         });
         const run_example = b.addRunArtifact(example_exe);
         examples_step.dependOn(&run_example.step);
+        if (std.mem.eql(u8, name, "http1_tcp_client_server")) {
+            const step = b.step("example-http1-tcp", "Run the loopback TCP HTTP/1 client/server example");
+            step.dependOn(&run_example.step);
+        } else if (std.mem.eql(u8, name, "http2_tcp_client_server")) {
+            const step = b.step("example-http2-tcp", "Run the loopback TCP HTTP/2 prior-knowledge client/server example");
+            step.dependOn(&run_example.step);
+        }
     }
 
     const tests = b.addTest(.{ .root_module = mod });

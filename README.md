@@ -108,7 +108,12 @@ layer; HTTP/2 can avoid the large fixed-state allocation while continuing to use
 the caller-selected allocator only for HPACK dynamic tables. In-place storage
 must remain at a stable address until `deinit`.
 
-The best executable starting points are compile-tested examples:
+The best executable starting points are compile-tested examples. For a complete socket-level composition, start with the runnable loopback client/server examples:
+
+- [`examples/http1_tcp_client_server.zig`](examples/http1_tcp_client_server.zig)
+- [`examples/http2_tcp_client_server.zig`](examples/http2_tcp_client_server.zig)
+
+They are explained in [`docs/basic-client-server.md`](docs/basic-client-server.md). Lower-level and focused examples include:
 
 - [`examples/http1_high_level.zig`](examples/http1_high_level.zig)
 - [`examples/http1_expect_upgrade.zig`](examples/http1_expect_upgrade.zig)
@@ -129,6 +134,7 @@ so they are kept in sync with the public API.
 Start with [`docs/README.md`](docs/README.md). The focused guides are:
 
 - [Architecture and composition levels](docs/architecture.md)
+- [Basic TCP client/server composition](docs/basic-client-server.md)
 - [HTTP/1.1 composition](docs/http1.md)
 - [HTTP/2 composition](docs/http2.md)
 - [Concurrency and ownership](docs/concurrency.md)

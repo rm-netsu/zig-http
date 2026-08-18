@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add runnable loopback TCP HTTP/1.1 and cleartext prior-knowledge HTTP/2 client/server examples, including pipelining/multiplexing, streaming bodies, HTTP/2 control responses and receive-credit handling, plus a focused integration guide and individual build targets.
+
 ## 0.19.0
 
 - Add caller-owned in-place storage for both high-level connection families: HTTP/1 can now run fully allocation-free at the composed layer, while HTTP/2 can avoid its large fixed-state allocation and retain allocator use only for HPACK dynamic-table memory.
