@@ -1,16 +1,19 @@
-# Protocol-core examples
+# Transport-neutral examples
 
-These examples are intentionally transport-neutral. They demonstrate how to
-compose zig-http with caller-owned buffers, HPACK state, stream storage, and I/O
-without making sockets, TLS, DNS, or an event loop part of the HTTP core.
+These examples cover both the optional convenience layer and direct protocol-core
+composition. None of them makes sockets, TLS, DNS, or an event loop part of the
+HTTP package.
 
 - `http1_client_core.zig` — serialize a request with `MessageWriter`, then parse
   a response with `ConnectionDecoder` and explicit outstanding-method context.
 - `http1_server_core.zig` — parse a request and serialize a framed response.
 - `http1_trailers.zig` — finish a chunked response with application-defined
   trailers through the explicit RFC 9110 semantic policy hook.
-- `http2_client_core.zig` — create a client `Session`, fixed caller-owned stream
-  store, HPACK codecs, and one request HEADERS block.
+- `http2_high_level.zig` — shortest bounded-memory client/server round-trip using
+  `high_level.http2.Connection`, typed message builders, copied header fields,
+  and automatic client stream-ID allocation.
+- `http2_client_core.zig` — create a client `Session`, public fixed stream store,
+  HPACK codecs, and one request HEADERS block.
 - `http2_server_core.zig` — in-memory client/server Session round-trip showing
   synchronous field sinks, stream storage, response HEADERS, and DATA.
 - `http2_trailers.zig` — send HTTP/2 trailers only after an explicit application/domain semantic policy accepts every field.
@@ -19,7 +22,6 @@ without making sockets, TLS, DNS, or an event loop part of the HTTP core.
   and emit a PRIORITY_UPDATE frame without introducing scheduling policy.
 - `error_handling.zig` — exhaustive peer-fault scope mapping plus HTTP/1 writer
   recovery-state checks; see `docs/operations.md` for the full operational model.
-- `support/fixed_stream_store.zig` — complete minimal `Session` store contract.
 - `support/counting_field_sink.zig` — minimal synchronous field-sink contract.
 
 Run all examples with:

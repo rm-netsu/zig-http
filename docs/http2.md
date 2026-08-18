@@ -1,5 +1,50 @@
 # HTTP/2 composition guide
 
+## Optional high-level connection
+
+For applications that want bounded defaults rather than custom storage,
+`http.high_level.http2.Connection(config)` owns the repetitive HTTP-specific
+connection wiring while leaving the transport outside the library:
+
+```zig
+const Conn = http.high_level.http2.Connection(.{});
+var client = try Conn.initClient(allocator);
+defer client.deinit();
+
+_ = try client.start(out, &.{});
+const sent = try client.sendRequest(
+    out,
+    http.http2.message.RequestFields.init("GET", "https", "example.com", "/"),
+    &.{http.http2.message.header("accept", "application/json")},
+    true,
+);
+```
+
+The wrapper bundles HPACK encoder/decoder contexts, `Bootstrap`, `Session`,
+`SettingsSync`, `http2.storage.FixedStreamStore`, a copying transactional
+`FixedFieldCollector`, and bounded scratch/staging buffers. It performs one
+connection-state allocation so its public handle is safely movable despite
+Session holding internal pointers. Sockets, TLS, transport buffers, timers, and
+application scheduling remain caller-owned. `core()`, `store()`, `collector()`,
+and `bootstrap()` expose the underlying components when an integration needs to
+drop down a level.
+
+The convenience defaults favor a practical standalone integration rather than
+minimum bytes per connection. `Connection(config).state_bytes` exposes the fixed
+allocation size at comptime; tune the bounds or use `Session` directly for very
+high connection counts or custom storage topologies.
+
+`receive()` returns copied header fields alongside HEADERS/PUSH_PROMISE events.
+If the configured collector capacity is insufficient, `overflowed` is reported
+without publishing a partial field list; the HTTP/2 decoder stays synchronized.
+Closed entries are retained until the application explicitly calls
+`reclaimClosed()`, so final stream state remains inspectable.
+
+Typed `http2.message.RequestFields` keeps ordinary, CONNECT, and Extended
+CONNECT pseudo-field layouts distinct. `ResponseFields` formats numeric status
+codes. Both build into caller/wrapper-owned `EncodedField` storage and run the
+production field validator before Session/wire mutation.
+
 ## Recommended composed API
 
 Use `http.http2.Bootstrap` plus `http.http2.Session` when one ordered connection owner should compose connection establishment and frame
@@ -10,11 +55,11 @@ I/O.
 Compile-tested starting points:
 
 ```text
+examples/http2_high_level.zig
 examples/http2_client_core.zig
 examples/http2_server_core.zig
 examples/http2_trailers.zig
 examples/http2_priority.zig
-examples/support/fixed_stream_store.zig
 examples/support/counting_field_sink.zig
 ```
 
@@ -89,8 +134,8 @@ pub fn maxActiveSendAdjustment(self: *@This()) i32;
 pub fn bodyState(self: *@This(), id: u31) ?*http2.fields.BodyState;
 ```
 
-The contract predicates validate complete method signatures (receiver, arguments, and return type), so malformed adapters fail at the API boundary instead of later in generic instantiation. The exact storage topology is caller-owned. `examples/support/fixed_stream_store.zig`
-is a small reference implementation, not a required production layout.
+The contract predicates validate complete method signatures (receiver, arguments, and return type), so malformed adapters fail at the API boundary instead of later in generic instantiation. The exact storage topology is caller-owned. `http2.storage.FixedStreamStore(N)` is a bounded O(N) default implementation;
+custom slabs/maps/shards remain supported through the same structural contract.
 
 A field sink is invoked synchronously while HPACK fields are decoded and is
 transactional at field-section granularity. The minimal shape is:

@@ -154,7 +154,13 @@ layout-sensitive benchmarks. See [`../BENCHMARKS.md`](../BENCHMARKS.md).
 
 ## Integration layers
 
-A concrete socket/TLS/event-loop adapter necessarily crosses the core boundary.
-Such adapters can live in a future optional `high_level` namespace or separate
-package, but must remain wrappers over independently usable core APIs. The
-protocol engine does not require consumers to adopt those wrappers.
+`http.high_level` is the optional in-package convenience layer. Its HTTP/2
+connection wrapper owns routine HTTP-specific composition (HPACK contexts,
+Bootstrap/Session, bounded default stream/header storage, scratch buffers, and
+client stream-ID allocation) while still consuming and producing caller-owned
+byte streams. It is implemented entirely on top of public core APIs.
+
+A concrete socket/TLS/event-loop adapter crosses the protocol boundary and
+belongs in an application or separate adapter package. The core never requires
+consumers to adopt `high_level`, and custom/sharded runtimes can bypass it
+without losing functionality.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add optional `http.high_level.http2.Connection(config)` composition with owned HPACK contexts, Bootstrap/Session, bounded stream/header storage, scratch/staging buffers, SETTINGS synchronization, copied receive fields, client stream-ID allocation, and typed request/response sends while keeping transport ownership outside the package.
+- Add public bounded `http2.storage.FixedStreamStore` with explicit closed-record reclamation and transactional copying `FixedFieldCollector`; migrate examples away from a copied support-only store.
+- Add allocation-free `http2.message.RequestFields` / `ResponseFields` builders that order pseudo-fields by construction, distinguish CONNECT variants, preserve regular-field HPACK indexing policy, and validate complete field sections before Session/wire mutation.
 - Add transport-neutral `http2.Bootstrap` composition for client/server connection prefaces and initial SETTINGS ordering, including fragmented client-magic receive, strict first-peer-SETTINGS enforcement, and a preflight-before-wire `start()` path.
 - Make HTTP/2 structural contracts validate complete method signatures for stream/session stores, transactional field sinks, and trailer policies instead of only checking declaration names.
 - Add opt-in HTTP/2 local preflight diagnostics for HEADERS, DATA, and SETTINGS, including field/setting indices and semantic reasons, while preserving the compact production send error sets and validator hot path.

@@ -21,6 +21,9 @@ program, a custom reactor, or a sharded multithreaded server.
   Extended CONNECT, RFC 9218 priority, and extension composition.
 - Optional composed APIs (`http1.ConnectionDecoder`, `http1.MessageWriter`,
   `http2.Bootstrap`, `http2.Session`) over the same independently usable low-level primitives.
+- Optional `http.high_level.http2.Connection` bundles HPACK, bootstrap, bounded
+  stream/header storage, scratch buffers, typed request/response builders, and
+  client stream-ID allocation while still leaving transport ownership outside.
 - Caller-owned buffers and HTTP/2 stream storage. The core does not force a
   slab, hash table, allocator, scheduler, queue, or synchronization strategy.
 - Transactional HTTP/2 header delivery and fail-closed message-body semantics,
@@ -48,7 +51,12 @@ See [the HTTP/1 composition guide](docs/http1.md).
 
 ### HTTP/2
 
-For one ordered connection owner, use `http.http2.Bootstrap` for the connection
+For the shortest bounded-memory integration, use
+`http.high_level.http2.Connection(config)`. It owns the routine per-connection
+HPACK/storage/scratch composition but still reads from and writes to
+caller-owned transport buffers.
+
+For custom storage or one ordered connection owner that wants direct control, use `http.http2.Bootstrap` for the connection
 preface/initial SETTINGS handshake and `http.http2.Session` for frame validation,
 HPACK, field semantics, stream transitions, peer SETTINGS/GOAWAY, flow accounting,
 and state-aware sends. Stream storage and HPACK memory remain caller-owned.
@@ -73,6 +81,7 @@ The best executable starting points are compile-tested examples:
 
 - [`examples/http1_client_core.zig`](examples/http1_client_core.zig)
 - [`examples/http1_server_core.zig`](examples/http1_server_core.zig)
+- [`examples/http2_high_level.zig`](examples/http2_high_level.zig)
 - [`examples/http2_client_core.zig`](examples/http2_client_core.zig)
 - [`examples/http2_server_core.zig`](examples/http2_server_core.zig)
 - [`examples/error_handling.zig`](examples/error_handling.zig)
@@ -108,7 +117,10 @@ The root module intentionally stays small:
 - `http.uri` — allocation-free URI/request-target validation helpers.
 - `http.http1` — HTTP/1.1 parser, body, semantics, connection, and write APIs.
 - `http.http2` — HTTP/2 framing, state, fields, flow control, streams, session,
-  dispatch, send, priority, and extension APIs.
+  bounded default storage, typed message builders, dispatch, send, priority,
+  and extension APIs.
+- `http.high_level` — optional transport-neutral convenience composition built
+  exclusively on the protocol core.
 
 Owning namespaces are part of the DX: low-level declarations live under the
 protocol component that owns their invariants instead of accumulating duplicate
@@ -190,10 +202,9 @@ The core deliberately does **not** own:
 - application routing/work queues;
 - a mandatory HTTP/2 stream storage or scheduling topology.
 
-Those concerns can be layered on top without restricting users who need the
-lower protocol components directly. A future optional `high_level` namespace
-may provide concrete integration wrappers, but the protocol core remains
-independently usable.
+The optional `http.high_level` namespace may own routine HTTP-specific
+connection storage/composition, but deliberately stops before sockets, TLS,
+DNS, timers, or an event loop. The protocol core remains independently usable.
 
 ## Status
 

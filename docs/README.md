@@ -8,8 +8,8 @@ TLS, event-loop, or thread-pool implementation.
 
 - [`../README.md`](../README.md) — package overview, quick starts, build commands,
   and composition-level selection.
-- [`../examples/README.md`](../examples/README.md) — compile-tested executable
-  examples and minimal support types.
+- [`../examples/README.md`](../examples/README.md) — compile-tested high-level
+  and protocol-core executable examples.
 - [`architecture.md`](architecture.md) — protocol/core boundary, composition
   levels, memory model, and low-level module map.
 - [`http1.md`](http1.md) — HTTP/1.1 receive/send composition and lower-level
