@@ -117,6 +117,21 @@ pub inline fn header(name: []const u8, value: []const u8) common.Header {
     return .{ .name = name, .value = value };
 }
 
+/// Canonical request field for the only expectation defined by RFC 9110. The
+/// caller still chooses framing/content and whether it waits before sending.
+pub inline fn expectContinue() common.Header {
+    return .{ .name = "expect", .value = "100-continue" };
+}
+
+/// Canonical pair required to advertise or select an HTTP/1.1 Upgrade.
+/// `protocols` is the comma-separated protocol list/value retained by caller.
+pub inline fn upgrade(protocols: []const u8) [2]common.Header {
+    return .{
+        .{ .name = "connection", .value = "Upgrade" },
+        .{ .name = "upgrade", .value = protocols },
+    };
+}
+
 test "typed request builder supplies Host and classifies response semantics" {
     var storage: [4]common.Header = undefined;
     const request = RequestFields.origin("HEAD", "/resource", "example.com");
@@ -143,4 +158,16 @@ test "typed request builder rejects duplicate Host before serialization" {
     var storage: [4]common.Header = undefined;
     const request = RequestFields.origin("GET", "/", "example.com");
     try std.testing.expectError(error.DuplicateHost, request.build(&storage, &.{header("Host", "other.example")}));
+}
+
+test "Expect and Upgrade helpers generate canonical fields" {
+    const expect = expectContinue();
+    try std.testing.expectEqualStrings("expect", expect.name);
+    try std.testing.expectEqualStrings("100-continue", expect.value);
+
+    const fields = upgrade("websocket");
+    try std.testing.expectEqualStrings("connection", fields[0].name);
+    try std.testing.expectEqualStrings("Upgrade", fields[0].value);
+    try std.testing.expectEqualStrings("upgrade", fields[1].name);
+    try std.testing.expectEqualStrings("websocket", fields[1].value);
 }

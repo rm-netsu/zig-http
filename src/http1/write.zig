@@ -63,7 +63,7 @@ pub const MessageWriter = struct {
         poisoned,
     };
 
-    pub const MessageError = Error || head.Error || semantics.RequestError || semantics.ResponseError || semantics.ConnectionError || error{
+    pub const MessageError = Error || head.Error || semantics.RequestError || semantics.ResponseError || semantics.ConnectionError || semantics.ExpectationError || error{
         InvalidState,
         ContentLengthMismatch,
         TrailersNotAllowed,
@@ -111,7 +111,8 @@ pub const MessageWriter = struct {
         if (self.state != .idle) return error.InvalidState;
         if (!common.isToken(method) or !validTarget(target)) return error.InvalidHeader;
         const framing = try head.requestBodyFramingFields(version, headers);
-        _ = try semantics.validateRequestFields(version, method, target, headers);
+        const semantic = try semantics.validateRequestFieldsWithExpectation(version, method, target, headers);
+        if (semantic.expectation == .continue_100 and !requestFramingHasContent(framing)) return error.InvalidExpectation;
         const persistence = try semantics.persistenceFields(version, headers);
 
         requestHeadUnchecked(w, version, method, target, headers) catch |err| {
@@ -340,6 +341,14 @@ fn writeHeadersUnchecked(w: *std.Io.Writer, headers: []const common.Header) std.
 fn endChunksUnchecked(w: *std.Io.Writer, trailers: []const common.Header) std.Io.Writer.Error!void {
     try w.writeAll("0\r\n");
     try writeHeadersUnchecked(w, trailers);
+}
+
+fn requestFramingHasContent(framing: head.BodyFraming) bool {
+    return switch (framing) {
+        .content_length => |length| length != 0,
+        .chunked, .close => true,
+        .none => false,
+    };
 }
 
 fn validTarget(target: []const u8) bool {
@@ -579,4 +588,21 @@ test "message writer rejects mismatched absolute-form Host before output" {
     }));
     try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
     try std.testing.expect(message.ready());
+}
+
+test "MessageWriter rejects 100-continue without request content before output" {
+    var writer = MessageWriter.init();
+    var storage: [256]u8 = undefined;
+    var out = std.Io.Writer.fixed(&storage);
+    const fields = [_]common.Header{
+        .{ .name = "host", .value = "example.com" },
+        .{ .name = "content-length", .value = "0" },
+        .{ .name = "expect", .value = "100-continue" },
+    };
+    try std.testing.expectError(
+        error.InvalidExpectation,
+        writer.beginRequest(&out, .http_1_1, "POST", "/upload", &fields),
+    );
+    try std.testing.expectEqual(@as(usize, 0), out.end);
+    try std.testing.expect(writer.ready());
 }

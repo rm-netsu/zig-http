@@ -14,6 +14,14 @@ pub const Config = struct {
 pub const Role = enum { client, server };
 pub const DrainAction = hl_common.DrainAction;
 
+fn requestFramingHasContent(framing: h1.head.BodyFraming) bool {
+    return switch (framing) {
+        .content_length => |length| length != 0,
+        .chunked, .close => true,
+        .none => false,
+    };
+}
+
 /// Transport-neutral bounded HTTP/1 convenience connection. The wrapper owns
 /// composed receive/send protocol state and the response-order queue required by
 /// HTTP/1 pipelining, but owns no socket, TLS session, timer, or event loop.
@@ -29,12 +37,18 @@ pub fn Connection(comptime config: Config) type {
     return struct {
         const Self = @This();
         const Kind = h1.message.RequestKind;
+        const PendingRequest = struct {
+            kind: Kind,
+            expect_continue: bool = false,
+            upgrade_offered: bool = false,
+            continue_sent: bool = false,
+        };
 
         allocator: std.mem.Allocator,
         state: *State,
 
         const Queue = struct {
-            items: [config.max_in_flight]Kind = undefined,
+            items: [config.max_in_flight]PendingRequest = undefined,
             first: usize = 0,
             len: usize = 0,
 
@@ -42,19 +56,24 @@ pub fn Connection(comptime config: Config) type {
                 return self.len == config.max_in_flight;
             }
 
-            fn push(self: *Queue, kind: Kind) bool {
+            fn push(self: *Queue, item: PendingRequest) bool {
                 if (self.full()) return false;
-                self.items[(self.first + self.len) % config.max_in_flight] = kind;
+                self.items[(self.first + self.len) % config.max_in_flight] = item;
                 self.len += 1;
                 return true;
             }
 
-            fn peek(self: *const Queue) ?Kind {
+            fn peek(self: *const Queue) ?PendingRequest {
                 if (self.len == 0) return null;
                 return self.items[self.first];
             }
 
-            fn pop(self: *Queue) ?Kind {
+            fn peekPtr(self: *Queue) ?*PendingRequest {
+                if (self.len == 0) return null;
+                return &self.items[self.first];
+            }
+
+            fn pop(self: *Queue) ?PendingRequest {
                 const value = self.peek() orelse return null;
                 self.first = (self.first + 1) % config.max_in_flight;
                 self.len -= 1;
@@ -88,6 +107,7 @@ pub fn Connection(comptime config: Config) type {
         pub const SendResponseError = h1.MessageWriter.MessageError || error{
             NotServer,
             NoPendingRequest,
+            ContinueRequiredBeforeUpgrade,
         };
         pub const DataError = h1.MessageWriter.MessageError;
 
@@ -157,7 +177,7 @@ pub fn Connection(comptime config: Config) type {
             if (self.state.pending.full()) return error.RequestQueueFull;
             const fields = try request.build(&self.state.outbound, regular_fields);
             const result = try self.state.writer.beginRequest(out, request.version, request.method, request.target, fields);
-            if (!self.state.pending.push(request.kind())) unreachable;
+            if (!self.state.pending.push(.{ .kind = request.kind() })) unreachable;
             return result;
         }
 
@@ -171,16 +191,19 @@ pub fn Connection(comptime config: Config) type {
             fields: []const common.Header,
         ) SendResponseError!h1.MessageWriter.BeginResult {
             if (self.role() != .server) return error.NotServer;
-            const kind = self.state.pending.peek() orelse return error.NoPendingRequest;
+            const pending = self.state.pending.peekPtr() orelse return error.NoPendingRequest;
+            if (response.status == 101 and pending.expect_continue and pending.upgrade_offered and !pending.continue_sent)
+                return error.ContinueRequiredBeforeUpgrade;
             const result = try self.state.writer.beginResponse(
                 out,
                 response.version,
                 response.status,
                 response.reason,
-                kind.canonicalMethod(),
+                pending.kind.canonicalMethod(),
                 fields,
             );
 
+            if (response.status == 100) pending.continue_sent = true;
             const informational = response.status >= 100 and response.status < 200 and response.status != 101;
             if (!informational) {
                 self.state.sending_final_response = !result.message_done;
@@ -224,8 +247,8 @@ pub fn Connection(comptime config: Config) type {
             switch (self.role()) {
                 .client => {
                     if (!self.state.decoder.responsePending()) {
-                        const kind = self.state.pending.peek() orelse return error.NoOutstandingRequest;
-                        try self.state.decoder.beginResponse(kind.canonicalMethod());
+                        const pending = self.state.pending.peek() orelse return error.NoOutstandingRequest;
+                        try self.state.decoder.beginResponse(pending.kind.canonicalMethod());
                     }
                 },
                 .server => {
@@ -244,7 +267,17 @@ pub fn Connection(comptime config: Config) type {
                             .request => |request| request,
                             else => unreachable,
                         };
-                        if (!self.state.pending.push(Kind.from(request.method))) unreachable;
+                        const expectation = h1.semantics.requestExpectation(head_event.head) catch .unsupported;
+                        const expect_continue = expectation == .continue_100 and requestFramingHasContent(head_event.framing);
+                        var upgrade_offered = false;
+                        if (h1.semantics.UpgradeOffer.init(head_event.head)) |_| {
+                            upgrade_offered = true;
+                        } else |_| {}
+                        if (!self.state.pending.push(.{
+                            .kind = Kind.from(request.method),
+                            .expect_continue = expect_continue,
+                            .upgrade_offered = upgrade_offered,
+                        })) unreachable;
                         self.state.receive_at_message_start = head_event.message_done;
                     },
                     .data => |data| self.state.receive_at_message_start = data.message_done,
@@ -258,8 +291,8 @@ pub fn Connection(comptime config: Config) type {
         /// Complete receive-side close-delimited framing at transport EOF.
         pub fn finishReceive(self: *Self) ReceiveError!?h1.Event {
             if (self.role() == .client and !self.state.decoder.responsePending()) {
-                if (self.state.pending.peek()) |kind|
-                    try self.state.decoder.beginResponse(kind.canonicalMethod());
+                if (self.state.pending.peek()) |pending|
+                    try self.state.decoder.beginResponse(pending.kind.canonicalMethod());
             }
             const event = try self.state.decoder.finish();
             if (self.role() == .client and !self.state.decoder.responsePending() and self.state.pending.len != 0)
@@ -438,4 +471,34 @@ test "high-level HTTP1 client treats EOF before an outstanding response as trunc
     _ = try conn.sendRequest(&request_wire, h1.message.RequestFields.origin("GET", "/", "example.com"), &.{});
     try std.testing.expectError(error.UnexpectedEof, conn.finishReceive());
     try std.testing.expectEqual(@as(usize, 1), conn.pendingResponses());
+}
+
+test "high-level HTTP1 server requires 100 before 101 when Expect and Upgrade are combined" {
+    const Conn = Connection(.{ .head_bytes = 1024, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    const request = try server.receive(
+        "POST /chat HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Content-Length: 4\r\n" ++
+            "Expect: 100-continue\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Upgrade: websocket\r\n\r\n",
+    );
+    try std.testing.expect(request.event.? == .head);
+
+    const upgrade_fields = h1.message.upgrade("websocket");
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expectError(
+        error.ContinueRequiredBeforeUpgrade,
+        server.sendResponse(&wire, h1.message.ResponseFields.init(101, "Switching Protocols"), &upgrade_fields),
+    );
+    try std.testing.expectEqual(@as(usize, 0), wire.end);
+
+    const continued = try server.sendResponse(&wire, h1.message.ResponseFields.init(100, "Continue"), &.{});
+    try std.testing.expect(continued.message_done);
+    _ = try server.sendResponse(&wire, h1.message.ResponseFields.init(101, "Switching Protocols"), &upgrade_fields);
+    try std.testing.expect(server.protocolSwitched());
 }
