@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add strict opt-in HTTP/2 peer field-section limit preflight using RFC `SETTINGS_MAX_HEADER_LIST_SIZE` accounting; the high-level HTTP/2 wrapper honors the advertised limit by default before HPACK/wire mutation while low-level `Session.sendHeaders()` remains permissive because the setting is advisory.
+- Add HTTP/1 `Expectation`/`ContinueGate` helpers and canonical `expectContinue()` construction so 100-continue coordination no longer requires application-side field scanning or timer ownership in core.
+- Add borrowed `UpgradeOffer` validation that checks Connection/Upgrade structure, case-insensitive protocol-name matching, and that a 101 response selects only client-offered protocols.
+- Add optional `http2.scheduler.Urgency`, a caller-driven RFC 9218 reference scheduler with urgency ordering, non-incremental continuation, incremental round-robin sharing, and flow-control-aware fallback to ready lower-priority work.
+- Add compile-tested HTTP/1 Expect/Upgrade and HTTP/2 priority-scheduler examples.
 - Add optional `http.high_level.http1.Connection(config)` composition with bounded parser/writer storage, automatic pipelined HEAD/CONNECT/other response-context tracking, server response-order enforcement/backpressure, typed Host-aware requests, and streaming send/receive while preserving caller-owned transport.
 - Add allocation-free `http1.message.RequestFields` / `ResponseFields` helpers for origin/absolute/asterisk/CONNECT composition and duplicate-Host prevention before wire mutation.
 - Add synchronous high-level `drain` helpers for HTTP/1 and HTTP/2 so event loops can consume immediately parseable events without hand-writing receive loops or buffering borrowed event batches.

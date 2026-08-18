@@ -18,7 +18,7 @@ program, a custom reactor, or a sharded multithreaded server.
   pipelining, informational responses, HEAD, CONNECT, Upgrade, chunked bodies,
   trailers, and close-delimited responses.
 - HTTP/2 frame, stream, SETTINGS, flow-control, HPACK, GOAWAY, server-push,
-  Extended CONNECT, RFC 9218 priority, and extension composition.
+  Extended CONNECT, RFC 9218 priority, reference urgency scheduling, and extension composition.
 - Optional composed APIs (`http1.ConnectionDecoder`, `http1.MessageWriter`,
   `http2.Bootstrap`, `http2.Session`) over the same independently usable low-level primitives.
 - Optional `http.high_level.http1.Connection` bundles HTTP/1 parsing/writing, a
@@ -90,11 +90,13 @@ sets 0.16.0 as the minimum Zig version.
 The best executable starting points are compile-tested examples:
 
 - [`examples/http1_high_level.zig`](examples/http1_high_level.zig)
+- [`examples/http1_expect_upgrade.zig`](examples/http1_expect_upgrade.zig)
 - [`examples/http1_client_core.zig`](examples/http1_client_core.zig)
 - [`examples/http1_server_core.zig`](examples/http1_server_core.zig)
 - [`examples/http2_high_level.zig`](examples/http2_high_level.zig)
 - [`examples/http2_client_core.zig`](examples/http2_client_core.zig)
 - [`examples/http2_server_core.zig`](examples/http2_server_core.zig)
+- [`examples/http2_scheduler.zig`](examples/http2_scheduler.zig)
 - [`examples/error_handling.zig`](examples/error_handling.zig)
 
 Trailer and RFC 9218 examples are listed in

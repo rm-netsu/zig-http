@@ -24,7 +24,29 @@ Typed `http1.message.RequestFields` constructors cover origin-form, absolute-
 form, OPTIONS `*`, and CONNECT. They compose Host by construction and reject a
 regular-field list that tries to duplicate the generated Host. `ResponseFields`
 packages the response start line while leaving body framing fields explicit for
-streaming applications.
+streaming applications. `http1.message.expectContinue()` and `upgrade(...)`
+provide canonical field construction for the two handshakes without hiding their
+application policy.
+
+`http1.semantics.requestExpectation()` classifies request Expect fields as
+`none`, `continue_100`, or `unsupported`; HTTP/1.0 expectations are ignored.
+`ContinueGate` is a tiny caller-owned client coordinator: 100 opens the body
+gate, another informational response leaves it waiting, a final response
+suppresses the body, and the application can stop waiting on its own timer via
+`proceedWithoutContinue()`. No timer is owned by the HTTP package.
+`MessageWriter.beginRequest()` also rejects generation of `100-continue` when
+request framing indicates no content, before any wire byte is written.
+
+For Upgrade, `http1.semantics.UpgradeOffer.init(head)` validates the request's
+`Connection: Upgrade` + Upgrade list once. `offers(protocol)` performs the RFC
+case-insensitive protocol-name match, and `validateSelection(response_head)`
+ensures a structurally valid 101 selected only protocols actually offered by
+the client. The helper borrows the parsed request head and performs no copying. The
+high-level server retains only whether a request combined a content-bearing
+100-continue expectation with an Upgrade offer; `sendResponse(101, ...)` then
+returns `ContinueRequiredBeforeUpgrade` until a successful 100 response has
+been emitted for that request. The selected protocol list remains application
+owned and can be checked with `UpgradeOffer.validateSelection()`.
 
 Both high-level roles expose `drain(input, handler)`. It repeatedly drives the
 one-event decoder and invokes `handler.onEvent(event)` synchronously; returning
@@ -39,6 +61,7 @@ The compile-tested starting points are:
 
 ```text
 examples/http1_high_level.zig
+examples/http1_expect_upgrade.zig
 examples/http1_client_core.zig
 examples/http1_server_core.zig
 examples/http1_trailers.zig

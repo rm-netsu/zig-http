@@ -45,6 +45,15 @@ CONNECT pseudo-field layouts distinct. `ResponseFields` formats numeric status
 codes. Both build into caller/wrapper-owned `EncodedField` storage and run the
 production field validator before Session/wire mutation.
 
+The high-level wrapper also honors a peer-advertised
+`SETTINGS_MAX_HEADER_LIST_SIZE` before HPACK or wire mutation. This is enabled by
+default with `Config.enforce_peer_header_list_size = true`; disable it when an
+application intentionally treats the advisory setting as soft policy. Low-level
+`Session.sendHeaders()` remains permissive. `Session.peerHeaderListLimit()`,
+`peerHeaderList()`, `diagnosePeerHeaderList()`, and
+`sendHeadersWithinPeerLimit()` provide explicit policy composition for custom
+runtimes. `http2.message.fieldSectionSize()` exposes the same RFC accounting.
+
 `Connection.drain(input, max_frame_size, handler)` is the convenience counterpart
 to one-event `receive()`. It synchronously invokes `handler.onEvent(result)` for
 every immediately parseable event and stops when the handler returns the shared
@@ -68,6 +77,7 @@ examples/http2_client_core.zig
 examples/http2_server_core.zig
 examples/http2_trailers.zig
 examples/http2_priority.zig
+examples/http2_scheduler.zig
 examples/support/counting_field_sink.zig
 ```
 
@@ -208,7 +218,12 @@ signals while preserving their different omission semantics.
 
 Scheduling policy, buffering priorities for not-yet-created streams, and merging
 client/server preferences remain caller-owned. The HTTP core intentionally does
-not impose a queue or scheduler topology.
+not impose a mandatory queue or scheduler topology. `http2.scheduler.Urgency` is
+an optional reference RFC 9218 scheduler: lower urgency wins, non-incremental
+responses are kept active while they can make progress, and incremental work
+round-robins within the same urgency. If a higher-urgency stream is flow-control
+blocked, ready lower-urgency work may proceed. The original tiny `RoundRobin`
+remains available when an application owns priority policy elsewhere.
 
 ## Trailer field semantics
 

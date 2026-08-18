@@ -5,6 +5,7 @@ composition. None of them makes sockets, TLS, DNS, or an event loop part of the
 HTTP package.
 
 - `http1_high_level.zig` — shortest bounded-memory HTTP/1 client/server round-trip with typed Host-aware request construction, automatic response-context coordination, and synchronous event draining.
+- `http1_expect_upgrade.zig` — allocation-free Expect: 100-continue coordination and validation of an HTTP/1.1 Upgrade selection against the original offer.
 - `http1_client_core.zig` — serialize a request with `MessageWriter`, then parse
   a response with `ConnectionDecoder` and explicit outstanding-method context.
 - `http1_server_core.zig` — parse a request and serialize a framed response.
@@ -20,7 +21,9 @@ HTTP package.
 - `http2_trailers.zig` — send HTTP/2 trailers only after an explicit application/domain semantic policy accepts every field.
 - `http2_priority.zig` — parse and serialize RFC 9218 Priority values, compose
   request/response/PRIORITY_UPDATE omission semantics with caller-owned state,
-  and emit a PRIORITY_UPDATE frame without introducing scheduling policy.
+  and emit a PRIORITY_UPDATE frame.
+- `http2_scheduler.zig` — apply caller-owned effective RFC 9218 priorities with
+  the optional urgency/incremental reference scheduler.
 - `error_handling.zig` — exhaustive peer-fault scope mapping plus HTTP/1 writer
   recovery-state checks; see `docs/operations.md` for the full operational model.
 - `support/counting_field_sink.zig` — minimal synchronous field-sink contract.
