@@ -21,7 +21,7 @@ pub fn main() !void {
 
     var c2s_storage: [8192]u8 = undefined;
     var c2s = std.Io.Writer.fixed(&c2s_storage);
-    _ = try client.start(&c2s, &.{});
+    _ = try client.start(&c2s);
     const sent = try client.sendRequest(
         &c2s,
         h2.message.RequestFields.init("GET", "https", "example.com", "/status"),
@@ -31,19 +31,18 @@ pub fn main() !void {
 
     var s2c_storage: [8192]u8 = undefined;
     var s2c = std.Io.Writer.fixed(&s2c_storage);
-    _ = try server.start(&s2c, &.{});
+    _ = try server.start(&s2c);
 
     var offset: usize = 0;
     while (offset < c2s.buffered().len) {
-        const received = (try server.receive(c2s.buffered()[offset..], h2.frame.default_max_frame_size)) orelse break;
+        const received = (try server.receive(c2s.buffered()[offset..])) orelse break;
         if (received.consumed == 0) break;
         offset += received.consumed;
         if (received.event) |event| switch (event) {
-            .settings => |settings| if (!settings.ack) try server.sendSettingsAck(&s2c),
+            .settings => {},
             .headers => |section| {
                 std.debug.assert(section.stream_id == sent.stream_id);
                 const copied = received.fields orelse return error.MissingFields;
-                std.debug.assert(!copied.overflowed);
                 std.debug.assert(copied.headers.len == 5);
 
                 var response = try h2.message.ResponseFields.init(200);
@@ -58,6 +57,7 @@ pub fn main() !void {
             },
             else => {},
         };
+        try server.sendControl(&s2c, received.control);
     }
 
     std.debug.assert(s2c.buffered().len != 0);

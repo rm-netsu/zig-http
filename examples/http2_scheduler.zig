@@ -18,7 +18,7 @@ pub fn main() !void {
 
     var wire_storage: [4096]u8 = undefined;
     var wire = std.Io.Writer.fixed(&wire_storage);
-    _ = try conn.start(&wire, &.{});
+    _ = try conn.start(&wire);
     _ = try conn.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/critical"), &.{}, false);
     _ = try conn.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/background"), &.{}, false);
 

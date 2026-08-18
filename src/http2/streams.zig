@@ -374,6 +374,10 @@ pub const Manager = struct {
         return @intCast(self.highest_local_bits & stream_id_mask);
     }
 
+    pub inline fn highestRemoteStreamId(self: Manager) u31 {
+        return self.highest_remote_stream_id;
+    }
+
     inline fn positiveSendAdjustmentSeen(self: Manager) bool {
         return (self.highest_local_bits & positive_send_adjustment_bit) != 0;
     }

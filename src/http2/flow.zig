@@ -13,8 +13,18 @@ pub const ReceiveCredit = struct {
     released: u32 = 0,
 
     pub fn init(target: u31, low_watermark: u31) error{InvalidPolicy}!ReceiveCredit {
-        if (target == 0 or low_watermark >= target) return error.InvalidPolicy;
+        if ((target == 0 and low_watermark != 0) or (target != 0 and low_watermark >= target)) return error.InvalidPolicy;
         return .{ .target = target, .low_watermark = low_watermark };
+    }
+
+    /// Reconfigures the target without discarding capacity already released by
+    /// the application. A zero target is useful while a reduced
+    /// SETTINGS_INITIAL_WINDOW_SIZE is being activated after its ACK: released
+    /// bytes can still recover a temporarily negative stream receive window.
+    pub fn setPolicy(self: *ReceiveCredit, target: u31, low_watermark: u31) error{InvalidPolicy}!void {
+        if ((target == 0 and low_watermark != 0) or (target != 0 and low_watermark >= target)) return error.InvalidPolicy;
+        self.target = target;
+        self.low_watermark = low_watermark;
     }
 
     /// Adds receive capacity released by the caller. For DATA with padding,
@@ -29,10 +39,15 @@ pub const ReceiveCredit = struct {
     /// the low watermark or while the caller has not released capacity.
     pub inline fn proposal(self: ReceiveCredit, current: FlowWindow) ?u31 {
         if (self.released == 0) return null;
-        const available = current.available();
-        if (available > self.low_watermark or available >= self.target) return null;
-        const gap: u31 = self.target - available;
-        const increment: u31 = @intCast(@min(self.released, @as(u32, gap)));
+        const signed = @as(i64, current.value);
+        if (signed >= 0) {
+            const available: u31 = @intCast(signed);
+            if (available > self.low_watermark or available >= self.target) return null;
+        }
+        const gap = @as(i64, self.target) - signed;
+        if (gap <= 0) return null;
+        const bounded_gap: u32 = @intCast(@min(gap, @as(i64, std.math.maxInt(u31))));
+        const increment: u31 = @intCast(@min(self.released, bounded_gap));
         return if (increment == 0) null else increment;
     }
 
@@ -200,6 +215,16 @@ test "receive credit caps updates at target" {
     credit.release(90_000);
     const window: FlowWindow = .{ .value = 40_000 };
     try std.testing.expectEqual(@as(?u31, 60_000), credit.proposal(window));
-    try std.testing.expectError(error.InvalidPolicy, ReceiveCredit.init(0, 0));
+    const zero = try ReceiveCredit.init(0, 0);
+    try std.testing.expectEqual(@as(u31, 0), zero.target);
+    try std.testing.expectError(error.InvalidPolicy, ReceiveCredit.init(0, 1));
     try std.testing.expectError(error.InvalidPolicy, ReceiveCredit.init(10, 10));
+}
+
+test "receive credit can recover a negative window after local settings activation" {
+    var credit = try ReceiveCredit.init(65_535, 32_767);
+    credit.release(20_000);
+    try credit.setPolicy(0, 0);
+    const window: FlowWindow = .{ .value = -10_000 };
+    try std.testing.expectEqual(@as(?u31, 10_000), credit.proposal(window));
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("../common.zig");
 const fields = @import("fields.zig");
+const flow = @import("flow.zig");
 const stream = @import("stream.zig");
 
 /// Small fixed-capacity Session store for embedded applications, examples, and
@@ -14,6 +15,7 @@ pub fn FixedStreamStore(comptime capacity: usize) type {
             used: bool = false,
             tracked: stream.Tracked = undefined,
             body: fields.BodyState = .{},
+            receive_credit: ?flow.ReceiveCredit = null,
         };
 
         entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
@@ -30,7 +32,7 @@ pub fn FixedStreamStore(comptime capacity: usize) type {
             if (self.get(id) != null) return null;
             for (&self.entries) |*entry| {
                 if (!entry.used) {
-                    entry.* = .{ .id = id, .used = true, .tracked = tracked, .body = .{} };
+                    entry.* = .{ .id = id, .used = true, .tracked = tracked, .body = .{}, .receive_credit = null };
                     self.used_count += 1;
                     return &entry.tracked;
                 }
@@ -55,6 +57,52 @@ pub fn FixedStreamStore(comptime capacity: usize) type {
                 if (entry.used and entry.id == id) return &entry.body;
             }
             return null;
+        }
+
+        pub fn receiveCredit(self: *Self, id: u31) ?*flow.ReceiveCredit {
+            for (&self.entries) |*entry| {
+                if (entry.used and entry.id == id) {
+                    if (entry.receive_credit) |*credit| return credit;
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        pub fn setReceiveCredit(self: *Self, id: u31, credit: flow.ReceiveCredit) bool {
+            for (&self.entries) |*entry| {
+                if (entry.used and entry.id == id) {
+                    entry.receive_credit = credit;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// Activates a newly acknowledged local SETTINGS_INITIAL_WINDOW_SIZE
+        /// for every retained stream. Validation is completed before mutation so
+        /// an impossible delta never leaves only part of the bounded store
+        /// updated.
+        pub fn applyLocalInitialWindow(self: *Self, old: u31, new: u31) error{FlowControl}!void {
+            const delta = @as(i64, new) - @as(i64, old);
+            for (&self.entries) |*entry| {
+                if (!entry.used) continue;
+                const next = @as(i64, entry.tracked.windows.receive.value) + delta;
+                if (next > 0x7fff_ffff or next < -0x7fff_ffff) return error.FlowControl;
+            }
+            for (&self.entries) |*entry| {
+                if (!entry.used) continue;
+                entry.tracked.windows.receive.applyInitialDelta(old, new) catch unreachable;
+            }
+        }
+
+        /// Changes the receive-credit target for active streams while retaining
+        /// bytes already released by the application.
+        pub fn setReceiveCreditPolicy(self: *Self, target: u31, low_watermark: u31) void {
+            for (&self.entries) |*entry| {
+                if (!entry.used) continue;
+                if (entry.receive_credit) |*credit| credit.setPolicy(target, low_watermark) catch unreachable;
+            }
         }
 
         /// Removes one record only after it reached the HTTP/2 closed state.
