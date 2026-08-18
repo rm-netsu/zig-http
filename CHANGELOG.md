@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.19.0
+
+- Add caller-owned in-place storage for both high-level connection families: HTTP/1 can now run fully allocation-free at the composed layer, while HTTP/2 can avoid its large fixed-state allocation and retain allocator use only for HPACK dynamic-table memory.
+- Forward common HTTP/2 lifecycle operations through the high-level wrapper, including semantic trailer sends and caller-timed two-phase graceful GOAWAY, without changing the underlying Session ownership model.
+- Add allocation-free typed body-framing helpers: stable decimal `ContentLength` holders for HTTP/1 and HTTP/2 plus canonical HTTP/1 `chunked()` construction, with final legality still enforced by the production writer/field validators.
+- Strengthen high-level state-model coverage with repeated bounded HTTP/1 pipeline reuse and HTTP/2 closed-stream reclamation/reuse tests.
 - Make high-level HTTP/2 local SETTINGS authoritative: `Config.local_settings` now drives the initial SETTINGS frame, inbound frame/header/stream limits, and HPACK decoder policy; restrictive values activate only after the matching SETTINGS ACK, including existing-stream initial-window adjustment, while safe receive expansions can be accepted eagerly. Remove the divergent `start(settings)` and `receive(max_frame_size)` arguments.
 - Add transport-neutral high-level HTTP/2 `ControlAction` responses for SETTINGS/PING/protocol faults plus `releaseData` / `flushReceiveCredit` flow-control composition; receive never writes implicitly.
 - Make high-level HTTP/2 field collection fail closed on bounded collector overflow after fully draining HPACK, rather than publishing empty headers with an easy-to-ignore overflow flag.
