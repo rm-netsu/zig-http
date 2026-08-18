@@ -370,7 +370,7 @@ pub const Manager = struct {
     const positive_send_adjustment_bit: u32 = 0x8000_0000;
     const stream_id_mask: u32 = 0x7fff_ffff;
 
-    inline fn highestLocalStreamId(self: Manager) u31 {
+    pub inline fn highestLocalStreamId(self: Manager) u31 {
         return @intCast(self.highest_local_bits & stream_id_mask);
     }
 

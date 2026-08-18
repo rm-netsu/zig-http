@@ -250,6 +250,150 @@ pub const Validator = struct {
     }
 };
 
+/// Detailed reason for an explicitly requested field-section diagnostic pass.
+/// The normal `Validator` keeps its compact `error.InvalidHeader` surface; this
+/// enum is populated only by `DiagnosticValidator`, so production hot paths do
+/// not pay for richer error reporting.
+pub const Violation = enum(u5) {
+    empty_name,
+    invalid_value,
+    invalid_name,
+    pseudo_after_regular,
+    pseudo_in_trailers,
+    invalid_pseudo,
+    duplicate_pseudo,
+    invalid_pseudo_value,
+    invalid_authority,
+    authority_host_mismatch,
+    duplicate_host,
+    connection_specific_field,
+    invalid_te,
+    invalid_content_length,
+    content_length_in_trailers,
+    missing_method,
+    missing_status,
+    invalid_request_target,
+    invalid_field,
+};
+
+/// Slow-path diagnostic wrapper around the exact production validator. It runs
+/// the real validator first and only classifies a failure from the pre-field
+/// snapshot, keeping the diagnostic implementation from becoming a second
+/// source of acceptance semantics.
+pub const DiagnosticValidator = struct {
+    inner: Validator,
+
+    pub fn init(kind: Kind) DiagnosticValidator {
+        return .{ .inner = Validator.init(kind) };
+    }
+
+    pub fn field(self: *DiagnosticValidator, h: common.Header) ?Violation {
+        const before = self.inner;
+        self.inner.field(h) catch return classifyFieldFailure(before, h);
+        return null;
+    }
+
+    pub fn finish(self: *DiagnosticValidator) ?Violation {
+        self.inner.finish() catch return classifyFinishFailure(self.inner);
+        return null;
+    }
+};
+
+fn classifyFieldFailure(before: Validator, h: common.Header) Violation {
+    if (h.name.len == 0) return .empty_name;
+    if (!validFieldValue(h.value)) return .invalid_value;
+
+    if (h.name[0] == ':') {
+        if (before.regular_seen) return .pseudo_after_regular;
+        if (before.kind == .trailers) return .pseudo_in_trailers;
+        if (std.mem.eql(u8, h.name, ":path")) {
+            if (before.kind != .request) return .invalid_pseudo;
+            if (before.path_seen) return .duplicate_pseudo;
+            if (uri.validatePathQuery(h.value) == null) return .invalid_pseudo_value;
+            return .invalid_field;
+        }
+        if (std.mem.eql(u8, h.name, ":protocol")) {
+            if (before.kind != .request) return .invalid_pseudo;
+            if (before.protocol_seen) return .duplicate_pseudo;
+            if (!common.isToken(h.value)) return .invalid_pseudo_value;
+            return .invalid_field;
+        }
+        if (std.mem.eql(u8, h.name, ":authority")) {
+            if (before.kind != .request) return .invalid_pseudo;
+            if (before.authority_seen) return .duplicate_pseudo;
+            if (uri.validateAuthority(h.value) == null) return .invalid_authority;
+            return .invalid_field;
+        }
+        if (std.mem.eql(u8, h.name, ":method")) {
+            if (before.kind != .request) return .invalid_pseudo;
+            if (before.method_seen) return .duplicate_pseudo;
+            if (!common.isToken(h.value)) return .invalid_pseudo_value;
+            return .invalid_field;
+        }
+        if (std.mem.eql(u8, h.name, ":scheme")) {
+            if (before.kind != .request) return .invalid_pseudo;
+            if (before.scheme_seen) return .duplicate_pseudo;
+            if (!uri.validScheme(h.value)) return .invalid_pseudo_value;
+            return .invalid_field;
+        }
+        if (std.mem.eql(u8, h.name, ":status")) {
+            if (before.kind != .response) return .invalid_pseudo;
+            if (before.status_seen) return .duplicate_pseudo;
+            if (h.value.len != 3 or !std.ascii.isDigit(h.value[0]) or
+                !std.ascii.isDigit(h.value[1]) or !std.ascii.isDigit(h.value[2]))
+                return .invalid_pseudo_value;
+            const status = @as(u16, h.value[0] - '0') * 100 +
+                @as(u16, h.value[1] - '0') * 10 + @as(u16, h.value[2] - '0');
+            if (status < 100 or status > 599) return .invalid_pseudo_value;
+            return .invalid_field;
+        }
+        return .invalid_pseudo;
+    }
+
+    for (h.name) |c| {
+        if ((c >= 'A' and c <= 'Z') or !common.isTchar(c)) return .invalid_name;
+    }
+
+    if (std.mem.eql(u8, h.name, "te")) {
+        if (!std.ascii.eqlIgnoreCase(common.trimOws(h.value), "trailers")) return .invalid_te;
+    } else if (std.mem.eql(u8, h.name, "upgrade") or
+        std.mem.eql(u8, h.name, "connection") or
+        std.mem.eql(u8, h.name, "keep-alive") or
+        std.mem.eql(u8, h.name, "proxy-connection") or
+        std.mem.eql(u8, h.name, "transfer-encoding"))
+    {
+        return .connection_specific_field;
+    } else if (std.mem.eql(u8, h.name, "content-length")) {
+        if (before.kind == .trailers) return .content_length_in_trailers;
+        const length = parseContentLength(h.value) orelse return .invalid_content_length;
+        if (before.content_length) |previous| {
+            if (previous != length) return .invalid_content_length;
+        }
+    } else if (std.mem.eql(u8, h.name, "host")) {
+        if (before.kind != .request) return .invalid_field;
+        if (before.host_seen) return .duplicate_host;
+        const host_info = uri.validateAuthority(h.value) orelse return .invalid_authority;
+        if (host_info.has_userinfo) return .invalid_authority;
+        if (before.authority_reference) |authority| {
+            const scheme: uri.Scheme = switch (before.request_target.scheme) {
+                .http => .http,
+                .https => .https,
+                .none, .other => .other,
+            };
+            if (!authority.eqlHostValidated(host_info, scheme)) return .authority_host_mismatch;
+        }
+    }
+    return .invalid_field;
+}
+
+fn classifyFinishFailure(validator: Validator) Violation {
+    return switch (validator.kind) {
+        .request => if (!validator.method_seen) .missing_method else .invalid_request_target,
+        .response => if (!validator.status_seen) .missing_status else .invalid_field,
+        .trailers => .invalid_field,
+    };
+}
+
 /// Standalone caller-owned HTTP message-body length validation for consumers
 /// composing lower-level frame/stream primitives manually. The integrated
 /// `Session` uses `BodyState` through its stream-store contract, so Session
@@ -595,4 +739,21 @@ test "HTTP/2 body length validates DATA bytes at end stream" {
     var unrestricted = BodyLength.init(null);
     try unrestricted.receive(1024, true);
     try unrestricted.finish();
+}
+
+test "diagnostic validator classifies common field failures without changing acceptance" {
+    var pseudo = DiagnosticValidator.init(.request);
+    try std.testing.expect(pseudo.field(.{ .name = ":method", .value = "GET" }) == null);
+    try std.testing.expect(pseudo.field(.{ .name = "x-test", .value = "ok" }) == null);
+    try std.testing.expectEqual(Violation.pseudo_after_regular, pseudo.field(.{ .name = ":path", .value = "/" }).?);
+
+    var authority = DiagnosticValidator.init(.request);
+    try std.testing.expect(authority.field(.{ .name = ":method", .value = "GET" }) == null);
+    try std.testing.expect(authority.field(.{ .name = ":scheme", .value = "https" }) == null);
+    try std.testing.expect(authority.field(.{ .name = ":authority", .value = "example.com" }) == null);
+    try std.testing.expect(authority.field(.{ .name = ":path", .value = "/" }) == null);
+    try std.testing.expectEqual(Violation.authority_host_mismatch, authority.field(.{ .name = "host", .value = "other.example" }).?);
+
+    var missing = DiagnosticValidator.init(.request);
+    try std.testing.expectEqual(Violation.missing_method, missing.finish().?);
 }

@@ -27,10 +27,12 @@ test {
     _ = http2.flow.StreamSendWindow;
     _ = http2.flow.ReceiveCredit;
     _ = http2.fields.Validator;
+    _ = http2.fields.DiagnosticValidator;
     _ = http2.fields.RequestTarget;
     _ = http2.payload.HeadersPayload;
     _ = http2.continuation.Guard;
     _ = http2.preface.Parser;
+    _ = http2.bootstrap.Bootstrap;
     _ = http2.protocol.ErrorCode;
     _ = http2.priority.Update;
     _ = http2.stream.Stream;

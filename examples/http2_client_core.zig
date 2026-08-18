@@ -19,10 +19,13 @@ pub fn main() !void {
         .encoder = &encoder,
         .header_storage = &header_storage,
     });
+    var bootstrap = h2.Bootstrap.init(.client);
+    var settings_sync: h2.session.SettingsSync = .{};
     var store: Store = .{};
 
     var wire_storage: [4096]u8 = undefined;
     var out = std.Io.Writer.fixed(&wire_storage);
+    _ = try bootstrap.start(&session, &settings_sync, &out, &.{});
     var staging: [1024]u8 = undefined;
     const request = [_]h2.hpack.EncodedField{
         .{ .field = .{ .name = ":method", .value = "GET" } },

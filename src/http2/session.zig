@@ -177,6 +177,49 @@ pub const CompleteResult = struct {
 pub const SendHeadersResult = send_mod.HeaderFrameStats;
 pub const SendPushPromiseResult = send_mod.HeaderFrameStats;
 
+/// Rich, opt-in reason for `sendHeaders` preflight failures. The normal send
+/// path intentionally retains its compact error set; this union is produced
+/// only when callers explicitly request diagnostics.
+pub const HeaderPreflightViolation = union(enum) {
+    send_poisoned,
+    goaway,
+    field: struct { index: u32, reason: fields.Violation },
+    section: fields.Violation,
+    trailers_require_end_stream,
+    informational_end_stream,
+    switching_protocols,
+    trailer_policy_required,
+    extended_connect_not_advertised,
+    successful_connect_content_length,
+    invalid_stream_id,
+    stream_closed,
+    invalid_stream_state,
+    peer_stream_limit,
+};
+
+pub const SettingsPreflightReason = enum {
+    invalid_enable_push,
+    invalid_enable_connect_protocol,
+    connect_protocol_withdrawal,
+    invalid_initial_window_size,
+    invalid_max_frame_size,
+};
+
+pub const SettingsPreflightViolation = struct {
+    index: u32,
+    reason: SettingsPreflightReason,
+};
+
+pub const DataPreflightViolation = enum {
+    send_poisoned,
+    goaway,
+    stream_closed,
+    invalid_stream_state,
+    response_headers_not_sent,
+    connect_tunnel_not_established,
+    connect_rejected,
+};
+
 pub const SendDataResult = struct {
     consumed: usize,
     blocked: bool,
@@ -310,6 +353,142 @@ pub const Session = struct {
         };
     }
 
+    pub inline fn role(self: Session) peer_mod.Role {
+        return self.streams.local_role;
+    }
+
+    /// Explains whether the same inputs would pass `sendHeaders` preflight,
+    /// without mutating stream/session/HPACK state or touching the writer.
+    /// Store-capacity failure is intentionally not predicted because arbitrary
+    /// caller-owned stores need not expose a non-mutating capacity probe.
+    pub fn diagnoseSendHeaders(
+        self: *const Session,
+        store: anytype,
+        stream_id: u31,
+        end_stream: bool,
+        items: []const hpack.EncodedField,
+    ) ?HeaderPreflightViolation {
+        comptime contracts.assertSessionStore(@TypeOf(store));
+        if (self.pending.poisoned()) return .send_poisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return .goaway;
+
+        const tracked = store.get(stream_id);
+        const kind = self.localHeaderKindTracked(tracked, stream_id);
+        var diagnostic = fields.DiagnosticValidator.init(kind);
+        var status: u16 = 0;
+        for (items, 0..) |item, index| {
+            const header: common.Header = .{ .name = item.field.name, .value = item.field.value };
+            if (diagnostic.field(header)) |reason| return .{ .field = .{ .index = @intCast(index), .reason = reason } };
+            if (kind == .response and std.mem.eql(u8, header.name, ":status")) {
+                status = @as(u16, header.value[0] - '0') * 100 +
+                    @as(u16, header.value[1] - '0') * 10 + @as(u16, header.value[2] - '0');
+            }
+        }
+        if (diagnostic.finish()) |reason| return .{ .section = reason };
+
+        if (kind == .trailers) {
+            if (!end_stream) return .trailers_require_end_stream;
+            if (items.len != 0) return .trailer_policy_required;
+        }
+        if (kind == .response) {
+            const informational = status >= 100 and status < 200;
+            if (status == 101) return .switching_protocols;
+            if (informational and end_stream) return .informational_end_stream;
+        }
+        if (diagnostic.inner.extendedConnect() and
+            (self.streams.local_role != .client or !self.peer.settings.enable_connect_protocol))
+            return .extended_connect_not_advertised;
+        if (kind == .response and status >= 200 and status < 300) {
+            if (tracked) |value| {
+                if (value.request_method == .connect and diagnostic.inner.content_length != null)
+                    return .successful_connect_content_length;
+            }
+        }
+
+        if (tracked) |value| {
+            if (value.stream.state == .reserved_local) {
+                if (self.peer.goAwayReceived()) return .goaway;
+                if (self.streams.activeLocal() >= self.peer.settings.max_concurrent_streams)
+                    return .peer_stream_limit;
+            }
+            var probe = value.stream;
+            probe.localHeaders(end_stream) catch |err| return switch (err) {
+                error.StreamClosed => .stream_closed,
+                error.Protocol => .invalid_stream_state,
+            };
+            return null;
+        }
+
+        // The only initial local HEADERS that can create a stream are client
+        // request HEADERS on a fresh, monotonically increasing odd stream id.
+        if (self.streams.local_role != .client or stream_id == 0 or
+            !self.streams.localInitiated(stream_id) or stream_id <= self.streams.highestLocalStreamId())
+            return .invalid_stream_id;
+        if (self.peer.goAwayReceived()) return .goaway;
+        if (self.streams.activeLocal() >= self.peer.settings.max_concurrent_streams)
+            return .peer_stream_limit;
+        return null;
+    }
+
+    /// Rich diagnostic companion for local SETTINGS validation. Unknown
+    /// extension settings remain valid and therefore never produce a reason.
+    pub fn diagnoseSettings(self: Session, items: []const settings.Setting) ?SettingsPreflightViolation {
+        var connect_enabled = self.streams.extendedConnectAdvertised();
+        for (items, 0..) |item, index| {
+            const reason: ?SettingsPreflightReason = switch (item.id) {
+                .enable_push => if (item.value > 1 or (self.streams.local_role == .server and item.value == 1))
+                    .invalid_enable_push
+                else
+                    null,
+                .enable_connect_protocol => switch (item.value) {
+                    0 => if (connect_enabled) .connect_protocol_withdrawal else null,
+                    1 => blk: {
+                        connect_enabled = true;
+                        break :blk null;
+                    },
+                    else => .invalid_enable_connect_protocol,
+                },
+                .initial_window_size => if (item.value > 0x7fff_ffff) .invalid_initial_window_size else null,
+                .max_frame_size => if (item.value < frame.default_max_frame_size or item.value > frame.max_frame_size)
+                    .invalid_max_frame_size
+                else
+                    null,
+                else => null,
+            };
+            if (reason) |value| return .{ .index = @intCast(index), .reason = value };
+        }
+        return null;
+    }
+
+    /// Diagnostic companion for DATA preconditions that do not depend on the
+    /// eventual writer outcome or amount of currently available flow credit.
+    pub fn diagnoseSendData(
+        self: *const Session,
+        store: anytype,
+        stream_id: u31,
+        byte_count: usize,
+        end_stream: bool,
+    ) ?DataPreflightViolation {
+        comptime contracts.assertStreamStore(@TypeOf(store));
+        if (self.pending.poisoned()) return .send_poisoned;
+        if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return .goaway;
+        const tracked = store.get(stream_id) orelse return .stream_closed;
+        if (self.streams.local_role == .server and tracked.local_headers == .initial and
+            (byte_count != 0 or end_stream))
+            return .response_headers_not_sent;
+        if (self.streams.local_role == .client and self.streams.localInitiated(stream_id) and byte_count != 0) {
+            if (tracked.request_method == .connect and tracked.remote_headers == .initial)
+                return .connect_tunnel_not_established;
+            if (tracked.request_method == .connect_rejected) return .connect_rejected;
+        }
+        switch (tracked.stream.state) {
+            .open, .half_closed_remote => {},
+            .half_closed_local, .closed => return .stream_closed,
+            else => return .invalid_stream_state,
+        }
+        return null;
+    }
+
     /// Streams one local field section directly into HEADERS/CONTINUATION
     /// frames. `frame_staging.len - 1` bounds the payload retained in memory;
     /// it may be smaller than the peer-advertised maximum frame size.
@@ -327,7 +506,7 @@ pub const Session = struct {
         frame_staging: []u8,
         items: []const hpack.EncodedField,
     ) SendHeadersError!SendHeadersResult {
-        comptime contracts.assertStreamStore(@TypeOf(store));
+        comptime contracts.assertSessionStore(@TypeOf(store));
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, stream_id)) return error.GoAway;
 
@@ -629,6 +808,18 @@ pub const Session = struct {
         if (self.pending.poisoned()) return error.SendPoisoned;
         if (self.streams.unprocessedByPeer(&self.peer, existing.stream_id)) return error.GoAway;
         return self.sendDataTracked(out, existing.stream_id, existing.tracked, bytes, end_stream, true);
+    }
+
+    /// Validates locally generated SETTINGS without mutating Session, HPACK,
+    /// stream state, synchronization state, or wire output. Composed bootstrap
+    /// code uses this before writing a client connection preface; applications
+    /// can also use it for explicit configuration diagnostics.
+    pub fn preflightSettings(self: Session, items: []const settings.Setting) error{ Protocol, FlowControl }!void {
+        _ = try validateLocalSettings(
+            self.streams.local_role,
+            self.streams.extendedConnectAdvertised(),
+            items,
+        );
     }
 
     /// Sends one SETTINGS frame and returns a synchronization ticket. ACKs are
@@ -957,7 +1148,7 @@ pub const Session = struct {
         return self.pending.poisoned();
     }
 
-    fn localHeaderKindTracked(self: *Session, tracked: ?*stream_mod.Tracked, stream_id: u31) fields.Kind {
+    fn localHeaderKindTracked(self: *const Session, tracked: ?*stream_mod.Tracked, stream_id: u31) fields.Kind {
         if (tracked) |value| {
             if (value.local_headers != .initial) return .trailers;
             return if (self.streams.local_role == .server) .response else .request;
@@ -3165,4 +3356,62 @@ test "session classifies HEADERS priority self dependency as stream protocol err
     }, &scratch, &sink);
     try std.testing.expectEqual(protocol.ErrorCode.protocol_error, event.fault.stream.code);
     try std.testing.expectEqual(@as(u31, 1), event.fault.stream.stream_id);
+}
+
+test "send preflight diagnostics identify field and stream failures" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var header_storage: [256]u8 = undefined;
+    var session = Session.init(.{ .role = .client, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+
+    const mismatch = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+        .{ .field = .{ .name = ":path", .value = "/" } },
+        .{ .field = .{ .name = "host", .value = "other.example" } },
+    };
+    const field_problem = session.diagnoseSendHeaders(&store, 1, true, &mismatch).?;
+    switch (field_problem) {
+        .field => |problem| {
+            try std.testing.expectEqual(@as(u32, 4), problem.index);
+            try std.testing.expectEqual(fields.Violation.authority_host_mismatch, problem.reason);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const valid = [_]hpack.EncodedField{
+        .{ .field = .{ .name = ":method", .value = "GET" } },
+        .{ .field = .{ .name = ":scheme", .value = "https" } },
+        .{ .field = .{ .name = ":authority", .value = "example.com" } },
+        .{ .field = .{ .name = ":path", .value = "/" } },
+    };
+    try std.testing.expect(session.diagnoseSendHeaders(&store, 1, true, &valid) == null);
+    const response = [_]hpack.EncodedField{.{ .field = .{ .name = ":status", .value = "200" } }};
+    try std.testing.expectEqual(HeaderPreflightViolation.invalid_stream_id, session.diagnoseSendHeaders(&store, 2, true, &response).?);
+}
+
+test "settings and DATA preflight diagnostics preserve compact send errors" {
+    const allocator = std.testing.allocator;
+    var inbound = hpack.Decoder.init(allocator, 4096);
+    defer inbound.deinit();
+    var outbound = hpack.Encoder.init(allocator, 4096);
+    defer outbound.deinit();
+    var header_storage: [256]u8 = undefined;
+    var session = Session.init(.{ .role = .server, .decoder = &inbound, .encoder = &outbound, .header_storage = &header_storage });
+    var store: TestStore = .{};
+
+    const invalid_settings = [_]settings.Setting{.{ .id = .max_frame_size, .value = 1024 }};
+    const settings_problem = session.diagnoseSettings(&invalid_settings).?;
+    try std.testing.expectEqual(@as(u32, 0), settings_problem.index);
+    try std.testing.expectEqual(SettingsPreflightReason.invalid_max_frame_size, settings_problem.reason);
+
+    var tracked = stream_mod.Tracked.init(65_535);
+    tracked.stream.state = .open;
+    _ = store.insert(1, tracked) orelse unreachable;
+    try std.testing.expectEqual(DataPreflightViolation.response_headers_not_sent, session.diagnoseSendData(&store, 1, 1, false).?);
 }

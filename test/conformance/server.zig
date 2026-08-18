@@ -210,13 +210,14 @@ fn handleConnection(io: std.Io, stream: net.Stream) !void {
     defer allocator.free(wire);
 
     var session = h2.Session.init(.{ .role = .server, .local_limits = .{ .max_concurrent_streams = max_concurrent_streams }, .decoder = &decoder, .encoder = &encoder, .header_storage = header_storage });
+    var bootstrap = h2.Bootstrap.init(.server);
     var store: Store = .{};
     var settings_sync: h2.session.SettingsSync = .{};
     const local_settings = [_]h2.settings.Setting{
         .{ .id = .max_concurrent_streams, .value = max_concurrent_streams },
         .{ .id = .enable_connect_protocol, .value = 1 },
     };
-    _ = try session.sendSettings(&settings_sync, out, &local_settings);
+    _ = try bootstrap.start(&session, &settings_sync, out, &local_settings);
     try out.flush();
 
     var staging: [h2.frame.default_max_frame_size + 1]u8 = undefined;

@@ -227,6 +227,7 @@ fn handleEvent(
 fn pump(
     in: *std.Io.Reader,
     out: *std.Io.Writer,
+    bootstrap: *h2.Bootstrap,
     session: *h2.Session,
     store: *Store,
     sync: *h2.session.SettingsSync,
@@ -249,7 +250,8 @@ fn pump(
         const total = 9 + @as(usize, frame_header.length);
         if (total > wire.len) return error.BufferTooSmall;
         if (used.* - consumed < total) break;
-        const result = try session.receiveBytes(
+        const result = try bootstrap.receiveBytes(
+            session,
             store,
             wire[consumed .. consumed + total],
             h2.frame.default_max_frame_size,
@@ -257,7 +259,7 @@ fn pump(
             sink,
         );
         const complete = result orelse unreachable;
-        try handleEvent(session, sync, out, observed, complete.event);
+        if (complete.event) |event| try handleEvent(session, sync, out, observed, event);
         consumed += complete.consumed;
     }
     if (consumed != 0) {
@@ -290,8 +292,6 @@ pub fn main(init: std.process.Init) !void {
     const in = &socket_reader.interface;
     const out = &socket_writer.interface;
 
-    try out.writeAll(h2.preface.bytes);
-
     var decoder = h2.hpack.Decoder.init(allocator, 4096);
     defer decoder.deinit();
     var encoder = h2.hpack.Encoder.init(allocator, 4096);
@@ -299,9 +299,10 @@ pub fn main(init: std.process.Init) !void {
     var header_storage: [64 * 1024]u8 = undefined;
     var scratch: [64 * 1024]u8 = undefined;
     var session = h2.Session.init(.{ .role = .client, .decoder = &decoder, .encoder = &encoder, .header_storage = &header_storage });
+    var bootstrap = h2.Bootstrap.init(.client);
     var store: Store = .{};
     var sync: h2.session.SettingsSync = .{};
-    _ = try session.sendSettings(&sync, out, &.{});
+    _ = try bootstrap.start(&session, &sync, out, &.{});
     try out.flush();
 
     var observed: Observed = .{};
@@ -312,7 +313,7 @@ pub fn main(init: std.process.Init) !void {
     // RFC 8441 requires the client to wait until the server advertises the
     // capability before creating an Extended CONNECT stream.
     while (!session.peerSupportsExtendedConnect()) {
-        try pump(in, out, &session, &store, &sync, &observed, &sink, &scratch, &wire, &used);
+        try pump(in, out, &bootstrap, &session, &store, &sync, &observed, &sink, &scratch, &wire, &used);
     }
 
     var staging: [4096]u8 = undefined;
@@ -322,7 +323,7 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 
     while (!observed.complete()) {
-        try pump(in, out, &session, &store, &sync, &observed, &sink, &scratch, &wire, &used);
+        try pump(in, out, &bootstrap, &session, &store, &sync, &observed, &sink, &scratch, &wire, &used);
     }
 
     if (!std.mem.eql(u8, observed.body1[0..observed.body1_len], "zig-http")) return error.InvalidResponse;
