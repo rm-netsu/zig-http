@@ -26,9 +26,9 @@ program, a custom reactor, or a sharded multithreaded server.
   and synchronous draining through the shared `high_level.DrainAction` without
   owning transport.
 - Optional `http.high_level.http2.Connection` bundles HPACK, bootstrap, bounded
-  stream/header storage, scratch buffers, typed request/response builders, client
-  stream-ID allocation, and synchronous draining while still leaving transport
-  ownership outside.
+  stream/header storage, local SETTINGS policy, explicit control actions, receive-
+  credit composition, typed request/response builders, client stream-ID allocation,
+  and synchronous draining while still leaving transport ownership outside.
 - Caller-owned buffers and HTTP/2 stream storage. The core does not force a
   slab, hash table, allocator, scheduler, queue, or synchronization strategy.
 - Transactional HTTP/2 header delivery and fail-closed message-body semantics,

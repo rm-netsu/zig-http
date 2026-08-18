@@ -4,6 +4,27 @@ The package is pre-1.0 and intentionally removes obsolete compatibility surfaces
 rather than carrying aliases indefinitely. Release notes remain authoritative;
 this document highlights source-level migration patterns.
 
+
+## 0.18.x Unreleased high-level API cleanup
+
+The pre-1.0 high-level APIs intentionally remove ambiguous compatibility forms.
+For HTTP/2, replace `Config.hpack_table_size` / `Config.local_limits` and
+`start(out, settings)` with one `Config.local_settings`; call `start(out)` and
+`receive(input)`. The configured SETTINGS now drive the initial wire frame, HPACK
+decoder policy, stream limits, and receive `SETTINGS_MAX_FRAME_SIZE`. Restrictive
+policy is activated only when the initial SETTINGS ticket is ACKed, so no caller
+has to coordinate the RFC synchronization boundary manually. Mandatory
+SETTINGS/PING/fault responses are exposed as `ReceiveResult.control` and can be
+written with `sendControl`. Header collector exhaustion is now terminal for the
+high-level receive path instead of returning an empty field list with an
+`overflowed` flag.
+
+HTTP/1 high-level Upgrade handling now retains a bounded exact offer per pending
+request. `sendResponse(101, ...)` validates the selected protocol automatically,
+and clients reject unsolicited or unoffered 101 responses. Increase
+`Config.upgrade_offer_bytes` if an application intentionally uses unusually large
+Upgrade lists; no compatibility boolean-only mode is retained.
+
 ## 0.16.x to 0.17.x
 
 ### Route HTTP/1 requests with `effective_authority`

@@ -11,7 +11,7 @@ const Conn = http.high_level.http2.Connection(.{});
 var client = try Conn.initClient(allocator);
 defer client.deinit();
 
-_ = try client.start(out, &.{});
+_ = try client.start(out);
 const sent = try client.sendRequest(
     out,
     http.http2.message.RequestFields.init("GET", "https", "example.com", "/"),
@@ -22,7 +22,16 @@ const sent = try client.sendRequest(
 
 The wrapper bundles HPACK encoder/decoder contexts, `Bootstrap`, `Session`,
 `SettingsSync`, `http2.storage.FixedStreamStore`, a copying transactional
-`FixedFieldCollector`, and bounded scratch/staging buffers. It performs one
+`FixedFieldCollector`, and bounded scratch/staging buffers. `Config.local_settings`
+is the single source of truth for the initial SETTINGS frame and receive-side
+frame/header/stream limits; `start(out)` no longer accepts a second settings list
+and `receive(input)` no longer takes a separately maintained max-frame value.
+Restrictive settings are synchronized correctly: the peer keeps the RFC defaults
+until the initial SETTINGS ticket is ACKed, then stream limits, reductions of the
+HPACK decoder table limit, and `SETTINGS_INITIAL_WINDOW_SIZE` are activated
+atomically for retained streams. Safe receive-side expansions such as a larger
+MAX_FRAME_SIZE can be accepted eagerly. `localSettingsActive()` exposes that
+boundary when application policy needs it. It performs one
 connection-state allocation so its public handle is safely movable despite
 Session holding internal pointers. Sockets, TLS, transport buffers, timers, and
 application scheduling remain caller-owned. `core()`, `store()`, `collector()`,
@@ -35,10 +44,23 @@ allocation size at comptime; tune the bounds or use `Session` directly for very
 high connection counts or custom storage topologies.
 
 `receive()` returns copied header fields alongside HEADERS/PUSH_PROMISE events.
-If the configured collector capacity is insufficient, `overflowed` is reported
-without publishing a partial field list; the HTTP/2 decoder stays synchronized.
-Closed entries are retained until the application explicitly calls
-`reclaimClosed()`, so final stream state remains inspectable.
+Collector exhaustion is fail-closed in the high-level layer: HPACK is fully drained
+for synchronization, then `HeaderCollectionOverflow` is returned and subsequent
+receive calls return `ReceiveFailed`; discard that high-level connection. The
+low-level transactional collector still exposes `overflowed()` for diagnostic or
+proxy integrations that intentionally manage this case themselves. Closed entries
+are retained until the application explicitly calls `reclaimClosed()`, so final
+stream state remains inspectable.
+
+Every receive result also carries a transport-neutral `control` action. Non-ACK
+SETTINGS, non-ACK PING, and protocol faults therefore do not require applications
+to reconstruct the mandatory response. Pass the action to `sendControl(out,
+action)` when the transport is writable. No receive call writes implicitly.
+
+After consuming a DATA event, call `releaseData(data)` when the application has
+released the corresponding capacity. `flushReceiveCredit(out, stream_id)` emits
+connection/stream WINDOW_UPDATE frames when the built-in low-watermark policy is
+ready. Custom runtimes can keep using `Session` with caller-owned `ReceiveCredit`.
 
 Typed `http2.message.RequestFields` keeps ordinary, CONNECT, and Extended
 CONNECT pseudo-field layouts distinct. `ResponseFields` formats numeric status
@@ -54,7 +76,7 @@ application intentionally treats the advisory setting as soft policy. Low-level
 `sendHeadersWithinPeerLimit()` provide explicit policy composition for custom
 runtimes. `http2.message.fieldSectionSize()` exposes the same RFC accounting.
 
-`Connection.drain(input, max_frame_size, handler)` is the convenience counterpart
+`Connection.drain(input, handler)` is the convenience counterpart
 to one-event `receive()`. It synchronously invokes `handler.onEvent(result)` for
 every immediately parseable event and stops when the handler returns the shared
 `http.high_level.DrainAction.stop` or more transport bytes are required. No event batch is retained; copied field

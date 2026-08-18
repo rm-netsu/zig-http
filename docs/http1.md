@@ -41,12 +41,17 @@ For Upgrade, `http1.semantics.UpgradeOffer.init(head)` validates the request's
 `Connection: Upgrade` + Upgrade list once. `offers(protocol)` performs the RFC
 case-insensitive protocol-name match, and `validateSelection(response_head)`
 ensures a structurally valid 101 selected only protocols actually offered by
-the client. The helper borrows the parsed request head and performs no copying. The
-high-level server retains only whether a request combined a content-bearing
-100-continue expectation with an Upgrade offer; `sendResponse(101, ...)` then
-returns `ContinueRequiredBeforeUpgrade` until a successful 100 response has
-been emitted for that request. The selected protocol list remains application
-owned and can be checked with `UpgradeOffer.validateSelection()`.
+the client. The low-level helper borrows the parsed request head and performs no
+copying.
+
+The high-level connection is stricter: it retains a bounded copy of each queued
+Upgrade offer (`Config.upgrade_offer_bytes`) and validates the complete 101
+selection automatically on both roles. A server cannot select a protocol the
+client did not offer, a client rejects unsolicited/unoffered 101 responses, and
+`Expect: 100-continue` still requires the 100 response before switching. If a
+server receives an offer larger than its configured retained capacity it may
+still process the request normally, but attempting 101 fails closed with
+`UpgradeOfferTooLarge`. Client sends reject an oversized offer before wire output.
 
 Both high-level roles expose `drain(input, handler)`. It repeatedly drives the
 one-event decoder and invokes `handler.onEvent(event)` synchronously; returning

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make high-level HTTP/2 local SETTINGS authoritative: `Config.local_settings` now drives the initial SETTINGS frame, inbound frame/header/stream limits, and HPACK decoder policy; restrictive values activate only after the matching SETTINGS ACK, including existing-stream initial-window adjustment, while safe receive expansions can be accepted eagerly. Remove the divergent `start(settings)` and `receive(max_frame_size)` arguments.
+- Add transport-neutral high-level HTTP/2 `ControlAction` responses for SETTINGS/PING/protocol faults plus `releaseData` / `flushReceiveCredit` flow-control composition; receive never writes implicitly.
+- Make high-level HTTP/2 field collection fail closed on bounded collector overflow after fully draining HPACK, rather than publishing empty headers with an easy-to-ignore overflow flag.
+- Make high-level HTTP/1 Upgrade selection fail closed in both directions by retaining bounded exact offers across pipelining, rejecting unsolicited client-side 101 responses, and preventing servers from selecting protocols that were not offered.
 - Add strict opt-in HTTP/2 peer field-section limit preflight using RFC `SETTINGS_MAX_HEADER_LIST_SIZE` accounting; the high-level HTTP/2 wrapper honors the advertised limit by default before HPACK/wire mutation while low-level `Session.sendHeaders()` remains permissive because the setting is advisory.
 - Add HTTP/1 `Expectation`/`ContinueGate` helpers and canonical `expectContinue()` construction so 100-continue coordination no longer requires application-side field scanning or timer ownership in core.
 - Add borrowed `UpgradeOffer` validation that checks Connection/Upgrade structure, case-insensitive protocol-name matching, and that a 101 response selects only client-offered protocols.
