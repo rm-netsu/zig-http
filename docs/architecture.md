@@ -154,11 +154,13 @@ layout-sensitive benchmarks. See [`../BENCHMARKS.md`](../BENCHMARKS.md).
 
 ## Integration layers
 
-`http.high_level` is the optional in-package convenience layer. Its HTTP/2
-connection wrapper owns routine HTTP-specific composition (HPACK contexts,
-Bootstrap/Session, bounded default stream/header storage, scratch buffers, and
-client stream-ID allocation) while still consuming and producing caller-owned
-byte streams. It is implemented entirely on top of public core APIs.
+`http.high_level` is the optional in-package convenience layer. Its HTTP/1
+connection wrapper owns bounded parser/writer scratch storage plus the ordered
+request semantics queue needed to correlate pipelined responses. Its HTTP/2
+wrapper owns routine HPACK/Bootstrap/Session, bounded stream/header storage,
+scratch buffers, and client stream-ID allocation. Both consume and produce
+caller-owned byte streams and are implemented entirely on top of public core
+APIs.
 
 A concrete socket/TLS/event-loop adapter crosses the protocol boundary and
 belongs in an application or separate adapter package. The core never requires

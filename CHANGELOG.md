@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add optional `http.high_level.http1.Connection(config)` composition with bounded parser/writer storage, automatic pipelined HEAD/CONNECT/other response-context tracking, server response-order enforcement/backpressure, typed Host-aware requests, and streaming send/receive while preserving caller-owned transport.
+- Add allocation-free `http1.message.RequestFields` / `ResponseFields` helpers for origin/absolute/asterisk/CONNECT composition and duplicate-Host prevention before wire mutation.
+- Add synchronous high-level `drain` helpers for HTTP/1 and HTTP/2 so event loops can consume immediately parseable events without hand-writing receive loops or buffering borrowed event batches.
 - Add optional `http.high_level.http2.Connection(config)` composition with owned HPACK contexts, Bootstrap/Session, bounded stream/header storage, scratch/staging buffers, SETTINGS synchronization, copied receive fields, client stream-ID allocation, and typed request/response sends while keeping transport ownership outside the package.
 - Add public bounded `http2.storage.FixedStreamStore` with explicit closed-record reclamation and transactional copying `FixedFieldCollector`; migrate examples away from a copied support-only store.
 - Add allocation-free `http2.message.RequestFields` / `ResponseFields` builders that order pseudo-fields by construction, distinguish CONNECT variants, preserve regular-field HPACK indexing policy, and validate complete field sections before Session/wire mutation.

@@ -2,13 +2,43 @@
 
 ## Recommended composed APIs
 
-Use `http.http1.ConnectionDecoder` for receive-side message coordination and
-`http.http1.MessageWriter` for send-side message coordination. They own HTTP
-state only; the caller owns the transport and buffers.
+For the shortest bounded-memory integration use
+`http.high_level.http1.Connection(config)`. It owns the HTTP-specific parser,
+writer, scratch storage, outbound Header descriptor array, and the bounded
+response-context queue required by pipelining. It still owns no socket, TLS
+session, timer, or event loop.
+
+The queue retains only `HEAD`, `CONNECT`, or `other` semantics rather than
+borrowed method strings. This is sufficient for HTTP response-body framing and
+allows arbitrary extension methods without copied method storage. Clients queue
+that semantic context when a request head is successfully written; responses
+are bound automatically in request order. Servers queue it when request heads
+are parsed and `sendResponse()` always uses the oldest outstanding request.
+
+When the configured queue is full, client `sendRequest()` returns
+`RequestQueueFull` before writing bytes. A server returns the same local
+backpressure error before consuming a new request head; send an outstanding
+final response (or choose a larger bound) and retry with the same input.
+
+Typed `http1.message.RequestFields` constructors cover origin-form, absolute-
+form, OPTIONS `*`, and CONNECT. They compose Host by construction and reject a
+regular-field list that tries to duplicate the generated Host. `ResponseFields`
+packages the response start line while leaving body framing fields explicit for
+streaming applications.
+
+Both high-level roles expose `drain(input, handler)`. It repeatedly drives the
+one-event decoder and invokes `handler.onEvent(event)` synchronously; returning
+`http.high_level.DrainAction.stop` leaves the remaining input untouched. This preserves the ordinary
+borrowed-slice lifetime and avoids buffering an event batch.
+
+Use `http.http1.ConnectionDecoder` and `http.http1.MessageWriter` directly when
+your runtime already owns the request/response queue or wants independent
+receive/send composition.
 
 The compile-tested starting points are:
 
 ```text
+examples/http1_high_level.zig
 examples/http1_client_core.zig
 examples/http1_server_core.zig
 examples/http1_trailers.zig

@@ -21,9 +21,14 @@ program, a custom reactor, or a sharded multithreaded server.
   Extended CONNECT, RFC 9218 priority, and extension composition.
 - Optional composed APIs (`http1.ConnectionDecoder`, `http1.MessageWriter`,
   `http2.Bootstrap`, `http2.Session`) over the same independently usable low-level primitives.
+- Optional `http.high_level.http1.Connection` bundles HTTP/1 parsing/writing, a
+  bounded pipelining response-context queue, typed Host-aware request builders,
+  and synchronous draining through the shared `high_level.DrainAction` without
+  owning transport.
 - Optional `http.high_level.http2.Connection` bundles HPACK, bootstrap, bounded
-  stream/header storage, scratch buffers, typed request/response builders, and
-  client stream-ID allocation while still leaving transport ownership outside.
+  stream/header storage, scratch buffers, typed request/response builders, client
+  stream-ID allocation, and synchronous draining while still leaving transport
+  ownership outside.
 - Caller-owned buffers and HTTP/2 stream storage. The core does not force a
   slab, hash table, allocator, scheduler, queue, or synchronization strategy.
 - Transactional HTTP/2 header delivery and fail-closed message-body semantics,
@@ -38,13 +43,18 @@ Use the highest layer that matches the HTTP state you want the library to own.
 
 ### HTTP/1.1
 
-For normal message-oriented use:
+For the shortest bounded-memory integration, use
+`http.high_level.http1.Connection(config)`. It composes receive/send state,
+automatically retains the HEAD/CONNECT/other response context required by
+pipelining, and offers typed Host-aware request construction while leaving all
+transport I/O caller-owned.
+
+For direct message-state control use:
 
 - receive: `http.http1.ConnectionDecoder`
 - send: `http.http1.MessageWriter`
 
-They coordinate HTTP state while leaving transport buffers and I/O to the
-caller. If your runtime already owns more of the message state machine, compose
+If your runtime already owns more of the message state machine, compose
 `http1.head`, `http1.body`, `http1.semantics`, and `http1.write` directly.
 
 See [the HTTP/1 composition guide](docs/http1.md).
@@ -79,6 +89,7 @@ sets 0.16.0 as the minimum Zig version.
 
 The best executable starting points are compile-tested examples:
 
+- [`examples/http1_high_level.zig`](examples/http1_high_level.zig)
 - [`examples/http1_client_core.zig`](examples/http1_client_core.zig)
 - [`examples/http1_server_core.zig`](examples/http1_server_core.zig)
 - [`examples/http2_high_level.zig`](examples/http2_high_level.zig)
@@ -115,7 +126,7 @@ The root module intentionally stays small:
 
 - `http.common` — shared field/value primitives.
 - `http.uri` — allocation-free URI/request-target validation helpers.
-- `http.http1` — HTTP/1.1 parser, body, semantics, connection, and write APIs.
+- `http.http1` — HTTP/1.1 parser, body, semantics, typed message helpers, connection, and write APIs.
 - `http.http2` — HTTP/2 framing, state, fields, flow control, streams, session,
   bounded default storage, typed message builders, dispatch, send, priority,
   and extension APIs.

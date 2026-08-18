@@ -4,6 +4,7 @@ These examples cover both the optional convenience layer and direct protocol-cor
 composition. None of them makes sockets, TLS, DNS, or an event loop part of the
 HTTP package.
 
+- `http1_high_level.zig` — shortest bounded-memory HTTP/1 client/server round-trip with typed Host-aware request construction, automatic response-context coordination, and synchronous event draining.
 - `http1_client_core.zig` — serialize a request with `MessageWriter`, then parse
   a response with `ConnectionDecoder` and explicit outstanding-method context.
 - `http1_server_core.zig` — parse a request and serialize a framed response.

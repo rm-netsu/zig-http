@@ -45,6 +45,14 @@ CONNECT pseudo-field layouts distinct. `ResponseFields` formats numeric status
 codes. Both build into caller/wrapper-owned `EncodedField` storage and run the
 production field validator before Session/wire mutation.
 
+`Connection.drain(input, max_frame_size, handler)` is the convenience counterpart
+to one-event `receive()`. It synchronously invokes `handler.onEvent(result)` for
+every immediately parseable event and stops when the handler returns the shared
+`http.high_level.DrainAction.stop` or more transport bytes are required. No event batch is retained; copied field
+sections follow the same collector lifetime as `receive()`. Core
+`Session.receiveBytes()` remains intentionally one-event-at-a-time for runtimes
+that want precise backpressure.
+
 ## Recommended composed API
 
 Use `http.http2.Bootstrap` plus `http.http2.Session` when one ordered connection owner should compose connection establishment and frame
