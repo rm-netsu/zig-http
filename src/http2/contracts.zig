@@ -172,9 +172,9 @@ pub fn assertFieldSink(comptime T: type) void {
     if (!sinkBegin(T))
         @compileError("zig-http HTTP/2 field sink begin signature must be begin(self, stream_id: u31, kind: http2.fields.Kind) void");
     if (!hasDecl(T, "field"))
-        @compileError("zig-http HTTP/2 field sink must provide field(self, stream_id: u31, kind: http2.fields.Kind, header: http.Header) void");
+        @compileError("zig-http HTTP/2 field sink must provide field(self, stream_id: u31, kind: http2.fields.Kind, header: http.common.Header) void");
     if (!sinkField(T))
-        @compileError("zig-http HTTP/2 field sink field signature must be field(self, stream_id: u31, kind: http2.fields.Kind, header: http.Header) void");
+        @compileError("zig-http HTTP/2 field sink field signature must be field(self, stream_id: u31, kind: http2.fields.Kind, header: http.common.Header) void");
     if (!hasDecl(T, "commit"))
         @compileError("zig-http HTTP/2 field sink must provide commit(self, stream_id: u31, kind: http2.fields.Kind) void");
     if (!sinkCommit(T))
