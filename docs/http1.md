@@ -20,11 +20,20 @@ When the configured queue is full, client `sendRequest()` returns
 backpressure error before consuming a new request head; send an outstanding
 final response (or choose a larger bound) and retry with the same input.
 
+`Connection(config).Storage` exposes the complete fixed high-level state. Use
+`initClientInPlace(&storage)` / `initServerInPlace(&storage)` when the application
+wants fully allocation-free HTTP/1 composition. The storage address must remain
+stable until `deinit`; the ordinary allocator constructors remain convenient when
+a movable handle backed by one allocation is preferable.
+
 Typed `http1.message.RequestFields` constructors cover origin-form, absolute-
 form, OPTIONS `*`, and CONNECT. They compose Host by construction and reject a
 regular-field list that tries to duplicate the generated Host. `ResponseFields`
 packages the response start line while leaving body framing fields explicit for
-streaming applications. `http1.message.expectContinue()` and `upgrade(...)`
+streaming applications. `http1.message.ContentLength.init(n)` owns canonical
+decimal bytes for a `content-length` field, and `http1.message.chunked()` emits
+the canonical transfer-coding field; `MessageWriter` still validates that the
+chosen framing is legal. `http1.message.expectContinue()` and `upgrade(...)`
 provide canonical field construction for the two handshakes without hiding their
 application policy.
 

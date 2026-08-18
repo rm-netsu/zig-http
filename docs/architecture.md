@@ -154,6 +154,11 @@ layout-sensitive benchmarks. See [`../BENCHMARKS.md`](../BENCHMARKS.md).
 
 ## Integration layers
 
+Both high-level connection families can either allocate their fixed connection
+state once or bind to caller-owned stable `Storage`. The in-place HTTP/1 path is
+fully allocation-free; HTTP/2 still uses the configured allocator for HPACK
+dynamic-table payloads while avoiding a large wrapper-state allocation.
+
 `http.high_level` is the optional in-package convenience layer. Its HTTP/1
 connection wrapper owns bounded parser/writer scratch storage plus the ordered
 request semantics queue needed to correlate pipelined responses. Its HTTP/2

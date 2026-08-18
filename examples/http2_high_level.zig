@@ -14,9 +14,11 @@ const Connection = http.high_level.http2.Connection(.{
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
-    var client = try Connection.initClient(allocator);
+    var client_storage: Connection.Storage = undefined;
+    var client = Connection.initClientInPlace(&client_storage, allocator);
     defer client.deinit();
-    var server = try Connection.initServer(allocator);
+    var server_storage: Connection.Storage = undefined;
+    var server = Connection.initServerInPlace(&server_storage, allocator);
     defer server.deinit();
 
     var c2s_storage: [8192]u8 = undefined;
@@ -46,11 +48,12 @@ pub fn main() !void {
                 std.debug.assert(copied.headers.len == 5);
 
                 var response = try h2.message.ResponseFields.init(200);
+                var response_length = h2.message.ContentLength.init(2);
                 _ = try server.sendResponse(
                     &s2c,
                     section.stream_id,
                     &response,
-                    &.{h2.message.header("content-length", "2")},
+                    &.{response_length.field()},
                     false,
                 );
                 _ = try server.sendData(&s2c, section.stream_id, "ok", true);

@@ -83,9 +83,30 @@ See [the HTTP/2 composition guide](docs/http2.md) and
 
 ## Getting started
 
-Add the package to your Zig build and import the exported `http` module. The
-package currently targets and is tested with Zig 0.16.0; the package manifest
-sets 0.16.0 as the minimum Zig version.
+Add the package with Zig's package manager:
+
+```sh
+zig fetch --save git+https://github.com/rm-netsu/zig-http.git#v0.19.0
+```
+
+Then import the module in `build.zig`:
+
+```zig
+const http_dep = b.dependency("http", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("http", http_dep.module("http"));
+```
+
+The package targets and is tested with Zig 0.16.0; the package manifest sets
+0.16.0 as the minimum Zig version.
+
+Both high-level connection types expose caller-owned `Storage` plus `init*InPlace`
+constructors. HTTP/1 can therefore run fully allocation-free at the composed
+layer; HTTP/2 can avoid the large fixed-state allocation while continuing to use
+the caller-selected allocator only for HPACK dynamic tables. In-place storage
+must remain at a stable address until `deinit`.
 
 The best executable starting points are compile-tested examples:
 
@@ -162,8 +183,7 @@ H2SPEC_BIN=/path/to/h2spec zig build release-checks
 The release gate runs unit/property tests, deterministic fuzz replay,
 compile-tested examples, conformance fixtures, generated API docs, external
 HTTP/1 and HTTP/2 interoperability, RFC smoke tests, and strict upstream
-h2spec. The 0.18.0 release fixture passes h2spec v2.6.0 in strict mode with
-147/147 tests.
+h2spec. The release fixture passes h2spec v2.6.0 in strict mode with 147/147 tests.
 
 Useful focused targets include:
 

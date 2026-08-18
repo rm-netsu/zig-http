@@ -31,11 +31,14 @@ until the initial SETTINGS ticket is ACKed, then stream limits, reductions of th
 HPACK decoder table limit, and `SETTINGS_INITIAL_WINDOW_SIZE` are activated
 atomically for retained streams. Safe receive-side expansions such as a larger
 MAX_FRAME_SIZE can be accepted eagerly. `localSettingsActive()` exposes that
-boundary when application policy needs it. It performs one
-connection-state allocation so its public handle is safely movable despite
-Session holding internal pointers. Sockets, TLS, transport buffers, timers, and
-application scheduling remain caller-owned. `core()`, `store()`, `collector()`,
-and `bootstrap()` expose the underlying components when an integration needs to
+boundary when application policy needs it. The ordinary constructors perform
+one connection-state allocation so the public handle is safely movable despite
+Session holding internal pointers. `Connection(config).Storage` plus
+`initClientInPlace` / `initServerInPlace` instead places that fixed state in
+caller-owned stable memory; the supplied allocator is then used only by HPACK
+dynamic tables. Sockets, TLS, transport buffers, timers, and application
+scheduling remain caller-owned. `core()`, `store()`, `collector()`, and
+`bootstrap()` expose the underlying components when an integration needs to
 drop down a level.
 
 The convenience defaults favor a practical standalone integration rather than
@@ -64,8 +67,17 @@ ready. Custom runtimes can keep using `Session` with caller-owned `ReceiveCredit
 
 Typed `http2.message.RequestFields` keeps ordinary, CONNECT, and Extended
 CONNECT pseudo-field layouts distinct. `ResponseFields` formats numeric status
-codes. Both build into caller/wrapper-owned `EncodedField` storage and run the
-production field validator before Session/wire mutation.
+codes. `http2.message.ContentLength.init(n)` owns the decimal bytes required by
+a canonical Content-Length field. Both builders build into caller/wrapper-owned
+`EncodedField` storage and run the production field validator before Session/wire
+mutation.
+
+The high-level wrapper also forwards common lifecycle operations that otherwise
+force an unnecessary drop to `Session`: `sendTrailers(...)`, `resetStream(...)`,
+`sendGoAway(...)`, and the two-phase `announceGracefulGoAway(...)` /
+`finishGracefulGoAway(...)`. Graceful shutdown still owns no timer; the
+application chooses the grace interval and final application-processed stream
+cutoff.
 
 The high-level wrapper also honors a peer-advertised
 `SETTINGS_MAX_HEADER_LIST_SIZE` before HPACK or wire mutation. This is enabled by

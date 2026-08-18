@@ -9,9 +9,11 @@ pub fn main() !void {
         .outbound_fields = 8,
     });
 
-    var client = try Conn.initClient(std.heap.page_allocator);
+    var client_storage: Conn.Storage = undefined;
+    var client = Conn.initClientInPlace(&client_storage);
     defer client.deinit();
-    var server = try Conn.initServer(std.heap.page_allocator);
+    var server_storage: Conn.Storage = undefined;
+    var server = Conn.initServerInPlace(&server_storage);
     defer server.deinit();
 
     var request_storage: [1024]u8 = undefined;
@@ -30,10 +32,11 @@ pub fn main() !void {
 
     var response_storage: [1024]u8 = undefined;
     var response_wire = std.Io.Writer.fixed(&response_storage);
+    var response_length = http.http1.message.ContentLength.init(2);
     _ = try server.sendResponse(
         &response_wire,
         http.http1.message.ResponseFields.init(200, "OK"),
-        &.{http.http1.message.header("content-length", "2")},
+        &.{response_length.header()},
     );
     _ = try server.writeData(&response_wire, "ok");
 

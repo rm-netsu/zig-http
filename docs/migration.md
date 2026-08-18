@@ -5,7 +5,7 @@ rather than carrying aliases indefinitely. Release notes remain authoritative;
 this document highlights source-level migration patterns.
 
 
-## 0.18.x Unreleased high-level API cleanup
+## 0.18.x to 0.19.x
 
 The pre-1.0 high-level APIs intentionally remove ambiguous compatibility forms.
 For HTTP/2, replace `Config.hpack_table_size` / `Config.local_limits` and
@@ -24,6 +24,13 @@ request. `sendResponse(101, ...)` validates the selected protocol automatically,
 and clients reject unsolicited or unoffered 101 responses. Increase
 `Config.upgrade_offer_bytes` if an application intentionally uses unusually large
 Upgrade lists; no compatibility boolean-only mode is retained.
+
+High-level connections now expose `Storage` and `init*InPlace` constructors.
+Existing allocator constructors remain valid, but applications that want stable
+caller-owned memory can remove the wrapper-state allocation directly. HTTP/2
+callers should keep the in-place storage address stable and still pass an
+allocator for HPACK dynamic-table memory. Common lifecycle calls such as HTTP/2
+trailers and graceful GOAWAY no longer require dropping to `core()`.
 
 ## 0.16.x to 0.17.x
 
