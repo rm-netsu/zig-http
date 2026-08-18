@@ -1,9 +1,8 @@
 const std = @import("std");
 const http = @import("http");
-const fixed_store = @import("support/fixed_stream_store.zig");
 
 const h2 = http.http2;
-const Store = fixed_store.FixedStreamStore(4);
+const Store = h2.storage.FixedStreamStore(4);
 
 const ApplicationTrailers = struct {
     pub fn allows(_: @This(), name: []const u8) bool {

@@ -18,6 +18,8 @@ pub const send = @import("http2/send.zig");
 pub const scheduler = @import("http2/scheduler.zig");
 pub const dispatch = @import("http2/dispatch.zig");
 pub const contracts = @import("http2/contracts.zig");
+pub const storage = @import("http2/storage.zig");
+pub const message = @import("http2/message.zig");
 pub const hpack = @import("hpack");
 
 /// Recommended composed HTTP/2 connection engine. Lower-level protocol pieces
