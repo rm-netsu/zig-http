@@ -77,9 +77,10 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Generate and install the HTTP API reference");
     docs_step.dependOn(&install_api_docs.step);
 
-    const examples_step = b.step("examples", "Build and run protocol-core usage examples");
+    const examples_step = b.step("examples", "Build and run transport-neutral HTTP usage examples");
     const example_sources = [_][]const u8{
         "http1_client_core",
+        "http1_high_level",
         "http1_server_core",
         "http1_trailers",
         "http2_client_core",

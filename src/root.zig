@@ -20,6 +20,7 @@ test {
     _ = http1.connection.Decoder;
     _ = http1.write.requestHead;
     _ = http1.MessageWriter;
+    _ = http1.message.RequestFields;
 
     _ = http2.frame.FrameDecoder;
     _ = http2.settings.Settings;
@@ -59,5 +60,7 @@ test {
     _ = http2.message.RequestFields;
     _ = http2.message.ResponseFields;
     _ = http2.send.HeaderFramer;
+    _ = high_level.DrainAction;
+    _ = high_level.http1.Connection;
     _ = high_level.http2.Connection;
 }
