@@ -8,131 +8,159 @@ synchronous application therefore has two explicit layers:
 2. `http.high_level.http1.Connection` or `http.high_level.http2.Connection`
    consumes transport bytes and emits protocol bytes/events.
 
-The runnable examples deliberately keep that seam visible instead of hiding it
-behind a package-specific socket adapter:
+The runnable examples keep that seam visible and are split into independent
+programs:
 
-- [`../examples/http1_tcp_client_server.zig`](../examples/http1_tcp_client_server.zig)
-- [`../examples/http2_tcp_client_server.zig`](../examples/http2_tcp_client_server.zig)
+- HTTP/1.1 server: [`../examples/http1_tcp_server.zig`](../examples/http1_tcp_server.zig)
+- HTTP/1.1 client: [`../examples/http1_tcp_client.zig`](../examples/http1_tcp_client.zig)
+- HTTP/2 prior-knowledge server: [`../examples/http2_tcp_server.zig`](../examples/http2_tcp_server.zig)
+- HTTP/2 prior-knowledge client: [`../examples/http2_tcp_client.zig`](../examples/http2_tcp_client.zig)
 
-Both bind an ephemeral loopback TCP port, start one server thread, run one
-client against it, verify the exchange, and exit. This makes them safe to run
-inside `zig build check` while leaving the server/client functions directly
-reusable in separate processes.
+The HTTP/1 examples use `127.0.0.1:18080`; the HTTP/2 examples use
+`127.0.0.1:18081`.
 
-Run them individually with:
+## Running HTTP/1.1
+
+Start the server in one terminal:
 
 ```sh
-zig build example-http1-tcp
-zig build example-http2-tcp
+zig build example-http1-server
 ```
 
-## HTTP/1.1 shape
+Then run the client in another:
 
-The HTTP/1 example uses caller-owned high-level storage and a normal buffered
-TCP reader/writer:
-
-```zig
-const Conn = http.high_level.http1.Connection(.{});
-var storage: Conn.Storage = undefined;
-var conn = Conn.initServerInPlace(&storage);
-
-var socket_reader = stream.reader(io, &read_storage);
-var socket_writer = stream.writer(io, &write_storage);
-const in = &socket_reader.interface;
-const out = &socket_writer.interface;
+```sh
+zig build example-http1-client
 ```
 
-The transport loop appends received bytes to a caller-owned wire buffer and
-repeatedly calls `conn.receive()` until no complete event remains. Consumed
-bytes are shifted out; partial message bytes stay in the wire buffer for the
-next socket read.
+The server remains in its accept loop. The client opens one connection,
+pipelines `GET /hello` and `POST /echo`, verifies both response bodies, and
+exits.
 
-The example exercises two pipelined requests:
-
-- `GET /hello` with no request body;
-- `POST /echo` with typed `Content-Length` and a streamed body.
-
-The client emits both requests before reading either response. The high-level
-connection retains only the response-framing semantics needed to correlate the
-ordered responses. The server sends responses through `sendResponse()` and
-`writeData()`; no whole-message buffering is required by the library.
-
-For a real service, keep the accept loop outside the per-connection function:
+The server allocates one independent high-level state object per accepted
+connection:
 
 ```zig
-while (true) {
-    const stream = try listener.accept(io);
-    // Dispatch `stream` to the runtime/thread/task model chosen by the app.
-    // Each connection gets its own Conn.Storage and transport buffers.
-}
+var connection_storage: Conn.Storage = undefined;
+var server = Conn.initServerInPlace(&connection_storage);
+defer server.deinit();
 ```
 
-Use `finishReceive()` when the transport reaches EOF so close-delimited HTTP/1
-messages can complete correctly. `mustClose()` / `protocolSwitched()` tell the
-runtime when ordinary HTTP reuse is no longer valid.
+Each socket read is appended to a caller-owned wire buffer. Complete events are
+consumed through `server.receive()`, while an incomplete head/body fragment is
+left in the buffer for the next transport read. Response bodies are streamed
+with `writeData()`; `zig-http` does not require whole-message buffering.
 
-## HTTP/2 prior-knowledge shape
-
-The HTTP/2 runnable example uses cleartext prior-knowledge HTTP/2. TLS/ALPN is
-outside `zig-http`; after ALPN selects `h2`, the same connection loop starts at
-`Connection.start()`.
+The client deliberately sends both requests before it starts reading. The
+high-level HTTP/1 connection retains only the bounded response-framing context
+needed to correlate pipelined responses:
 
 ```zig
-const Conn = http.high_level.http2.Connection(.{});
-var storage: Conn.Storage = undefined;
-var conn = Conn.initServerInPlace(&storage, allocator);
+_ = try client.sendRequest(
+    out,
+    h1.message.RequestFields.origin("GET", "/hello", server_authority),
+    &.{},
+);
 
-_ = try conn.start(out); // server SETTINGS, or client magic + SETTINGS
+var length = h1.message.ContentLength.init(5);
+_ = try client.sendRequest(
+    out,
+    h1.message.RequestFields.origin("POST", "/echo", server_authority),
+    &.{ length.header(), h1.message.header("connection", "close") },
+);
+_ = try client.writeData(out, "hello");
+```
+
+Call `finishReceive()` when the transport reaches EOF so close-delimited HTTP/1
+messages can complete correctly. `mustClose()` and `protocolSwitched()` tell
+the transport owner when normal HTTP connection reuse is no longer valid.
+
+## Running HTTP/2 prior knowledge
+
+Start the cleartext HTTP/2 server:
+
+```sh
+zig build example-http2-server
+```
+
+Run the separate client:
+
+```sh
+zig build example-http2-client
+```
+
+The client sends two concurrent streams (`GET /hello` and `POST /echo`). The
+server responds on both streams, returns consumed DATA flow-control credit, and
+finishes that finite connection with GOAWAY before accepting the next TCP
+connection.
+
+Both peers begin HTTP/2 using the composed bootstrap:
+
+```zig
+var connection_storage: Conn.Storage = undefined;
+var conn = Conn.initServerInPlace(&connection_storage, allocator);
+defer conn.deinit();
+
+_ = try conn.start(out);
 try out.flush();
 ```
 
-Each transport read is fed to `conn.receive()`. A returned result has three
-independent pieces:
+For a client, the same `start()` writes client magic plus initial SETTINGS. For
+a server, it writes initial SETTINGS and `receive()` incrementally validates the
+client preface.
 
-- `event` — application-visible HTTP/2 work such as HEADERS or DATA;
-- `fields` — copied decoded fields when the event commits a field section;
-- `control` — an explicit protocol response such as SETTINGS ACK, PING ACK,
-  RST_STREAM, or GOAWAY.
-
-The runtime writes control responses explicitly:
+Each receive result separates application work from required protocol output:
 
 ```zig
 const result = (try conn.receive(input)) orelse break;
 try conn.sendControl(out, result.control);
+
+if (result.event) |event| {
+    // Handle committed HEADERS, DATA, GOAWAY, and so on.
+}
 ```
 
-The example multiplexes a bodyless `GET /hello` and a streamed `POST /echo` on
-separate streams. After DATA has been consumed by the application, receive
-window capacity is returned explicitly:
+After the application is finished with DATA bytes, return receive credit
+explicitly:
 
 ```zig
 conn.releaseData(data);
 _ = try conn.flushReceiveCredit(out, data.stream_id);
 ```
 
-This separation is intentional: application code decides when DATA storage is
-actually reusable, so flow-control credit cannot accidentally outrun body
-processing.
+This prevents flow-control credit from getting ahead of actual body processing.
 
-The finite example sends a clean `GOAWAY` after both responses. A long-lived
-server would instead keep accepting streams, and during shutdown can use the
-high-level two-phase `announceGracefulGoAway()` / `finishGracefulGoAway()` API.
+The finite server drains already-sent peer control bytes after its final GOAWAY
+before closing TCP. That avoids turning an otherwise clean close into a reset
+when SETTINGS ACK or WINDOW_UPDATE bytes are still unread in the kernel receive
+queue.
 
-## Splitting the loopback example into real programs
+## Build/check behavior
 
-The example files contain independent `serveOne()` and `runClient()` functions.
-To turn them into standalone applications:
+The four standalone TCP programs are compiled by:
 
-- server: replace the loopback setup in `main()` with a fixed/listener address
-  and call `serveOne()` from your worker model for every accepted stream;
-- client: resolve/connect to the target address and call the same client loop;
-- add deadlines/cancellation in the transport/runtime layer;
-- for HTTPS, wrap the socket in TLS first and feed only decrypted HTTP bytes to
-  the HTTP connection object;
-- for HTTP/2 over TLS, call `start()` only after ALPN selected `h2`;
-- for connection pooling, keep one high-level connection object per live
-  transport and let the pool own transport lifetime/reuse policy.
+```sh
+zig build examples
+zig build check
+```
 
-The examples intentionally do not add routing, DNS, TLS, retries, cookies,
-redirects, compression, or pooling because those responsibilities are outside
-the protocol engine.
+They are not automatically executed by those aggregate targets because the two
+servers intentionally remain in accept loops. Run the protocol-specific
+`example-*-server` and `example-*-client` targets explicitly when exercising the
+network examples.
+
+## Adapting to a real application
+
+The examples intentionally keep transport responsibilities outside `zig-http`:
+
+- dispatch each accepted stream to your chosen thread/task/event-loop model;
+- assign one high-level connection state object to each live transport;
+- add deadlines and cancellation in the runtime layer;
+- for HTTPS, terminate TLS outside the HTTP state machine and feed decrypted
+  bytes to the HTTP connection;
+- for HTTP/2 over TLS, call `start()` after ALPN selects `h2`;
+- keep DNS, connection pooling, retries, redirects, cookies, content decoding,
+  routing, and WebSocket implementations in their own layers.
+
+The protocol engine remains usable at lower levels when an application needs
+custom storage, scheduling, or transport integration.

@@ -1,9 +1,10 @@
 # Examples
 
-These examples cover the optional convenience layer, direct protocol-core composition, and two runnable loopback TCP integrations. The TCP examples keep socket ownership in application code; they do not make transport part of the HTTP package.
+These examples cover the optional convenience layer, direct protocol-core composition, and standalone TCP client/server integrations. The TCP examples keep socket ownership in application code; they do not make transport part of the HTTP package.
 
 - `http1_high_level.zig` — shortest in-memory bounded HTTP/1 client/server round-trip with typed Host-aware request construction, automatic response-context coordination, and synchronous event draining.
-- `http1_tcp_client_server.zig` — runnable loopback TCP HTTP/1.1 client/server with pipelined GET+POST, streamed request/response bodies, keep-alive correlation, and clean close.
+- `http1_tcp_server.zig` — standalone TCP HTTP/1.1 server with a persistent accept loop, pipelined request handling, streaming bodies, and bounded in-place connection state.
+- `http1_tcp_client.zig` — standalone TCP HTTP/1.1 client that pipelines GET+POST, streams the POST body, and validates both responses.
 - `http1_expect_upgrade.zig` — allocation-free Expect: 100-continue coordination and validation of an HTTP/1.1 Upgrade selection against the original offer.
 - `http1_client_core.zig` — serialize a request with `MessageWriter`, then parse
   a response with `ConnectionDecoder` and explicit outstanding-method context.
@@ -13,7 +14,8 @@ These examples cover the optional convenience layer, direct protocol-core compos
 - `http2_high_level.zig` — shortest in-memory bounded client/server round-trip using
   `high_level.http2.Connection`, typed message builders, copied header fields,
   and automatic client stream-ID allocation.
-- `http2_tcp_client_server.zig` — runnable loopback cleartext prior-knowledge HTTP/2 client/server with SETTINGS bootstrap, multiplexed GET+POST streams, explicit control responses, receive-credit replenishment, and GOAWAY.
+- `http2_tcp_server.zig` — standalone cleartext prior-knowledge HTTP/2 server with SETTINGS bootstrap, multiplexed streams, explicit control responses, receive-credit replenishment, and GOAWAY.
+- `http2_tcp_client.zig` — standalone cleartext prior-knowledge HTTP/2 client that opens concurrent GET+POST streams and handles control responses/flow-control credit explicitly.
 - `http2_client_core.zig` — create a client `Session`, public fixed stream store,
   HPACK codecs, and one request HEADERS block.
 - `http2_server_core.zig` — in-memory client/server Session round-trip showing
@@ -34,14 +36,17 @@ Run all examples with:
 zig build examples
 ```
 
-`zig build check` also runs them, so public API changes that make these reference
-compositions stale fail the normal merge gate.
+`zig build check` runs the finite in-memory examples and compiles the four standalone
+TCP programs, so public API changes that make these reference compositions stale
+fail the normal merge gate without starting persistent servers.
 
-Focused runnable TCP targets:
+Standalone TCP targets (run server and client in separate terminals):
 
 ```sh
-zig build example-http1-tcp
-zig build example-http2-tcp
+zig build example-http1-server
+zig build example-http1-client
+zig build example-http2-server
+zig build example-http2-client
 ```
 
-See [`../docs/basic-client-server.md`](../docs/basic-client-server.md) for how to split the loopback examples into standalone client/server processes.
+The aggregate `examples` / `check` targets compile these four programs but do not run the persistent servers. See [`../docs/basic-client-server.md`](../docs/basic-client-server.md) for the complete transport loop and adaptation notes.

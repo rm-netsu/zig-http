@@ -8,7 +8,7 @@ TLS, event-loop, or thread-pool implementation.
 
 - [`../README.md`](../README.md) — package overview, quick starts, build commands,
   and composition-level selection.
-- [`../examples/README.md`](../examples/README.md) — compile-tested high-level, protocol-core, and runnable loopback TCP examples.
+- [`../examples/README.md`](../examples/README.md) — compile-tested high-level, protocol-core, and standalone TCP client/server examples.
 - [`basic-client-server.md`](basic-client-server.md) — end-to-end TCP client/server composition for HTTP/1.1 and HTTP/2.
 - [`architecture.md`](architecture.md) — protocol/core boundary, composition
   levels, memory model, and low-level module map.

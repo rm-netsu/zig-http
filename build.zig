@@ -77,17 +77,19 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Generate and install the HTTP API reference");
     docs_step.dependOn(&install_api_docs.step);
 
-    const examples_step = b.step("examples", "Build and run HTTP usage examples");
+    const examples_step = b.step("examples", "Build HTTP usage examples and run finite examples");
     const example_sources = [_][]const u8{
         "http1_client_core",
         "http1_high_level",
-        "http1_tcp_client_server",
+        "http1_tcp_client",
+        "http1_tcp_server",
         "http1_expect_upgrade",
         "http1_server_core",
         "http1_trailers",
         "http2_client_core",
         "http2_high_level",
-        "http2_tcp_client_server",
+        "http2_tcp_client",
+        "http2_tcp_server",
         "http2_server_core",
         "http2_trailers",
         "http2_priority",
@@ -106,12 +108,29 @@ pub fn build(b: *std.Build) void {
             .root_module = example_mod,
         });
         const run_example = b.addRunArtifact(example_exe);
-        examples_step.dependOn(&run_example.step);
-        if (std.mem.eql(u8, name, "http1_tcp_client_server")) {
-            const step = b.step("example-http1-tcp", "Run the loopback TCP HTTP/1 client/server example");
+        const standalone_tcp = std.mem.eql(u8, name, "http1_tcp_client") or
+            std.mem.eql(u8, name, "http1_tcp_server") or
+            std.mem.eql(u8, name, "http2_tcp_client") or
+            std.mem.eql(u8, name, "http2_tcp_server");
+        if (standalone_tcp) {
+            // Standalone servers are intentionally not run by `zig build check`.
+            // Compile all four TCP programs here; run them explicitly below.
+            examples_step.dependOn(&example_exe.step);
+        } else {
+            examples_step.dependOn(&run_example.step);
+        }
+
+        if (std.mem.eql(u8, name, "http1_tcp_server")) {
+            const step = b.step("example-http1-server", "Run the standalone TCP HTTP/1.1 example server");
             step.dependOn(&run_example.step);
-        } else if (std.mem.eql(u8, name, "http2_tcp_client_server")) {
-            const step = b.step("example-http2-tcp", "Run the loopback TCP HTTP/2 prior-knowledge client/server example");
+        } else if (std.mem.eql(u8, name, "http1_tcp_client")) {
+            const step = b.step("example-http1-client", "Run the standalone TCP HTTP/1.1 example client");
+            step.dependOn(&run_example.step);
+        } else if (std.mem.eql(u8, name, "http2_tcp_server")) {
+            const step = b.step("example-http2-server", "Run the standalone TCP HTTP/2 prior-knowledge example server");
+            step.dependOn(&run_example.step);
+        } else if (std.mem.eql(u8, name, "http2_tcp_client")) {
+            const step = b.step("example-http2-client", "Run the standalone TCP HTTP/2 prior-knowledge example client");
             step.dependOn(&run_example.step);
         }
     }

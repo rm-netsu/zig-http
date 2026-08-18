@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add runnable loopback TCP HTTP/1.1 and cleartext prior-knowledge HTTP/2 client/server examples, including pipelining/multiplexing, streaming bodies, HTTP/2 control responses and receive-credit handling, plus a focused integration guide and individual build targets.
+- Split the runnable TCP integrations into independent HTTP/1.1 and cleartext prior-knowledge HTTP/2 server/client executables, with persistent server accept loops, explicit per-process build targets, and aggregate checks that compile rather than run the standalone servers. The examples retain pipelining/multiplexing, streaming bodies, HTTP/2 control responses and receive-credit handling.
 
 ## 0.19.0
 
