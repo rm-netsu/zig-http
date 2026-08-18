@@ -8,6 +8,7 @@ pub const Config = struct {
     chunk_line_bytes: usize = 8 * 1024,
     max_in_flight: usize = 64,
     outbound_fields: usize = 64,
+    upgrade_offer_bytes: usize = 128,
     decoder_options: h1.connection.Options = .{},
 };
 
@@ -33,6 +34,7 @@ pub fn Connection(comptime config: Config) type {
     if (config.chunk_line_bytes == 0) @compileError("high_level.http1 Connection chunk_line_bytes must be non-zero");
     if (config.max_in_flight == 0) @compileError("high_level.http1 Connection max_in_flight must be non-zero");
     if (config.outbound_fields == 0) @compileError("high_level.http1 Connection outbound_fields must be non-zero");
+    if (config.upgrade_offer_bytes == 0) @compileError("high_level.http1 Connection upgrade_offer_bytes must be non-zero");
 
     return struct {
         const Self = @This();
@@ -41,7 +43,14 @@ pub fn Connection(comptime config: Config) type {
             kind: Kind,
             expect_continue: bool = false,
             upgrade_offered: bool = false,
+            upgrade_offer_truncated: bool = false,
             continue_sent: bool = false,
+            upgrade_len: usize = 0,
+            upgrade_bytes: [config.upgrade_offer_bytes]u8 = undefined,
+
+            fn offer(self: *const PendingRequest) []const u8 {
+                return self.upgrade_bytes[0..self.upgrade_len];
+            }
         };
 
         allocator: std.mem.Allocator,
@@ -99,15 +108,20 @@ pub fn Connection(comptime config: Config) type {
         pub const ReceiveError = h1.connection.Error || error{
             NoOutstandingRequest,
             RequestQueueFull,
+            UnexpectedUpgrade,
         };
         pub const SendRequestError = h1.message.BuildError || h1.MessageWriter.MessageError || error{
             NotClient,
             RequestQueueFull,
+            UpgradeOfferTooLarge,
+            InvalidUpgradeRequest,
         };
         pub const SendResponseError = h1.MessageWriter.MessageError || error{
             NotServer,
             NoPendingRequest,
             ContinueRequiredBeforeUpgrade,
+            UpgradeNotOffered,
+            UpgradeOfferTooLarge,
         };
         pub const DataError = h1.MessageWriter.MessageError;
 
@@ -176,8 +190,18 @@ pub fn Connection(comptime config: Config) type {
             if (self.role() != .client) return error.NotClient;
             if (self.state.pending.full()) return error.RequestQueueFull;
             const fields = try request.build(&self.state.outbound, regular_fields);
+            var pending: PendingRequest = .{ .kind = request.kind() };
+            const maybe_offer = h1.semantics.copyUpgradeOfferFields(request.version, fields, &pending.upgrade_bytes) catch |err| switch (err) {
+                error.BufferTooSmall => return error.UpgradeOfferTooLarge,
+                error.InvalidUpgradeRequest => return error.InvalidUpgradeRequest,
+                error.InvalidConnectionHeader => return error.InvalidConnectionHeader,
+            };
+            if (maybe_offer) |offer| {
+                pending.upgrade_offered = true;
+                pending.upgrade_len = offer.len;
+            }
             const result = try self.state.writer.beginRequest(out, request.version, request.method, request.target, fields);
-            if (!self.state.pending.push(.{ .kind = request.kind() })) unreachable;
+            if (!self.state.pending.push(pending)) unreachable;
             return result;
         }
 
@@ -192,8 +216,12 @@ pub fn Connection(comptime config: Config) type {
         ) SendResponseError!h1.MessageWriter.BeginResult {
             if (self.role() != .server) return error.NotServer;
             const pending = self.state.pending.peekPtr() orelse return error.NoPendingRequest;
-            if (response.status == 101 and pending.expect_continue and pending.upgrade_offered and !pending.continue_sent)
-                return error.ContinueRequiredBeforeUpgrade;
+            if (response.status == 101) {
+                if (!pending.upgrade_offered) return error.UpgradeNotOffered;
+                if (pending.upgrade_offer_truncated) return error.UpgradeOfferTooLarge;
+                if (pending.expect_continue and !pending.continue_sent) return error.ContinueRequiredBeforeUpgrade;
+                try h1.semantics.validateUpgradeSelectionFields(pending.offer(), response.version, response.status, fields);
+            }
             const result = try self.state.writer.beginResponse(
                 out,
                 response.version,
@@ -259,6 +287,18 @@ pub fn Connection(comptime config: Config) type {
             const result = try self.state.decoder.feed(input);
             if (result.event) |event| switch (self.role()) {
                 .client => {
+                    if (event == .head) {
+                        const head_event = event.head;
+                        const response = switch (head_event.head.start) {
+                            .response => |value| value,
+                            else => unreachable,
+                        };
+                        if (response.status == 101) {
+                            const pending = self.state.pending.peekPtr() orelse return error.NoOutstandingRequest;
+                            if (!pending.upgrade_offered) return error.UnexpectedUpgrade;
+                            try h1.semantics.validateRetainedUpgradeSelection(pending.offer(), head_event.head);
+                        }
+                    }
                     if (!self.state.decoder.responsePending()) _ = self.state.pending.pop() orelse unreachable;
                 },
                 .server => switch (event) {
@@ -269,15 +309,21 @@ pub fn Connection(comptime config: Config) type {
                         };
                         const expectation = h1.semantics.requestExpectation(head_event.head) catch .unsupported;
                         const expect_continue = expectation == .continue_100 and requestFramingHasContent(head_event.framing);
-                        var upgrade_offered = false;
-                        if (h1.semantics.UpgradeOffer.init(head_event.head)) |_| {
-                            upgrade_offered = true;
-                        } else |_| {}
-                        if (!self.state.pending.push(.{
+                        var pending: PendingRequest = .{
                             .kind = Kind.from(request.method),
                             .expect_continue = expect_continue,
-                            .upgrade_offered = upgrade_offered,
-                        })) unreachable;
+                        };
+                        if (h1.semantics.copyUpgradeOffer(head_event.head, &pending.upgrade_bytes)) |offer| {
+                            pending.upgrade_offered = true;
+                            pending.upgrade_len = offer.len;
+                        } else |err| switch (err) {
+                            error.BufferTooSmall => {
+                                pending.upgrade_offered = true;
+                                pending.upgrade_offer_truncated = true;
+                            },
+                            else => {},
+                        }
+                        if (!self.state.pending.push(pending)) unreachable;
                         self.state.receive_at_message_start = head_event.message_done;
                     },
                     .data => |data| self.state.receive_at_message_start = data.message_done,
@@ -501,4 +547,45 @@ test "high-level HTTP1 server requires 100 before 101 when Expect and Upgrade ar
     try std.testing.expect(continued.message_done);
     _ = try server.sendResponse(&wire, h1.message.ResponseFields.init(101, "Switching Protocols"), &upgrade_fields);
     try std.testing.expect(server.protocolSwitched());
+}
+
+test "high-level HTTP1 rejects unoffered Upgrade selection on both sides" {
+    const Conn = Connection(.{ .head_bytes = 1024, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    const offered = h1.message.upgrade("websocket");
+    var request_storage: [512]u8 = undefined;
+    var request_wire = std.Io.Writer.fixed(&request_storage);
+    _ = try client.sendRequest(&request_wire, h1.message.RequestFields.origin("GET", "/", "example.com"), &offered);
+    _ = try server.receive(request_wire.buffered());
+
+    const wrong = h1.message.upgrade("h2c");
+    var response_storage: [512]u8 = undefined;
+    var response_wire = std.Io.Writer.fixed(&response_storage);
+    try std.testing.expectError(
+        error.InvalidUpgradeResponse,
+        server.sendResponse(&response_wire, h1.message.ResponseFields.init(101, "Switching Protocols"), &wrong),
+    );
+    try std.testing.expectEqual(@as(usize, 0), response_wire.end);
+
+    const selected = h1.message.upgrade("WebSocket");
+    _ = try server.sendResponse(&response_wire, h1.message.ResponseFields.init(101, "Switching Protocols"), &selected);
+    const received = try client.receive(response_wire.buffered());
+    try std.testing.expect(received.event.?.head.protocol_switched);
+}
+
+test "high-level HTTP1 client rejects unsolicited 101" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 1, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+    var wire_storage: [256]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/", "example.com"), &.{});
+    try std.testing.expectError(
+        error.UnexpectedUpgrade,
+        client.receive("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"),
+    );
 }

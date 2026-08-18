@@ -113,6 +113,123 @@ pub const UpgradeOfferError = head.Error || ConnectionError || error{InvalidUpgr
 /// Borrowed HTTP/1.1 Upgrade offer. It validates Connection: Upgrade and the
 /// Upgrade list once, then lets applications test candidate protocols or a 101
 /// selection without allocating or copying field values.
+/// Copy the validated comma-separated Upgrade offer into caller-owned storage.
+/// Multiple Upgrade field lines are joined with a single comma so the result can
+/// be retained independently of the borrowed parsed head.
+pub fn copyUpgradeOffer(request: head.Head, out: []u8) (UpgradeOfferError || error{BufferTooSmall})![]const u8 {
+    _ = try UpgradeOffer.init(request);
+    var used: usize = 0;
+    var first = true;
+    var it = request.headerIterator();
+    while (try it.next()) |field| {
+        if (!common.eqlHeaderName(field.name, "upgrade")) continue;
+        const extra: usize = field.value.len + (if (first) @as(usize, 0) else @as(usize, 1));
+        if (extra > out.len -| used) return error.BufferTooSmall;
+        if (!first) {
+            out[used] = ',';
+            used += 1;
+        }
+        @memcpy(out[used..][0..field.value.len], field.value);
+        used += field.value.len;
+        first = false;
+    }
+    return out[0..used];
+}
+
+/// Send-side counterpart used when a high-level client retains an Upgrade
+/// offer before writing the request. The structural Connection/Upgrade rules
+/// are checked with sender grammar before any bytes are copied.
+pub fn copyUpgradeOfferFields(version: head.Version, headers: []const common.Header, out: []u8) (ConnectionError || error{ InvalidUpgradeRequest, BufferTooSmall })!?[]const u8 {
+    if (version != .http_1_1) return null;
+    var options: ConnectionOptions = .{};
+    var saw_upgrade = false;
+    for (headers) |field| {
+        if (common.eqlHeaderName(field.name, "connection")) {
+            try addConnectionOptions(&options, field.value, .send);
+        } else if (common.eqlHeaderName(field.name, "upgrade")) {
+            const saw = scanUpgradeList(field.value, .send) orelse return error.InvalidUpgradeRequest;
+            saw_upgrade = saw_upgrade or saw;
+        }
+    }
+    if (!options.upgrade and !saw_upgrade) return null;
+    if (!options.upgrade or !saw_upgrade) return error.InvalidUpgradeRequest;
+
+    var used: usize = 0;
+    var first = true;
+    for (headers) |field| {
+        if (!common.eqlHeaderName(field.name, "upgrade")) continue;
+        const extra: usize = field.value.len + (if (first) @as(usize, 0) else @as(usize, 1));
+        if (extra > out.len -| used) return error.BufferTooSmall;
+        if (!first) {
+            out[used] = ',';
+            used += 1;
+        }
+        @memcpy(out[used..][0..field.value.len], field.value);
+        used += field.value.len;
+        first = false;
+    }
+    return out[0..used];
+}
+
+/// Validate a 101 response against a retained comma-separated Upgrade offer.
+/// Protocol names compare case-insensitively while optional versions compare
+/// exactly, matching `UpgradeOffer.offers`.
+/// Receive-side form for a retained client offer and a parsed 101 response.
+pub fn validateRetainedUpgradeSelection(
+    offered: []const u8,
+    response: head.Head,
+) (head.Error || ConnectionError || ResponseError)!void {
+    try validateUpgradeResponse(response);
+    var it = response.headerIterator();
+    while (try it.next()) |field| {
+        if (!common.eqlHeaderName(field.name, "upgrade")) continue;
+        var selected = ProtocolList.init(field.value, .receive);
+        while (true) {
+            const next = selected.next() orelse break;
+            const protocol = next orelse return error.InvalidUpgradeResponse;
+            var candidates = ProtocolList.init(offered, .receive);
+            var matched = false;
+            while (true) {
+                const candidate_next = candidates.next() orelse break;
+                const candidate = candidate_next orelse return error.InvalidUpgradeResponse;
+                if (protocolMatches(candidate, protocol)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return error.InvalidUpgradeResponse;
+        }
+    }
+}
+
+pub fn validateUpgradeSelectionFields(
+    offered: []const u8,
+    version: head.Version,
+    status: u16,
+    headers: []const common.Header,
+) (ConnectionError || ResponseError)!void {
+    if (status != 101) return error.InvalidUpgradeResponse;
+    try validateUpgradeResponseFields(version, headers);
+    for (headers) |field| {
+        if (!common.eqlHeaderName(field.name, "upgrade")) continue;
+        var selected = ProtocolList.init(field.value, .send);
+        while (true) {
+            const next = selected.next() orelse break;
+            const protocol = next orelse return error.InvalidUpgradeResponse;
+            var candidates = ProtocolList.init(offered, .receive);
+            var matched = false;
+            while (true) {
+                const candidate_next = candidates.next() orelse break;
+                const candidate = candidate_next orelse return error.InvalidUpgradeResponse;
+                if (protocolMatches(candidate, protocol)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return error.InvalidUpgradeResponse;
+        }
+    }
+}
 pub const UpgradeOffer = struct {
     request: head.Head,
 
