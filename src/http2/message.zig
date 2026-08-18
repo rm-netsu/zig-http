@@ -5,6 +5,20 @@ const hpack = @import("hpack");
 
 pub const BuildError = error{ BufferTooSmall, InvalidRequest, InvalidResponse };
 
+/// RFC 9113 field-section size used by SETTINGS_MAX_HEADER_LIST_SIZE: the
+/// uncompressed name length + value length + 32 bytes of per-field overhead.
+/// The result saturates rather than overflowing so it remains safe for
+/// attacker-controlled or synthetic slices on every target width.
+pub fn fieldSectionSize(items: []const hpack.EncodedField) u64 {
+    var total: u64 = 0;
+    for (items) |item| {
+        total = std.math.add(u64, total, @intCast(item.field.name.len)) catch return std.math.maxInt(u64);
+        total = std.math.add(u64, total, @intCast(item.field.value.len)) catch return std.math.maxInt(u64);
+        total = std.math.add(u64, total, 32) catch return std.math.maxInt(u64);
+    }
+    return total;
+}
+
 /// Concise regular-field constructor for typed HTTP/2 message builders.
 pub inline fn header(name: []const u8, value: []const u8) hpack.EncodedField {
     return .{ .field = .{ .name = name, .value = value } };
@@ -193,4 +207,12 @@ test "header helper is allocation free" {
     const item = header("x-test", "ok");
     const value: common.Header = .{ .name = item.field.name, .value = item.field.value };
     try std.testing.expectEqualStrings("x-test", value.name);
+}
+
+test "field section size follows RFC accounting" {
+    const items = [_]hpack.EncodedField{
+        header(":method", "GET"),
+        header("x", "abc"),
+    };
+    try std.testing.expectEqual(@as(u64, 7 + 3 + 32 + 1 + 3 + 32), fieldSectionSize(&items));
 }

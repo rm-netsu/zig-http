@@ -17,6 +17,10 @@ pub const Config = struct {
     collected_field_bytes: usize = 16 * 1024,
     outbound_fields: usize = 64,
     hpack_table_size: u32 = 4096,
+    /// Treat the peer's advisory SETTINGS_MAX_HEADER_LIST_SIZE as a hard
+    /// local send preflight. Disable only when application policy intentionally
+    /// allows sections the peer has said it might refuse.
+    enforce_peer_header_list_size: bool = true,
     local_limits: h2.streams.LocalLimits = .{},
 };
 
@@ -84,11 +88,11 @@ pub fn Connection(comptime config: Config) type {
 
         pub const DrainResult = hl_common.DrainResult;
 
-        pub const SendRequestError = h2.message.BuildError || h2.session.SendHeadersError || error{
+        pub const SendRequestError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{
             NotClient,
             StreamIdExhausted,
         };
-        pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersError || error{NotServer};
+        pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{NotServer};
         pub const ReceiveError = h2.bootstrap.Bootstrap.ReceiveError;
 
         pub fn initClient(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
@@ -147,6 +151,10 @@ pub fn Connection(comptime config: Config) type {
 
         pub inline fn settingsSync(self: *Self) *h2.session.SettingsSync {
             return &self.state.settings_sync;
+        }
+
+        pub inline fn peerHeaderListLimit(self: *const Self) ?u32 {
+            return self.state.session.peerHeaderListLimit();
         }
 
         /// Emits the local HTTP/2 connection preface and initial SETTINGS.
@@ -223,14 +231,24 @@ pub fn Connection(comptime config: Config) type {
             if (self.state.next_request_stream_id > std.math.maxInt(u31)) return error.StreamIdExhausted;
             const stream_id: u31 = @intCast(self.state.next_request_stream_id);
             const items = try request.build(&self.state.outbound, regular_fields);
-            const stats = try self.state.session.sendHeaders(
-                &self.state.store,
-                out,
-                stream_id,
-                end_stream,
-                &self.state.frame_staging,
-                items,
-            );
+            const stats = if (config.enforce_peer_header_list_size)
+                try self.state.session.sendHeadersWithinPeerLimit(
+                    &self.state.store,
+                    out,
+                    stream_id,
+                    end_stream,
+                    &self.state.frame_staging,
+                    items,
+                )
+            else
+                try self.state.session.sendHeaders(
+                    &self.state.store,
+                    out,
+                    stream_id,
+                    end_stream,
+                    &self.state.frame_staging,
+                    items,
+                );
             self.state.next_request_stream_id += 2;
             return .{ .stream_id = stream_id, .headers = stats };
         }
@@ -246,14 +264,24 @@ pub fn Connection(comptime config: Config) type {
         ) SendResponseError!h2.session.SendHeadersResult {
             if (self.role() != .server) return error.NotServer;
             const items = try response.build(&self.state.outbound, regular_fields);
-            return self.state.session.sendHeaders(
-                &self.state.store,
-                out,
-                stream_id,
-                end_stream,
-                &self.state.frame_staging,
-                items,
-            );
+            return if (config.enforce_peer_header_list_size)
+                self.state.session.sendHeadersWithinPeerLimit(
+                    &self.state.store,
+                    out,
+                    stream_id,
+                    end_stream,
+                    &self.state.frame_staging,
+                    items,
+                )
+            else
+                self.state.session.sendHeaders(
+                    &self.state.store,
+                    out,
+                    stream_id,
+                    end_stream,
+                    &self.state.frame_staging,
+                    items,
+                );
         }
 
         pub inline fn sendData(self: *Self, out: *std.Io.Writer, stream_id: u31, bytes: []const u8, end_stream: bool) h2.session.SendDataError!h2.session.SendDataResult {
@@ -320,4 +348,25 @@ test "high-level HTTP2 drain processes multiple complete control frames" {
     try std.testing.expectEqual(input.len, drained.consumed);
     try std.testing.expectEqual(@as(usize, 2), drained.events);
     try std.testing.expectEqual(@as(usize, 2), counter.count);
+}
+
+test "high-level HTTP2 honors peer header list limit before wire mutation" {
+    const Conn = Connection(.{ .max_streams = 4, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var conn = try Conn.initClient(std.testing.allocator);
+    defer conn.deinit();
+    conn.core().peer.settings.max_header_list_size = 64;
+
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expectError(
+        error.PeerHeaderListTooLarge,
+        conn.sendRequest(
+            &wire,
+            h2.message.RequestFields.init("GET", "https", "example.com", "/"),
+            &.{},
+            true,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), wire.end);
+    try std.testing.expect(conn.store().get(1) == null);
 }

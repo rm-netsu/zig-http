@@ -8,6 +8,7 @@ const fields = @import("fields.zig");
 const frame = @import("frame.zig");
 const flow = @import("flow.zig");
 const header_block = @import("header_block.zig");
+const message = @import("message.zig");
 const payload = @import("payload.zig");
 const peer_mod = @import("peer.zig");
 const protocol = @import("protocol.zig");
@@ -210,6 +211,17 @@ pub const SettingsPreflightViolation = struct {
     reason: SettingsPreflightReason,
 };
 
+pub const PeerHeaderList = struct {
+    size: u64,
+    /// Null means the peer has not advertised a practical bound. The compact
+    /// peer settings model uses maxInt(u32) as this sentinel.
+    limit: ?u32,
+
+    pub inline fn exceeds(self: PeerHeaderList) bool {
+        return if (self.limit) |limit| self.size > limit else false;
+    }
+};
+
 pub const DataPreflightViolation = enum {
     send_poisoned,
     goaway,
@@ -233,6 +245,7 @@ pub const DataSendCredit = struct {
 };
 
 pub const SendHeadersError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned, TrailerPolicyRequired, TrailerRejected };
+pub const SendHeadersWithinPeerLimitError = SendHeadersError || error{PeerHeaderListTooLarge};
 pub const SendPushPromiseError = hpack.codec.Error || streams_mod.LocalError || error{ BufferTooSmall, SendPoisoned };
 pub const SendDataError = std.Io.Writer.Error || streams_mod.LocalError || error{SendPoisoned};
 pub const DataSendCreditError = streams_mod.LocalError || error{SendPoisoned};
@@ -355,6 +368,26 @@ pub const Session = struct {
 
     pub inline fn role(self: Session) peer_mod.Role {
         return self.streams.local_role;
+    }
+
+    /// Current peer-advertised SETTINGS_MAX_HEADER_LIST_SIZE. The protocol
+    /// default is maxInt(u32), which effectively means no useful bound was
+    /// advertised. The setting is advisory in HTTP/2; low-level `sendHeaders`
+    /// therefore remains permissive while callers can opt into strict preflight.
+    pub inline fn peerHeaderListLimit(self: Session) ?u32 {
+        const value = self.peer.settings.max_header_list_size;
+        return if (value == std.math.maxInt(u32)) null else value;
+    }
+
+    /// Computes the RFC field-section accounting and pairs it with the current
+    /// peer limit without mutating HPACK, stream state, or the writer.
+    pub inline fn peerHeaderList(self: Session, items: []const hpack.EncodedField) PeerHeaderList {
+        return .{ .size = message.fieldSectionSize(items), .limit = self.peerHeaderListLimit() };
+    }
+
+    pub inline fn diagnosePeerHeaderList(self: Session, items: []const hpack.EncodedField) ?PeerHeaderList {
+        const result = self.peerHeaderList(items);
+        return if (result.exceeds()) result else null;
     }
 
     /// Explains whether the same inputs would pass `sendHeaders` preflight,
@@ -487,6 +520,22 @@ pub const Session = struct {
             else => return .invalid_stream_state,
         }
         return null;
+    }
+
+    /// Strict convenience variant for applications that choose to honor the
+    /// peer's advisory SETTINGS_MAX_HEADER_LIST_SIZE as a hard local preflight.
+    /// Rejection happens before stream/HPACK/wire mutation.
+    pub fn sendHeadersWithinPeerLimit(
+        self: *Session,
+        store: anytype,
+        out: *std.Io.Writer,
+        stream_id: u31,
+        end_stream: bool,
+        frame_staging: []u8,
+        items: []const hpack.EncodedField,
+    ) SendHeadersWithinPeerLimitError!SendHeadersResult {
+        if (self.diagnosePeerHeaderList(items) != null) return error.PeerHeaderListTooLarge;
+        return self.sendHeaders(store, out, stream_id, end_stream, frame_staging, items);
     }
 
     /// Streams one local field section directly into HEADERS/CONTINUATION
