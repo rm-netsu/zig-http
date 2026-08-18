@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
         "http1_server_core",
         "http1_trailers",
         "http2_client_core",
+        "http2_high_level",
         "http2_server_core",
         "http2_trailers",
         "http2_priority",

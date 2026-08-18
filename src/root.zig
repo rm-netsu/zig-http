@@ -6,6 +6,7 @@ pub const common = @import("common.zig");
 pub const uri = @import("uri.zig");
 pub const http1 = @import("http1.zig");
 pub const http2 = @import("http2.zig");
+pub const high_level = @import("high_level.zig");
 
 test {
     _ = common.Header;
@@ -53,5 +54,10 @@ test {
     _ = http2.dispatch.Prepared;
     _ = http2.dispatch.StreamWork;
     _ = http2.contracts.hasSessionStore;
+    _ = http2.storage.FixedStreamStore;
+    _ = http2.storage.FixedFieldCollector;
+    _ = http2.message.RequestFields;
+    _ = http2.message.ResponseFields;
     _ = http2.send.HeaderFramer;
+    _ = high_level.http2.Connection;
 }
