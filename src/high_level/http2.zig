@@ -243,13 +243,17 @@ pub fn Connection(comptime config: Config) type {
             ConnectionFailed,
             StreamIdExhausted,
         };
-        pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{ NotServer, ConnectionFailed };
-        pub const SendDataError = h2.session.SendDataError || error{ConnectionFailed};
-        pub const SendTrailersError = h2.session.SendHeadersWithinPeerLimitError || error{ConnectionFailed};
-        pub const SendPingError = h2.session.SendSimpleControlError || error{ConnectionFailed};
+        pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{ NotServer, NotStarted, ConnectionFailed };
+        pub const SendDataError = h2.session.SendDataError || error{ NotStarted, ConnectionFailed };
+        pub const SendTrailersError = h2.session.SendHeadersWithinPeerLimitError || error{ NotStarted, ConnectionFailed };
+        pub const SendPingError = h2.session.SendSimpleControlError || error{ NotStarted, ConnectionFailed };
         pub const SendLocalSettingsError = h2.session.SendSettingsError || error{ SettingsPending, NotStarted, ConnectionDraining, ConnectionFailed, LocalSettingsFlowControl };
         pub const ReceiveError = h2.bootstrap.Bootstrap.ReceiveError || error{ HeaderCollectionOverflow, LocalSettingsFlowControl, ReceiveFailed };
-        pub const SendControlError = h2.session.SendSimpleControlError || h2.session.SendStreamControlError || h2.session.SendGoAwayError;
+        pub const SendControlError = h2.session.SendSimpleControlError || h2.session.SendStreamControlError || h2.session.SendGoAwayError || error{NotStarted};
+        pub const ReceiveCreditError = h2.session.SendStreamControlError || error{ NotStarted, ConnectionFailed };
+        pub const ResetStreamError = h2.session.SendStreamControlError || error{ NotStarted, ConnectionFailed };
+        pub const SendGoAwayError = h2.session.SendGoAwayError || error{NotStarted};
+        pub const GracefulGoAwayError = h2.session.SendGoAwayError || error{ NotStarted, ConnectionFailed };
 
         pub fn initClient(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
             return initOwned(allocator, .client);
@@ -371,6 +375,15 @@ pub fn Connection(comptime config: Config) type {
 
         fn applicationSendFailed(self: *const Self) bool {
             return self.state.receive_failed or self.state.bootstrap.sendPoisoned() or self.state.session.sendPoisoned();
+        }
+
+        fn requireStarted(self: *const Self) error{NotStarted}!void {
+            if (!self.state.bootstrap.localPrefaceSent()) return error.NotStarted;
+        }
+
+        fn requireApplicationSend(self: *const Self) error{ NotStarted, ConnectionFailed }!void {
+            try self.requireStarted();
+            if (self.applicationSendFailed()) return error.ConnectionFailed;
         }
 
         /// Whether a client may open another request stream. This becomes true
@@ -613,7 +626,7 @@ pub fn Connection(comptime config: Config) type {
             end_stream: bool,
         ) SendResponseError!h2.session.SendHeadersResult {
             if (self.role() != .server) return error.NotServer;
-            if (self.applicationSendFailed()) return error.ConnectionFailed;
+            try self.requireApplicationSend();
             const items = try response.build(&self.state.outbound, regular_fields);
             return if (config.enforce_peer_header_list_size)
                 self.state.session.sendHeadersWithinPeerLimit(
@@ -636,7 +649,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn sendData(self: *Self, out: *std.Io.Writer, stream_id: u31, bytes: []const u8, end_stream: bool) SendDataError!h2.session.SendDataResult {
-            if (self.applicationSendFailed()) return error.ConnectionFailed;
+            try self.requireApplicationSend();
             return self.state.session.sendData(&self.state.store, out, stream_id, bytes, end_stream);
         }
 
@@ -649,7 +662,7 @@ pub fn Connection(comptime config: Config) type {
             items: []const h2.hpack.EncodedField,
             policy: anytype,
         ) SendTrailersError!h2.session.SendHeadersResult {
-            if (self.applicationSendFailed()) return error.ConnectionFailed;
+            try self.requireApplicationSend();
             if (config.enforce_peer_header_list_size and self.state.session.diagnosePeerHeaderList(items) != null)
                 return error.PeerHeaderListTooLarge;
             return self.state.session.sendTrailers(&self.state.store, out, stream_id, &self.state.frame_staging, items, policy);
@@ -660,6 +673,11 @@ pub fn Connection(comptime config: Config) type {
         /// Local resource/configuration failures deliberately map to `.none`;
         /// callers should close the transport without blaming the peer.
         pub fn controlForReceiveError(self: *const Self, err: ReceiveError) ControlAction {
+            // The first locally emitted HTTP/2 frame must be the initial
+            // SETTINGS frame. If receive fails before `start()`, no recovery
+            // control frame can be serialized without violating connection
+            // preface ordering; close the transport instead.
+            if (!self.state.bootstrap.localPrefaceSent()) return .none;
             const code: ?h2.protocol.ErrorCode = switch (err) {
                 error.FrameSize => .frame_size_error,
                 error.Protocol, error.InvalidPreface => .protocol_error,
@@ -684,7 +702,11 @@ pub fn Connection(comptime config: Config) type {
         /// action is transport-neutral and never writes implicitly from receive().
         pub fn sendControl(self: *Self, out: *std.Io.Writer, action: ControlAction) SendControlError!void {
             switch (action) {
-                .none => {},
+                .none => return,
+                else => try self.requireStarted(),
+            }
+            switch (action) {
+                .none => unreachable,
                 .settings_ack => try self.state.session.sendSettingsAck(out),
                 .ping_ack => |bytes| try self.state.session.sendPingAck(out, &bytes),
                 .reset_stream => |reset| try self.state.session.sendReset(&self.state.store, out, reset.stream_id, reset.code),
@@ -693,7 +715,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn sendPing(self: *Self, out: *std.Io.Writer, bytes: *const [8]u8) SendPingError!void {
-            if (self.applicationSendFailed()) return error.ConnectionFailed;
+            try self.requireApplicationSend();
             return self.state.session.sendPing(out, false, bytes);
         }
 
@@ -735,7 +757,8 @@ pub fn Connection(comptime config: Config) type {
         /// Emit any WINDOW_UPDATE frames made ready by prior `releaseData` calls.
         /// The transport remains caller-owned and no control bytes are emitted by
         /// receive() itself.
-        pub fn flushReceiveCredit(self: *Self, out: *std.Io.Writer, stream_id: u31) h2.session.SendStreamControlError!ReceiveCreditResult {
+        pub fn flushReceiveCredit(self: *Self, out: *std.Io.Writer, stream_id: u31) ReceiveCreditError!ReceiveCreditResult {
+            try self.requireApplicationSend();
             var result: ReceiveCreditResult = .{};
             result.connection = try self.state.session.replenishConnectionReceive(out, &self.state.connection_credit);
             if (self.state.store.receiveCredit(stream_id)) |credit|
@@ -743,23 +766,27 @@ pub fn Connection(comptime config: Config) type {
             return result;
         }
 
-        pub inline fn resetStream(self: *Self, out: *std.Io.Writer, stream_id: u31, code: h2.protocol.ErrorCode) h2.session.SendStreamControlError!void {
+        pub fn resetStream(self: *Self, out: *std.Io.Writer, stream_id: u31, code: h2.protocol.ErrorCode) ResetStreamError!void {
+            try self.requireApplicationSend();
             return self.state.session.sendReset(&self.state.store, out, stream_id, code);
         }
 
-        pub inline fn sendGoAway(self: *Self, out: *std.Io.Writer, last_stream_id: u31, code: h2.protocol.ErrorCode, debug_data: []const u8) h2.session.SendGoAwayError!void {
+        pub fn sendGoAway(self: *Self, out: *std.Io.Writer, last_stream_id: u31, code: h2.protocol.ErrorCode, debug_data: []const u8) SendGoAwayError!void {
+            try self.requireStarted();
             return self.state.session.sendGoAway(out, last_stream_id, code, debug_data);
         }
 
         /// Start the RFC 9113 two-phase graceful server shutdown sequence. No
         /// timer is owned; the caller decides when to call `finishGracefulGoAway`.
-        pub inline fn announceGracefulGoAway(self: *Self, out: *std.Io.Writer, debug_data: []const u8) h2.session.SendGoAwayError!void {
+        pub fn announceGracefulGoAway(self: *Self, out: *std.Io.Writer, debug_data: []const u8) GracefulGoAwayError!void {
+            try self.requireApplicationSend();
             return self.state.graceful_goaway.announce(&self.state.session, out, debug_data);
         }
 
         /// Send the final graceful GOAWAY cutoff after the caller-selected grace
         /// interval. `last_stream_id` is application-processed, not merely parsed.
-        pub inline fn finishGracefulGoAway(self: *Self, out: *std.Io.Writer, last_stream_id: u31, debug_data: []const u8) h2.session.SendGoAwayError!void {
+        pub fn finishGracefulGoAway(self: *Self, out: *std.Io.Writer, last_stream_id: u31, debug_data: []const u8) GracefulGoAwayError!void {
+            try self.requireApplicationSend();
             return self.state.graceful_goaway.finish(&self.state.session, out, last_stream_id, debug_data);
         }
 
@@ -856,6 +883,9 @@ test "high-level HTTP2 drain processes multiple complete control frames" {
     const Conn = Connection(.{ .max_streams = 4, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
     var server = try Conn.initServer(std.testing.allocator);
     defer server.deinit();
+    var server_start_storage: [64]u8 = undefined;
+    var server_start = std.Io.Writer.fixed(&server_start_storage);
+    _ = try server.start(&server_start);
 
     var settings_header: [9]u8 = undefined;
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&settings_header);
@@ -1157,6 +1187,9 @@ test "high-level HTTP2 reports and emits mandatory control responses" {
     const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
     var server = try Conn.initServer(std.testing.allocator);
     defer server.deinit();
+    var server_start_storage: [64]u8 = undefined;
+    var server_start = std.Io.Writer.fixed(&server_start_storage);
+    _ = try server.start(&server_start);
 
     var settings_header: [9]u8 = undefined;
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&settings_header);
@@ -1199,6 +1232,9 @@ test "high-level HTTP2 composes receive-credit release and WINDOW_UPDATE" {
     defer client.deinit();
     var server = try Conn.initServer(std.testing.allocator);
     defer server.deinit();
+    var server_start_storage: [64]u8 = undefined;
+    var server_start = std.Io.Writer.fixed(&server_start_storage);
+    _ = try server.start(&server_start);
 
     var c2s_storage: [64 * 1024]u8 = undefined;
     var c2s = std.Io.Writer.fixed(&c2s_storage);
@@ -1397,4 +1433,91 @@ test "high-level HTTP2 reclaims one closed stream without full-store scan" {
     try client.resetStream(&wire, request.stream_id, .cancel);
     try std.testing.expect(client.reclaimStream(request.stream_id));
     try std.testing.expect(!client.reclaimStream(request.stream_id));
+}
+
+test "high-level HTTP2 rejects all non-preface local frames before start" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var wire_storage: [2048]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    const empty_ping = [_]u8{0} ** 8;
+    try std.testing.expectError(error.NotStarted, client.sendPing(&wire, &empty_ping));
+    try std.testing.expectError(error.NotStarted, client.sendControl(&wire, .settings_ack));
+    try std.testing.expectError(error.NotStarted, client.sendData(&wire, 1, "x", false));
+    try std.testing.expectError(error.NotStarted, client.resetStream(&wire, 1, .cancel));
+    try std.testing.expectError(error.NotStarted, client.flushReceiveCredit(&wire, 1));
+    try std.testing.expectError(error.NotStarted, client.sendGoAway(&wire, 0, .no_error, ""));
+    try std.testing.expectError(error.NotStarted, client.announceGracefulGoAway(&wire, ""));
+    try std.testing.expectError(error.NotStarted, client.finishGracefulGoAway(&wire, 0, ""));
+    try std.testing.expectEqual(@as(usize, 0), wire.end);
+}
+
+test "high-level HTTP2 server can receive early but cannot answer before local start" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 1024, .scratch_bytes = 1024, .frame_staging_bytes = 1024, .collected_fields = 8, .collected_field_bytes = 512, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    var c2s_storage: [4096]u8 = undefined;
+    var c2s = std.Io.Writer.fixed(&c2s_storage);
+    _ = try client.start(&c2s);
+    const request = try client.sendRequest(&c2s, h2.message.RequestFields.init("GET", "https", "example.com", "/"), &.{}, true);
+
+    var offset: usize = 0;
+    while (offset < c2s.end) {
+        const result = (try server.receive(c2s.buffered()[offset..])) orelse break;
+        offset += result.consumed;
+        if (result.event) |event| if (event == .headers) break;
+    }
+    try std.testing.expect(server.store().get(request.stream_id) != null);
+
+    var response = try h2.message.ResponseFields.init(204);
+    var s2c_storage: [4096]u8 = undefined;
+    var s2c = std.Io.Writer.fixed(&s2c_storage);
+    try std.testing.expectError(error.NotStarted, server.sendResponse(&s2c, request.stream_id, &response, &.{}, true));
+    try std.testing.expectEqual(@as(usize, 0), s2c.end);
+
+    _ = try server.start(&s2c);
+    _ = try server.sendResponse(&s2c, request.stream_id, &response, &.{}, true);
+    try std.testing.expect(s2c.end > 0);
+}
+
+test "high-level HTTP2 partial request write latches application send failure" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var preface_storage: [128]u8 = undefined;
+    var preface = std.Io.Writer.fixed(&preface_storage);
+    _ = try client.start(&preface);
+
+    var tiny_storage: [4]u8 = undefined;
+    var tiny = std.Io.Writer.fixed(&tiny_storage);
+    try std.testing.expectError(
+        error.WriteFailed,
+        client.sendRequest(&tiny, h2.message.RequestFields.init("GET", "https", "example.com", "/"), &.{}, true),
+    );
+    try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());
+    try std.testing.expect(!client.canOpenRequest());
+
+    var retry_storage: [512]u8 = undefined;
+    var retry = std.Io.Writer.fixed(&retry_storage);
+    try std.testing.expectError(
+        error.ConnectionFailed,
+        client.sendRequest(&retry, h2.message.RequestFields.init("GET", "https", "example.com", "/later"), &.{}, true),
+    );
+    try std.testing.expectEqual(@as(usize, 0), retry.end);
+}
+
+test "high-level HTTP2 pre-start receive failure never suggests an out-of-order GOAWAY" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    try std.testing.expectError(error.InvalidPreface, server.receive("not-an-http2-preface"));
+    try std.testing.expect(server.controlForReceiveError(error.InvalidPreface) == .none);
+    try std.testing.expectEqual(Lifecycle.failed, server.lifecycle());
 }
