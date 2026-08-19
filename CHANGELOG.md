@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make high-level HTTP/1 Upgrade receive validation terminal and fail closed: unsolicited or mismatched `101` responses now latch `Lifecycle.failed`, suppress protocol-switch reporting, prevent request-body writes, and make subsequent receive calls return `ReceiveFailed` instead of exposing the decoder's already-entered tunnel state.
+- Enforce HTTP/2 local connection-preface ordering across the whole high-level send surface: response/data/trailers/PING/control/WINDOW_UPDATE/RST_STREAM/GOAWAY helpers now reject pre-`start()` wire output with `NotStarted`, while receive-before-start remains supported for event-loop flexibility.
+- Prevent pre-start receive failures from suggesting an impossible out-of-order GOAWAY; `controlForReceiveError()` returns `.none` until the local initial SETTINGS frame has been emitted.
+- Add composed partial-I/O regression coverage proving HTTP/1 pipeline bookkeeping is not published after a failed head write and HTTP/2 application sends latch terminal failure after partial HEADERS output.
 - Make high-level HTTP/1 client body coordination fail closed: automatically gate `Expect: 100-continue` request content, expose `continuePhase()` / `proceedWithoutContinue()`, and abandon unsent request content with mandatory connection close when an early final or earlier pipelined `Connection: close` response makes further body transmission unsafe.
 - Make high-level HTTP/2 request/policy sends lifecycle-aware: reject request streams before the local preface, expose `canOpenRequest()`, reject new requests/runtime SETTINGS during GOAWAY draining, and reject ordinary application sends after terminal composed failure while keeping explicit control emission available for the required GOAWAY.
 - Strengthen composed state-model coverage with repeated single-slot HTTP/2 open/reset/reclaim cycles and explicit terminal-send/early-final regression tests.

@@ -61,11 +61,16 @@ copying.
 The high-level connection is stricter: it retains a bounded copy of each queued
 Upgrade offer (`Config.upgrade_offer_bytes`) and validates the complete 101
 selection automatically on both roles. A server cannot select a protocol the
-client did not offer, a client rejects unsolicited/unoffered 101 responses, and
-`Expect: 100-continue` still requires the 100 response before switching. If a
-server receives an offer larger than its configured retained capacity it may
-still process the request normally, but attempting 101 fails closed with
-`UpgradeOfferTooLarge`. Client sends reject an oversized offer before wire output.
+client did not offer. On the client, an unsolicited or mismatched 101 is a
+terminal composed receive failure: `lifecycle()` becomes `failed`,
+`protocolSwitched()` remains false, pending request-body writes return
+`ConnectionFailed`, and later receive calls return `ReceiveFailed`. This avoids
+exposing the low-level decoder's tunnel transition after high-level negotiation
+policy rejected the switch. `Expect: 100-continue` still requires the 100 response
+before switching. If a server receives an offer larger than its configured
+retained capacity it may still process the request normally, but attempting 101
+fails closed with `UpgradeOfferTooLarge`. Client sends reject an oversized offer
+before wire output.
 
 Both high-level roles expose `drain(input, handler)`. It repeatedly drives the
 one-event decoder and invokes `handler.onEvent(event)` synchronously; returning

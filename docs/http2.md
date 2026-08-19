@@ -62,16 +62,20 @@ minimum bytes per connection. `Connection(config).state_bytes` exposes the fixed
 allocation size at comptime; tune the bounds or use `Session` directly for very
 high connection counts or custom storage topologies.
 
-High-level request creation is lifecycle-gated. `sendRequest()` returns
-`NotStarted` until the local client preface has been emitted, but requests may be
-sent immediately after `start()` without waiting for the peer's initial SETTINGS,
-matching HTTP/2 connection-preface rules. `canOpenRequest()` reports that exact
-composed condition. Once either endpoint has entered GOAWAY draining, new client
-requests and local SETTINGS policy updates fail with `ConnectionDraining`; existing
-streams may still send responses/data/trailers. Terminal receive/send poisoning
-fails ordinary application sends with `ConnectionFailed`, while `sendControl()`
-remains available to serialize the required GOAWAY when the failure is
-peer-attributable.
+The whole high-level send surface is connection-preface gated. `start(out)` is
+the only operation that may emit the local HTTP/2 preface/initial SETTINGS;
+request, response, DATA, trailers, PING, non-empty control, receive-credit, reset,
+and GOAWAY helpers return `NotStarted` before that point. A server may still
+receive the client preface and even request HEADERS before calling `start()`; this
+keeps event-loop ordering flexible while ensuring its first local frame is still
+SETTINGS. Client requests may be sent immediately after `start()` without waiting
+for the peer's initial SETTINGS, matching HTTP/2 connection-preface rules.
+`canOpenRequest()` reports that exact request-stream condition. Once either endpoint
+has entered GOAWAY draining, new client requests and local SETTINGS policy updates
+fail with `ConnectionDraining`; existing streams may still send
+responses/data/trailers. Terminal receive/send poisoning fails ordinary
+application sends with `ConnectionFailed`, while `sendControl()` remains available
+after start to serialize a required terminal GOAWAY.
 
 `receive()` returns copied header fields alongside HEADERS/PUSH_PROMISE events.
 Collector exhaustion is fail-closed in the high-level layer: HPACK is fully drained
@@ -100,9 +104,11 @@ call writes implicitly.
 Errors raised before an Event can be produced (for example malformed frame headers
 or connection preface) latch the high-level receive side as failed.
 `controlForReceiveError(err)` maps RFC-defined peer faults such as FRAME_SIZE,
-PROTOCOL, and HPACK compression failures to a GOAWAY action; local resource/policy
-failures map to `.none` so the application closes without incorrectly blaming the
-peer.
+PROTOCOL, and HPACK compression failures to a GOAWAY action only after the local
+initial SETTINGS has been sent. Before `start()`, it returns `.none`: emitting a
+GOAWAY first would itself violate connection-preface ordering, so the transport
+owner should simply close. Local resource/policy failures likewise map to `.none`
+so the application closes without incorrectly blaming the peer.
 
 After consuming a DATA event, call `releaseData(data)` when the application has
 released the corresponding capacity. `flushReceiveCredit(out, stream_id)` emits

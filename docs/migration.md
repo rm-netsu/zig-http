@@ -7,6 +7,10 @@ this document highlights source-level migration patterns.
 
 ## 0.19.x development after 0.19.0
 
+High-level terminal send/receive ordering is stricter. HTTP/1 clients now latch a terminal high-level receive failure when a structurally valid `101` selects an unoffered protocol; `protocolSwitched()` stays false, `lifecycle()` reports `failed`, and client `writeData()` / `finish()` return `ConnectionFailed`. Subsequent receive calls return `ReceiveFailed`; close the transport.
+
+For HTTP/2, `start(out)` is now the only operation allowed to emit the local connection preface. `sendResponse`, `sendData`, `sendTrailers`, `sendPing`, non-empty `sendControl`, receive-credit flushes, stream resets, GOAWAY, and graceful-GOAWAY helpers return `NotStarted` until initial SETTINGS has been emitted. A server may still call `receive()` before `start()`; it must call `start()` before serializing any response/control frame. `controlForReceiveError()` returns `.none` for failures that occur before local start, because a GOAWAY cannot precede the mandatory initial SETTINGS frame.
+
 The high-level HTTP/2 connection now owns runtime local SETTINGS updates rather
 than exposing its internal `SettingsSync`. `settingsSync()`, `localSettings()`,
 and `localSettingsActive()` are removed. Use `configuredInitialSettings()`,

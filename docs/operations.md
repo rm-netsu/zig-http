@@ -54,9 +54,19 @@ received and `failed` after a terminal composed receive/decode failure. These
 queries summarize protocol state only; the application still owns the actual
 socket close and retry policy.
 
+A high-level HTTP/1 client also treats Upgrade negotiation failures as terminal.
+If a structurally valid 101 selects a protocol that was not retained in the
+corresponding request offer, the low-level decoder has already consumed the head,
+but the high-level wrapper latches `failed`, suppresses `protocolSwitched()`, and
+rejects any remaining request-body writes. Close the transport.
+
 For an HTTP/2 receive error that terminates the composed connection before an
 Event exists, `controlForReceiveError(err)` can produce the corresponding GOAWAY
-when the failure has a peer-visible RFC error code.
+when the failure has a peer-visible RFC error code **and** local initial SETTINGS
+has already been emitted. Before `start()`, the helper returns `.none`; close the
+transport rather than sending an out-of-order HTTP/2 control frame. All other
+high-level HTTP/2 frame-emitting helpers likewise return `NotStarted` until the
+local preface has been serialized.
 
 ## HTTP/1 send ownership
 
