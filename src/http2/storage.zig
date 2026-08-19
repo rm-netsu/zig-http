@@ -79,17 +79,24 @@ pub fn FixedStreamStore(comptime capacity: usize) type {
             return false;
         }
 
-        /// Activates a newly acknowledged local SETTINGS_INITIAL_WINDOW_SIZE
-        /// for every retained stream. Validation is completed before mutation so
-        /// an impossible delta never leaves only part of the bounded store
-        /// updated.
-        pub fn applyLocalInitialWindow(self: *Self, old: u31, new: u31) error{FlowControl}!void {
+        /// Preflight a local SETTINGS_INITIAL_WINDOW_SIZE transition without
+        /// mutating retained stream state. High-level SETTINGS composition uses
+        /// this before committing the frame so a known local representational
+        /// failure can never be discovered only after the peer-visible write.
+        pub fn validateLocalInitialWindow(self: *Self, old: u31, new: u31) error{FlowControl}!void {
             const delta = @as(i64, new) - @as(i64, old);
             for (&self.entries) |*entry| {
                 if (!entry.used) continue;
                 const next = @as(i64, entry.tracked.windows.receive.value) + delta;
                 if (next > 0x7fff_ffff or next < -0x7fff_ffff) return error.FlowControl;
             }
+        }
+
+        /// Activates a local SETTINGS_INITIAL_WINDOW_SIZE policy for every
+        /// retained stream. Validation is completed before mutation so an
+        /// impossible delta never leaves only part of the bounded store updated.
+        pub fn applyLocalInitialWindow(self: *Self, old: u31, new: u31) error{FlowControl}!void {
+            try self.validateLocalInitialWindow(old, new);
             for (&self.entries) |*entry| {
                 if (!entry.used) continue;
                 entry.tracked.windows.receive.applyInitialDelta(old, new) catch unreachable;

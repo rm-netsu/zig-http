@@ -14,53 +14,107 @@ pub const LocalSettings = struct {
     max_concurrent_streams: u32 = std.math.maxInt(u32),
     initial_window_size: u31 = 65_535,
     max_frame_size: u32 = h2.frame.default_max_frame_size,
-    max_header_list_size: ?u32 = null,
+    /// Effective unlimited/default value. Unlike an optional representation,
+    /// this can also be restored by a later SETTINGS update on the wire.
+    max_header_list_size: u32 = std.math.maxInt(u32),
     enable_connect_protocol: bool = false,
+
+    pub const defaults: LocalSettings = .{};
 
     fn validate(comptime self: LocalSettings) void {
         if (self.max_frame_size < h2.frame.default_max_frame_size or self.max_frame_size > h2.frame.max_frame_size)
             @compileError("high_level.http2 local_settings.max_frame_size must be in 16384..16777215");
     }
 
+    fn validateRuntime(self: LocalSettings) error{Protocol}!void {
+        if (self.max_frame_size < h2.frame.default_max_frame_size or self.max_frame_size > h2.frame.max_frame_size)
+            return error.Protocol;
+    }
+
+    fn normalized(self: LocalSettings, role: h2.Role) LocalSettings {
+        var result = self;
+        // RFC 9113 gives SETTINGS_ENABLE_PUSH no server-side enabling meaning;
+        // an explicit server value may only be zero. Canonicalize that role so
+        // high-level snapshots compare the actual wire/effective semantics.
+        if (role == .server) result.enable_push = false;
+        return result;
+    }
+
     fn streamLimits(self: LocalSettings, role: h2.Role) h2.streams.LocalLimits {
+        const value = self.normalized(role);
         return .{
-            .initial_window_size = self.initial_window_size,
-            .max_concurrent_streams = self.max_concurrent_streams,
-            .enable_push = role == .client and self.enable_push,
+            .initial_window_size = value.initial_window_size,
+            .max_concurrent_streams = value.max_concurrent_streams,
+            .enable_push = role == .client and value.enable_push,
         };
     }
 
-    fn encoded(self: LocalSettings, role: h2.Role, out: *[7]h2.settings.Setting) []const h2.settings.Setting {
+    fn encodedInitial(self: LocalSettings, role: h2.Role, out: *[7]h2.settings.Setting) []const h2.settings.Setting {
+        return diff(defaults.normalized(role), self.normalized(role), role, out) catch unreachable;
+    }
+
+    fn diff(
+        previous_raw: LocalSettings,
+        next_raw: LocalSettings,
+        role: h2.Role,
+        out: *[7]h2.settings.Setting,
+    ) error{Protocol}![]const h2.settings.Setting {
+        const previous = previous_raw.normalized(role);
+        const next = next_raw.normalized(role);
+        try next.validateRuntime();
+        if (previous.enable_connect_protocol and !next.enable_connect_protocol) return error.Protocol;
+
         var n: usize = 0;
-        if (self.header_table_size != 4096) {
-            out[n] = .{ .id = .header_table_size, .value = self.header_table_size };
+        if (next.header_table_size != previous.header_table_size) {
+            out[n] = .{ .id = .header_table_size, .value = next.header_table_size };
             n += 1;
         }
-        if (role == .client and !self.enable_push) {
-            out[n] = .{ .id = .enable_push, .value = 0 };
+        if (role == .client and next.enable_push != previous.enable_push) {
+            out[n] = .{ .id = .enable_push, .value = @intFromBool(next.enable_push) };
             n += 1;
         }
-        if (self.max_concurrent_streams != std.math.maxInt(u32)) {
-            out[n] = .{ .id = .max_concurrent_streams, .value = self.max_concurrent_streams };
+        if (next.max_concurrent_streams != previous.max_concurrent_streams) {
+            out[n] = .{ .id = .max_concurrent_streams, .value = next.max_concurrent_streams };
             n += 1;
         }
-        if (self.initial_window_size != 65_535) {
-            out[n] = .{ .id = .initial_window_size, .value = self.initial_window_size };
+        if (next.initial_window_size != previous.initial_window_size) {
+            out[n] = .{ .id = .initial_window_size, .value = next.initial_window_size };
             n += 1;
         }
-        if (self.max_frame_size != h2.frame.default_max_frame_size) {
-            out[n] = .{ .id = .max_frame_size, .value = self.max_frame_size };
+        if (next.max_frame_size != previous.max_frame_size) {
+            out[n] = .{ .id = .max_frame_size, .value = next.max_frame_size };
             n += 1;
         }
-        if (self.max_header_list_size) |limit| {
-            out[n] = .{ .id = .max_header_list_size, .value = limit };
+        if (next.max_header_list_size != previous.max_header_list_size) {
+            out[n] = .{ .id = .max_header_list_size, .value = next.max_header_list_size };
             n += 1;
         }
-        if (self.enable_connect_protocol) {
-            out[n] = .{ .id = .enable_connect_protocol, .value = 1 };
+        if (next.enable_connect_protocol != previous.enable_connect_protocol) {
+            out[n] = .{ .id = .enable_connect_protocol, .value = @intFromBool(next.enable_connect_protocol) };
             n += 1;
         }
         return out[0..n];
+    }
+
+    /// The receive-side policy that is safe while `next` is in flight. A peer
+    /// can apply a SETTINGS increase before its ACK reaches us, so expansions
+    /// must be accepted immediately; restrictions become authoritative only at
+    /// the synchronization point.
+    fn permissiveMerge(acknowledged_raw: LocalSettings, next_raw: LocalSettings, role: h2.Role) LocalSettings {
+        const acknowledged = acknowledged_raw.normalized(role);
+        const next = next_raw.normalized(role);
+        return .{
+            // HPACK table-size changes are explicitly synchronized at the
+            // SETTINGS ACK boundary (RFC 9113 Section 4.3.1), unlike ordinary
+            // receive-capacity expansions.
+            .header_table_size = acknowledged.header_table_size,
+            .enable_push = acknowledged.enable_push or next.enable_push,
+            .max_concurrent_streams = @max(acknowledged.max_concurrent_streams, next.max_concurrent_streams),
+            .initial_window_size = @max(acknowledged.initial_window_size, next.initial_window_size),
+            .max_frame_size = @max(acknowledged.max_frame_size, next.max_frame_size),
+            .max_header_list_size = @max(acknowledged.max_header_list_size, next.max_header_list_size),
+            .enable_connect_protocol = acknowledged.enable_connect_protocol or next.enable_connect_protocol,
+        };
     }
 };
 
@@ -96,6 +150,8 @@ pub fn Connection(comptime config: Config) type {
     if (config.header_block_bytes == 0) @compileError("high_level.http2 Connection header_block_bytes must be non-zero");
     if (config.scratch_bytes == 0) @compileError("high_level.http2 Connection scratch_bytes must be non-zero");
     if (config.frame_staging_bytes == 0) @compileError("high_level.http2 Connection frame_staging_bytes must be non-zero");
+    if (config.collected_fields == 0) @compileError("high_level.http2 Connection collected_fields must be non-zero");
+    if (config.collected_field_bytes == 0) @compileError("high_level.http2 Connection collected_field_bytes must be non-zero");
     if (config.outbound_fields < 5) @compileError("high_level.http2 Connection outbound_fields must be at least 5");
     config.local_settings.validate();
 
@@ -121,8 +177,11 @@ pub fn Connection(comptime config: Config) type {
             bootstrap: h2.Bootstrap,
             settings_sync: h2.session.SettingsSync = .{},
             local_settings_wire: [7]h2.settings.Setting = undefined,
-            initial_settings_ticket: ?h2.session.SettingsTicket = null,
-            local_settings_active: bool = false,
+            acknowledged_local_settings: LocalSettings = .{},
+            effective_local_settings: LocalSettings = .{},
+            pending_local_settings: ?LocalSettings = null,
+            pending_settings_ticket: ?h2.session.SettingsTicket = null,
+            initial_settings_acknowledged: bool = false,
             store: StreamStore = .{},
             collector: FieldCollector = .{},
             next_request_stream_id: u32 = 1,
@@ -177,6 +236,7 @@ pub fn Connection(comptime config: Config) type {
         };
         pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{NotServer};
         pub const SendTrailersError = h2.session.SendHeadersWithinPeerLimitError;
+        pub const SendLocalSettingsError = h2.session.SendSettingsError || error{ SettingsPending, NotStarted, LocalSettingsFlowControl };
         pub const ReceiveError = h2.bootstrap.Bootstrap.ReceiveError || error{ HeaderCollectionOverflow, LocalSettingsFlowControl, ReceiveFailed };
         pub const SendControlError = h2.session.SendSimpleControlError || h2.session.SendStreamControlError || h2.session.SendGoAwayError;
 
@@ -205,28 +265,26 @@ pub fn Connection(comptime config: Config) type {
         }
 
         fn initInPlace(storage: *Storage, allocator: std.mem.Allocator, endpoint_role: h2.Role, owns_storage: bool) Self {
-            // A reduction is not enforceable until the peer ACKs the initial
-            // SETTINGS; before that it may still legally encode with the RFC
-            // default table size. Increases are safe to accept eagerly.
-            storage.decoder = h2.hpack.Decoder.init(allocator, @max(@as(u32, 4096), config.local_settings.header_table_size));
-            if (config.local_settings.max_header_list_size) |limit| storage.decoder.setMaxHeaderListSize(limit);
+            const defaults = LocalSettings.defaults.normalized(endpoint_role);
+            storage.decoder = h2.hpack.Decoder.init(allocator, defaults.header_table_size);
+            storage.decoder.setMaxHeaderListSize(defaults.max_header_list_size);
             storage.encoder = h2.hpack.Encoder.init(allocator, 4096);
             storage.bootstrap = h2.Bootstrap.init(endpoint_role);
             storage.settings_sync = .{};
+            storage.acknowledged_local_settings = defaults;
+            storage.effective_local_settings = defaults;
+            storage.pending_local_settings = null;
+            storage.pending_settings_ticket = null;
+            storage.initial_settings_acknowledged = false;
             storage.store = .{};
             storage.collector = .{};
             storage.next_request_stream_id = 1;
-            storage.initial_settings_ticket = null;
-            storage.local_settings_active = false;
             storage.connection_credit = h2.flow.ReceiveCredit.init(65_535, 32_767) catch unreachable;
             storage.receive_failed = false;
             storage.graceful_goaway = .{};
             storage.session = h2.Session.init(.{
                 .role = endpoint_role,
-                // Restrictions advertised by initial SETTINGS become binding
-                // only after their ACK. Until then the peer is entitled to the
-                // RFC defaults.
-                .local_limits = .{},
+                .local_limits = defaults.streamLimits(endpoint_role),
                 .decoder = &storage.decoder,
                 .encoder = &storage.encoder,
                 .header_storage = &storage.header_storage,
@@ -261,33 +319,88 @@ pub fn Connection(comptime config: Config) type {
             return &self.state.collector;
         }
 
-        pub inline fn settingsSync(self: *Self) *h2.session.SettingsSync {
-            return &self.state.settings_sync;
-        }
-
         pub inline fn peerHeaderListLimit(self: *const Self) ?u32 {
             return self.state.session.peerHeaderListLimit();
         }
 
-        pub inline fn localSettings(self: *const Self) LocalSettings {
-            _ = self;
-            return config.local_settings;
+        /// Initial SETTINGS target configured for this Connection type.
+        pub inline fn configuredInitialSettings(self: *const Self) LocalSettings {
+            return config.local_settings.normalized(self.role());
         }
 
-        /// Emits the local HTTP/2 connection preface and the initial SETTINGS
-        /// derived from `Config.local_settings`. There is no second settings
-        /// argument that can diverge from receive-side policy.
+        /// Oldest local SETTINGS snapshot whose application is confirmed by a
+        /// peer ACK. This is distinct from `effectiveLocalSettings()`: permissive
+        /// increases can become safe to receive before the synchronization ACK.
+        pub inline fn acknowledgedLocalSettings(self: *const Self) LocalSettings {
+            return self.state.acknowledged_local_settings;
+        }
+
+        /// Receive-side policy currently accepted by the high-level wrapper.
+        /// While one SETTINGS frame is pending this is the permissive envelope
+        /// of the acknowledged and pending snapshots.
+        pub inline fn effectiveLocalSettings(self: *const Self) LocalSettings {
+            return self.state.effective_local_settings;
+        }
+
+        pub inline fn pendingLocalSettings(self: *const Self) ?LocalSettings {
+            return self.state.pending_local_settings;
+        }
+
+        /// Emits the local HTTP/2 connection preface and initial SETTINGS from
+        /// `Config.local_settings`. Expansions become receive-safe immediately;
+        /// restrictions become authoritative at the matching SETTINGS ACK.
         pub fn start(self: *Self, out: *std.Io.Writer) h2.bootstrap.Bootstrap.StartError!h2.session.SettingsTicket {
-            const items = config.local_settings.encoded(self.role(), &self.state.local_settings_wire);
+            const target = config.local_settings.normalized(self.role());
+            const items = config.local_settings.encodedInitial(self.role(), &self.state.local_settings_wire);
+            const permissive = LocalSettings.permissiveMerge(self.state.acknowledged_local_settings, target, self.role());
+            self.state.store.validateLocalInitialWindow(self.state.effective_local_settings.initial_window_size, permissive.initial_window_size) catch unreachable;
             const ticket = try self.state.bootstrap.start(&self.state.session, &self.state.settings_sync, out, items);
-            self.state.initial_settings_ticket = ticket;
+            self.applyEffectiveLocalSettings(permissive) catch unreachable;
+            self.state.pending_local_settings = target;
+            self.state.pending_settings_ticket = ticket;
             return ticket;
         }
 
-        /// True once the peer has acknowledged the initial local SETTINGS and
-        /// their restrictive receive-side policy has become active.
-        pub inline fn localSettingsActive(self: *const Self) bool {
-            return self.state.local_settings_active;
+        /// Send a complete replacement snapshot after the previous local
+        /// SETTINGS has been acknowledged. Returns null when `next` is already
+        /// the acknowledged snapshot and therefore no wire frame is needed.
+        /// High-level composition deliberately serializes local SETTINGS updates;
+        /// use Session directly when multiple unacknowledged policy snapshots are
+        /// a requirement.
+        pub fn sendLocalSettings(
+            self: *Self,
+            out: *std.Io.Writer,
+            next_raw: LocalSettings,
+        ) SendLocalSettingsError!?h2.session.SettingsTicket {
+            if (!self.state.bootstrap.localPrefaceSent()) return error.NotStarted;
+            if (self.state.pending_local_settings != null or self.state.settings_sync.outstanding() != 0)
+                return error.SettingsPending;
+
+            const next = next_raw.normalized(self.role());
+            const items = LocalSettings.diff(self.state.acknowledged_local_settings, next, self.role(), &self.state.local_settings_wire) catch
+                return error.Protocol;
+            if (items.len == 0) return null;
+
+            const permissive = LocalSettings.permissiveMerge(self.state.acknowledged_local_settings, next, self.role());
+            self.state.store.validateLocalInitialWindow(self.state.effective_local_settings.initial_window_size, permissive.initial_window_size) catch
+                return error.LocalSettingsFlowControl;
+            // Also preflight the eventual synchronized restriction against the
+            // current records. DATA can still move windows while ACK is in
+            // flight; an impossible later transition remains fail-closed.
+            self.state.store.validateLocalInitialWindow(permissive.initial_window_size, next.initial_window_size) catch
+                return error.LocalSettingsFlowControl;
+
+            const ticket = try self.state.session.sendSettings(&self.state.settings_sync, out, items);
+            self.applyEffectiveLocalSettings(permissive) catch unreachable;
+            self.state.pending_local_settings = next;
+            self.state.pending_settings_ticket = ticket;
+            return ticket;
+        }
+
+        /// True once the initial connection-preface SETTINGS frame has been
+        /// acknowledged. Later runtime SETTINGS updates do not clear this flag.
+        pub inline fn initialSettingsAcknowledged(self: *const Self) bool {
+            return self.state.initial_settings_acknowledged;
         }
 
         /// Processes at most one event using the bundled stream store, scratch
@@ -298,7 +411,7 @@ pub fn Connection(comptime config: Config) type {
                 &self.state.session,
                 &self.state.store,
                 input,
-                config.local_settings.max_frame_size,
+                self.state.effective_local_settings.max_frame_size,
                 &self.state.scratch,
                 &self.state.collector,
             )) orelse return null;
@@ -320,11 +433,17 @@ pub fn Connection(comptime config: Config) type {
                 .settings => |applied| {
                     if (applied.ack) {
                         if (applied.acknowledge(&self.state.settings_sync)) |ticket| {
-                            if (!self.state.local_settings_active and self.state.initial_settings_ticket == ticket)
-                                self.activateLocalSettings() catch {
+                            if (self.state.pending_settings_ticket == ticket) {
+                                const target = self.state.pending_local_settings orelse unreachable;
+                                self.applyEffectiveLocalSettings(target) catch {
                                     self.state.receive_failed = true;
                                     return error.LocalSettingsFlowControl;
                                 };
+                                self.state.acknowledged_local_settings = target;
+                                self.state.pending_local_settings = null;
+                                self.state.pending_settings_ticket = null;
+                                self.state.initial_settings_acknowledged = true;
+                            }
                         }
                     } else control = .settings_ack;
                 },
@@ -477,10 +596,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         fn streamCreditPolicy(self: *const Self) struct { target: u31, low: u31 } {
-            const target: u31 = if (self.state.local_settings_active)
-                config.local_settings.initial_window_size
-            else
-                65_535;
+            const target = self.state.effective_local_settings.initial_window_size;
             return .{ .target = target, .low = if (target == 0) 0 else target / 2 };
         }
 
@@ -491,15 +607,17 @@ pub fn Connection(comptime config: Config) type {
             _ = self.state.store.setReceiveCredit(stream_id, credit);
         }
 
-        fn activateLocalSettings(self: *Self) error{FlowControl}!void {
-            if (self.state.local_settings_active) return;
-            const previous: u31 = 65_535;
-            try self.state.store.applyLocalInitialWindow(previous, config.local_settings.initial_window_size);
-            self.state.session.streams.local_limits = config.local_settings.streamLimits(self.role());
-            self.state.decoder.setAllowedMaxSize(config.local_settings.header_table_size);
-            const target = config.local_settings.initial_window_size;
+        fn applyEffectiveLocalSettings(self: *Self, next_raw: LocalSettings) error{FlowControl}!void {
+            const next = next_raw.normalized(self.role());
+            const previous = self.state.effective_local_settings;
+            if (previous.initial_window_size != next.initial_window_size)
+                try self.state.store.applyLocalInitialWindow(previous.initial_window_size, next.initial_window_size);
+            self.state.session.streams.local_limits = next.streamLimits(self.role());
+            self.state.decoder.setAllowedMaxSize(next.header_table_size);
+            self.state.decoder.setMaxHeaderListSize(next.max_header_list_size);
+            const target = next.initial_window_size;
             self.state.store.setReceiveCreditPolicy(target, if (target == 0) 0 else target / 2);
-            self.state.local_settings_active = true;
+            self.state.effective_local_settings = next;
         }
 
         /// Report DATA capacity released by the application after it has finished
@@ -686,7 +804,7 @@ test "high-level HTTP2 derives initial SETTINGS and receive limit from config" {
     });
     var client = try Conn.initClient(std.testing.allocator);
     defer client.deinit();
-    try std.testing.expectEqual(@as(u32, 32_768), client.localSettings().max_frame_size);
+    try std.testing.expectEqual(@as(u32, 32_768), client.configuredInitialSettings().max_frame_size);
 
     var storage: [256]u8 = undefined;
     var out = std.Io.Writer.fixed(&storage);
@@ -740,7 +858,7 @@ test "high-level HTTP2 activates restrictive local settings only after ACK" {
         true,
     );
 
-    try std.testing.expect(!client.localSettingsActive());
+    try std.testing.expect(!client.initialSettingsAcknowledged());
     try std.testing.expectEqual(@as(i32, 65_535), client.store().get(sent.stream_id).?.windows.receive.value);
     try std.testing.expect(client.core().streams.local_limits.enable_push);
     try std.testing.expectEqual(std.math.maxInt(u32), client.core().streams.local_limits.max_concurrent_streams);
@@ -748,15 +866,181 @@ test "high-level HTTP2 activates restrictive local settings only after ACK" {
     var peer_settings: [9]u8 = undefined;
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
     _ = (try client.receive(&peer_settings)).?;
-    try std.testing.expect(!client.localSettingsActive());
+    try std.testing.expect(!client.initialSettingsAcknowledged());
 
     var ack: [9]u8 = undefined;
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0x01, .stream_id = 0 }).encode(&ack);
     _ = (try client.receive(&ack)).?;
-    try std.testing.expect(client.localSettingsActive());
+    try std.testing.expect(client.initialSettingsAcknowledged());
     try std.testing.expectEqual(@as(i32, 32_768), client.store().get(sent.stream_id).?.windows.receive.value);
     try std.testing.expect(!client.core().streams.local_limits.enable_push);
     try std.testing.expectEqual(@as(u32, 0), client.core().streams.local_limits.max_concurrent_streams);
+}
+
+test "high-level HTTP2 accepts permissive initial SETTINGS before ACK" {
+    const Conn = Connection(.{
+        .max_streams = 4,
+        .header_block_bytes = 512,
+        .scratch_bytes = 512,
+        .frame_staging_bytes = 512,
+        .collected_fields = 8,
+        .collected_field_bytes = 256,
+        .outbound_fields = 8,
+        .local_settings = .{
+            .header_table_size = 8192,
+            .enable_push = false,
+            .max_concurrent_streams = 0,
+            .initial_window_size = 131_070,
+            .max_frame_size = 32_768,
+            .max_header_list_size = 1024,
+        },
+    });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var outbound_storage: [2048]u8 = undefined;
+    var outbound = std.Io.Writer.fixed(&outbound_storage);
+    _ = try client.start(&outbound);
+
+    const acknowledged = client.acknowledgedLocalSettings();
+    const effective = client.effectiveLocalSettings();
+    try std.testing.expectEqual(@as(u31, 65_535), acknowledged.initial_window_size);
+    try std.testing.expectEqual(@as(u31, 131_070), effective.initial_window_size);
+    try std.testing.expectEqual(@as(u32, 32_768), effective.max_frame_size);
+    // HPACK maximum changes are synchronized specifically at ACK, while these
+    // restrictive settings remain at their defaults until then.
+    try std.testing.expectEqual(@as(u32, 4096), effective.header_table_size);
+    try std.testing.expectEqual(std.math.maxInt(u32), effective.max_concurrent_streams);
+    try std.testing.expectEqual(std.math.maxInt(u32), effective.max_header_list_size);
+    try std.testing.expect(effective.enable_push);
+
+    const request = try client.sendRequest(
+        &outbound,
+        h2.message.RequestFields.init("GET", "https", "example.com", "/"),
+        &.{},
+        true,
+    );
+    try std.testing.expectEqual(@as(i32, 131_070), client.store().get(request.stream_id).?.windows.receive.value);
+
+    var peer_settings: [9]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
+    _ = (try client.receive(&peer_settings)).?;
+    var ack: [9]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0x01, .stream_id = 0 }).encode(&ack);
+    _ = (try client.receive(&ack)).?;
+
+    try std.testing.expect(client.initialSettingsAcknowledged());
+    try std.testing.expectEqual(@as(u32, 8192), client.acknowledgedLocalSettings().header_table_size);
+    try std.testing.expectEqual(@as(u32, 0), client.acknowledgedLocalSettings().max_concurrent_streams);
+    try std.testing.expectEqual(@as(u32, 1024), client.effectiveLocalSettings().max_header_list_size);
+    try std.testing.expect(!client.effectiveLocalSettings().enable_push);
+}
+
+test "high-level HTTP2 serializes runtime local SETTINGS updates" {
+    const Conn = Connection(.{
+        .max_streams = 4,
+        .header_block_bytes = 512,
+        .scratch_bytes = 512,
+        .frame_staging_bytes = 512,
+        .collected_fields = 8,
+        .collected_field_bytes = 256,
+        .outbound_fields = 8,
+    });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var startup_storage: [1024]u8 = undefined;
+    var startup = std.Io.Writer.fixed(&startup_storage);
+    _ = try client.start(&startup);
+
+    var peer_settings: [9]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
+    _ = (try client.receive(&peer_settings)).?;
+    var ack: [9]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0x01, .stream_id = 0 }).encode(&ack);
+    _ = (try client.receive(&ack)).?;
+    try std.testing.expect(client.initialSettingsAcknowledged());
+    try std.testing.expect(client.pendingLocalSettings() == null);
+
+    const request = try client.sendRequest(
+        &startup,
+        h2.message.RequestFields.init("GET", "https", "example.com", "/settings"),
+        &.{},
+        false,
+    );
+    try std.testing.expectEqual(@as(i32, 65_535), client.store().get(request.stream_id).?.windows.receive.value);
+
+    const restrictive: LocalSettings = .{
+        .header_table_size = 2048,
+        .enable_push = false,
+        .max_concurrent_streams = 4,
+        .initial_window_size = 131_070,
+        .max_frame_size = 32_768,
+        .max_header_list_size = 1024,
+    };
+    var update_storage: [256]u8 = undefined;
+    var update = std.Io.Writer.fixed(&update_storage);
+    const ticket = (try client.sendLocalSettings(&update, restrictive)).?;
+    try std.testing.expect(ticket > 0);
+    try std.testing.expect(client.pendingLocalSettings() != null);
+
+    const before_ack = client.effectiveLocalSettings();
+    try std.testing.expectEqual(@as(u31, 131_070), before_ack.initial_window_size);
+    try std.testing.expectEqual(@as(u32, 32_768), before_ack.max_frame_size);
+    try std.testing.expectEqual(@as(u32, 4096), before_ack.header_table_size);
+    try std.testing.expectEqual(std.math.maxInt(u32), before_ack.max_concurrent_streams);
+    try std.testing.expectEqual(std.math.maxInt(u32), before_ack.max_header_list_size);
+    try std.testing.expect(before_ack.enable_push);
+    try std.testing.expectEqual(@as(i32, 131_070), client.store().get(request.stream_id).?.windows.receive.value);
+
+    var blocked_storage: [64]u8 = undefined;
+    var blocked = std.Io.Writer.fixed(&blocked_storage);
+    try std.testing.expectError(error.SettingsPending, client.sendLocalSettings(&blocked, .{}));
+    try std.testing.expectEqual(@as(usize, 0), blocked.end);
+
+    _ = (try client.receive(&ack)).?;
+    try std.testing.expect(client.pendingLocalSettings() == null);
+    try std.testing.expectEqual(restrictive, client.acknowledgedLocalSettings());
+    try std.testing.expectEqual(restrictive, client.effectiveLocalSettings());
+
+    const relaxed: LocalSettings = .{
+        .header_table_size = 8192,
+        .enable_push = true,
+        .max_concurrent_streams = 100,
+        .initial_window_size = 65_535,
+        .max_frame_size = 32_768,
+        .max_header_list_size = std.math.maxInt(u32),
+    };
+    var relax_storage: [256]u8 = undefined;
+    var relax = std.Io.Writer.fixed(&relax_storage);
+    _ = (try client.sendLocalSettings(&relax, relaxed)).?;
+    const relaxed_pending = client.effectiveLocalSettings();
+    // Relaxations are receive-safe immediately. HPACK and the smaller stream
+    // window remain synchronized at ACK.
+    try std.testing.expectEqual(@as(u32, 100), relaxed_pending.max_concurrent_streams);
+    try std.testing.expectEqual(std.math.maxInt(u32), relaxed_pending.max_header_list_size);
+    try std.testing.expect(relaxed_pending.enable_push);
+    try std.testing.expectEqual(@as(u32, 2048), relaxed_pending.header_table_size);
+    try std.testing.expectEqual(@as(u31, 131_070), relaxed_pending.initial_window_size);
+
+    var frames = h2.frame.CompleteIterator.init(relax.buffered(), h2.frame.default_max_frame_size);
+    const update_frame = (try frames.next()).?;
+    var settings_it = try h2.settings.Iterator.init(update_frame.payload);
+    var restored_header_limit = false;
+    while (settings_it.next()) |setting| {
+        if (setting.id == .max_header_list_size)
+            restored_header_limit = setting.value == std.math.maxInt(u32);
+    }
+    try std.testing.expect(restored_header_limit);
+
+    _ = (try client.receive(&ack)).?;
+    try std.testing.expectEqual(relaxed, client.effectiveLocalSettings());
+    try std.testing.expectEqual(@as(i32, 65_535), client.store().get(request.stream_id).?.windows.receive.value);
+
+    var noop_storage: [32]u8 = undefined;
+    var noop = std.Io.Writer.fixed(&noop_storage);
+    try std.testing.expect((try client.sendLocalSettings(&noop, relaxed)) == null);
+    try std.testing.expectEqual(@as(usize, 0), noop.end);
 }
 
 test "high-level HTTP2 reports and emits mandatory control responses" {
