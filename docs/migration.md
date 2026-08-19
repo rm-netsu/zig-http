@@ -5,7 +5,14 @@ rather than carrying aliases indefinitely. Release notes remain authoritative;
 this document highlights source-level migration patterns.
 
 
-## 0.19.x development after 0.19.0
+## 0.19.x to 0.20.x
+
+High-level cancellation is now explicit. HTTP/1 clients can call `cancelRequestBody()` to abandon an unfinished outbound body; because HTTP/1 has no stream reset, the connection becomes non-reusable while the already queued response context remains available to drain. HTTP/2 clients can call `cancelRequest(out, stream_id)`, which sends `RST_STREAM(CANCEL)` and reclaims the bounded stream slot only after a successful write.
+
+HTTP/2 high-level drain/scheduling code can use `activeLocalStreams()`, `activeRemoteStreams()`, `activeStreams()`, `retainedStreams()`, and `streamsDrained()` instead of inspecting the bundled Session/store directly. The existing `resetStream()` + explicit `reclaimStream()` path remains the lower-level choice when an application wants to retain a closed record after reset.
+
+
+### Additional 0.20.0 lifecycle changes
 
 High-level transport EOF handling is now explicit and fail-closed. HTTP/1
 `finishReceive()` latches `failed` on truncated EOF and treats clean EOF as a

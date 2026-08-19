@@ -48,6 +48,10 @@ open the gate without giving the HTTP package timer ownership. Other 1xx respons
 do not open the gate. A final response received before the request content is
 finished suppresses the remaining content and makes that HTTP/1 transport
 non-reusable so unsent bytes cannot become a later-message framing ambiguity.
+Applications can make the same transition explicitly with `cancelRequestBody()`
+when a timeout or user cancellation occurs before the body is complete. HTTP/1
+has no per-request reset frame, so cancellation intentionally preserves the
+queued response context while making the transport non-reusable.
 `MessageWriter.beginRequest()` also rejects generation of `100-continue` when
 request framing indicates no content, before any wire byte is written.
 
