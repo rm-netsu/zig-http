@@ -98,6 +98,8 @@ test "1.0 candidate composed API surface remains present" {
             "mustClose",
             "lifecycle",
             "peerCloseRequired",
+            "continuePhase",
+            "proceedWithoutContinue",
         };
         for (h1_required) |name| if (!@hasDecl(H1, name))
             @compileError("missing 1.0-candidate high-level HTTP/1 API: " ++ name);
@@ -126,6 +128,7 @@ test "1.0 candidate composed API surface remains present" {
             "peerGoAwayLastStreamId",
             "localGoAwayLastStreamId",
             "unprocessedByPeer",
+            "canOpenRequest",
             "receive",
             "drain",
             "acknowledgedLocalSettings",
@@ -151,7 +154,8 @@ test "1.0 candidate composed API surface remains present" {
         if (!@hasDecl(http1.ConnectionDecoder, "feed"))
             @compileError("missing 1.0-candidate HTTP/1 ConnectionDecoder.feed");
         if (!@hasDecl(http1.MessageWriter, "beginRequest") or
-            !@hasDecl(http1.MessageWriter, "beginResponse"))
-            @compileError("missing 1.0-candidate HTTP/1 MessageWriter begin APIs");
+            !@hasDecl(http1.MessageWriter, "beginResponse") or
+            !@hasDecl(http1.MessageWriter, "abandonBody"))
+            @compileError("missing 1.0-candidate HTTP/1 MessageWriter begin/abandon APIs");
     }
 }

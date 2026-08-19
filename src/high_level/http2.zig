@@ -238,11 +238,16 @@ pub fn Connection(comptime config: Config) type {
 
         pub const SendRequestError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{
             NotClient,
+            NotStarted,
+            ConnectionDraining,
+            ConnectionFailed,
             StreamIdExhausted,
         };
-        pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{NotServer};
-        pub const SendTrailersError = h2.session.SendHeadersWithinPeerLimitError;
-        pub const SendLocalSettingsError = h2.session.SendSettingsError || error{ SettingsPending, NotStarted, LocalSettingsFlowControl };
+        pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{ NotServer, ConnectionFailed };
+        pub const SendDataError = h2.session.SendDataError || error{ConnectionFailed};
+        pub const SendTrailersError = h2.session.SendHeadersWithinPeerLimitError || error{ConnectionFailed};
+        pub const SendPingError = h2.session.SendSimpleControlError || error{ConnectionFailed};
+        pub const SendLocalSettingsError = h2.session.SendSettingsError || error{ SettingsPending, NotStarted, ConnectionDraining, ConnectionFailed, LocalSettingsFlowControl };
         pub const ReceiveError = h2.bootstrap.Bootstrap.ReceiveError || error{ HeaderCollectionOverflow, LocalSettingsFlowControl, ReceiveFailed };
         pub const SendControlError = h2.session.SendSimpleControlError || h2.session.SendStreamControlError || h2.session.SendGoAwayError;
 
@@ -358,10 +363,26 @@ pub fn Connection(comptime config: Config) type {
         pub inline fn lifecycle(self: *const Self) Lifecycle {
             if (self.state.receive_failed or self.state.bootstrap.sendPoisoned() or self.state.session.sendPoisoned())
                 return .failed;
-            if (!self.state.bootstrap.active()) return .handshaking;
             if (self.state.session.peer.goAwayReceived() or self.state.session.streams.goAwaySent() or self.state.graceful_goaway.phase != .open)
                 return .draining;
+            if (!self.state.bootstrap.active()) return .handshaking;
             return .active;
+        }
+
+        fn applicationSendFailed(self: *const Self) bool {
+            return self.state.receive_failed or self.state.bootstrap.sendPoisoned() or self.state.session.sendPoisoned();
+        }
+
+        /// Whether a client may open another request stream. This becomes true
+        /// immediately after the local preface is emitted; clients do not need
+        /// to wait for the peer's initial SETTINGS before sending requests. It
+        /// becomes false after either GOAWAY direction or a terminal failure.
+        pub inline fn canOpenRequest(self: *const Self) bool {
+            if (self.role() != .client or self.applicationSendFailed()) return false;
+            if (!self.state.bootstrap.localPrefaceSent()) return false;
+            if (self.state.session.peer.goAwayReceived() or self.state.session.streams.goAwaySent()) return false;
+            if (self.state.graceful_goaway.phase != .open) return false;
+            return true;
         }
 
         pub inline fn peerGoAwayLastStreamId(self: *const Self) ?u31 {
@@ -406,6 +427,9 @@ pub fn Connection(comptime config: Config) type {
             next_raw: LocalSettings,
         ) SendLocalSettingsError!?h2.session.SettingsTicket {
             if (!self.state.bootstrap.localPrefaceSent()) return error.NotStarted;
+            if (self.applicationSendFailed()) return error.ConnectionFailed;
+            if (self.state.session.peer.goAwayReceived() or self.state.session.streams.goAwaySent() or self.state.graceful_goaway.phase != .open)
+                return error.ConnectionDraining;
             if (self.state.pending_local_settings != null or self.state.settings_sync.outstanding() != 0)
                 return error.SettingsPending;
 
@@ -550,6 +574,9 @@ pub fn Connection(comptime config: Config) type {
             end_stream: bool,
         ) SendRequestError!SendRequestResult {
             if (self.role() != .client) return error.NotClient;
+            if (self.applicationSendFailed()) return error.ConnectionFailed;
+            if (!self.state.bootstrap.localPrefaceSent()) return error.NotStarted;
+            if (!self.canOpenRequest()) return error.ConnectionDraining;
             if (self.state.next_request_stream_id > std.math.maxInt(u31)) return error.StreamIdExhausted;
             const stream_id: u31 = @intCast(self.state.next_request_stream_id);
             const items = try request.build(&self.state.outbound, regular_fields);
@@ -586,6 +613,7 @@ pub fn Connection(comptime config: Config) type {
             end_stream: bool,
         ) SendResponseError!h2.session.SendHeadersResult {
             if (self.role() != .server) return error.NotServer;
+            if (self.applicationSendFailed()) return error.ConnectionFailed;
             const items = try response.build(&self.state.outbound, regular_fields);
             return if (config.enforce_peer_header_list_size)
                 self.state.session.sendHeadersWithinPeerLimit(
@@ -607,7 +635,8 @@ pub fn Connection(comptime config: Config) type {
                 );
         }
 
-        pub inline fn sendData(self: *Self, out: *std.Io.Writer, stream_id: u31, bytes: []const u8, end_stream: bool) h2.session.SendDataError!h2.session.SendDataResult {
+        pub fn sendData(self: *Self, out: *std.Io.Writer, stream_id: u31, bytes: []const u8, end_stream: bool) SendDataError!h2.session.SendDataResult {
+            if (self.applicationSendFailed()) return error.ConnectionFailed;
             return self.state.session.sendData(&self.state.store, out, stream_id, bytes, end_stream);
         }
 
@@ -620,6 +649,7 @@ pub fn Connection(comptime config: Config) type {
             items: []const h2.hpack.EncodedField,
             policy: anytype,
         ) SendTrailersError!h2.session.SendHeadersResult {
+            if (self.applicationSendFailed()) return error.ConnectionFailed;
             if (config.enforce_peer_header_list_size and self.state.session.diagnosePeerHeaderList(items) != null)
                 return error.PeerHeaderListTooLarge;
             return self.state.session.sendTrailers(&self.state.store, out, stream_id, &self.state.frame_staging, items, policy);
@@ -662,7 +692,8 @@ pub fn Connection(comptime config: Config) type {
             }
         }
 
-        pub inline fn sendPing(self: *Self, out: *std.Io.Writer, bytes: *const [8]u8) h2.session.SendSimpleControlError!void {
+        pub fn sendPing(self: *Self, out: *std.Io.Writer, bytes: *const [8]u8) SendPingError!void {
+            if (self.applicationSendFailed()) return error.ConnectionFailed;
             return self.state.session.sendPing(out, false, bytes);
         }
 
@@ -855,6 +886,8 @@ test "high-level HTTP2 honors peer header list limit before wire mutation" {
 
     var wire_storage: [512]u8 = undefined;
     var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try conn.start(&wire);
+    const before = wire.end;
     try std.testing.expectError(
         error.PeerHeaderListTooLarge,
         conn.sendRequest(
@@ -864,7 +897,7 @@ test "high-level HTTP2 honors peer header list limit before wire mutation" {
             true,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 0), wire.end);
+    try std.testing.expectEqual(before, wire.end);
     try std.testing.expect(conn.store().get(1) == null);
 }
 
@@ -1209,6 +1242,39 @@ test "high-level HTTP2 composes receive-credit release and WINDOW_UPDATE" {
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
+test "high-level HTTP2 request lifecycle is fail-closed before start and after local GOAWAY" {
+    const Conn = Connection(.{ .max_streams = 4, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var wire_storage: [2048]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    try std.testing.expect(!client.canOpenRequest());
+    try std.testing.expectError(
+        error.NotStarted,
+        client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/early"), &.{}, true),
+    );
+    try std.testing.expectEqual(@as(usize, 0), wire.end);
+
+    _ = try client.start(&wire);
+    try std.testing.expect(client.canOpenRequest());
+    // RFC 9113 permits request frames immediately after the client preface;
+    // waiting for the server's initial SETTINGS is not required.
+    const request = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/ok"), &.{}, true);
+    try std.testing.expectEqual(@as(u31, 1), request.stream_id);
+
+    try client.sendGoAway(&wire, 0, .no_error, "done");
+    try std.testing.expectEqual(Lifecycle.draining, client.lifecycle());
+    try std.testing.expect(!client.canOpenRequest());
+    const before = wire.end;
+    try std.testing.expectError(
+        error.ConnectionDraining,
+        client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/blocked"), &.{}, true),
+    );
+    try std.testing.expectEqual(before, wire.end);
+    try std.testing.expectError(error.ConnectionDraining, client.sendLocalSettings(&wire, .{}));
+}
+
 test "high-level HTTP2 exposes GOAWAY retry classification and lifecycle" {
     const Conn = Connection(.{ .max_streams = 8, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
     var client = try Conn.initClient(std.testing.allocator);
@@ -1246,7 +1312,7 @@ test "high-level HTTP2 exposes GOAWAY retry classification and lifecycle" {
     var blocked_storage: [256]u8 = undefined;
     var blocked = std.Io.Writer.fixed(&blocked_storage);
     try std.testing.expectError(
-        error.GoAway,
+        error.ConnectionDraining,
         client.sendRequest(&blocked, h2.message.RequestFields.init("GET", "https", "example.com", "/new"), &.{}, true),
     );
     try std.testing.expectEqual(@as(usize, 0), blocked.end);
@@ -1286,6 +1352,37 @@ test "high-level HTTP2 connection faults latch receive terminal state" {
     try server.sendControl(&control, control_action);
     const parsed = (try h2.frame.parseComplete(control.buffered(), h2.frame.default_max_frame_size)).?;
     try std.testing.expectEqual(h2.frame.Type.goaway, parsed.frame.header.type);
+
+    var blocked_storage: [256]u8 = undefined;
+    var blocked = std.Io.Writer.fixed(&blocked_storage);
+    var response = try h2.message.ResponseFields.init(204);
+    try std.testing.expectError(error.ConnectionFailed, server.sendResponse(&blocked, 1, &response, &.{}, true));
+    try std.testing.expectError(error.ConnectionFailed, server.sendData(&blocked, 1, "x", true));
+    const ping_bytes = [_]u8{0} ** 8;
+    try std.testing.expectError(error.ConnectionFailed, server.sendPing(&blocked, &ping_bytes));
+    try std.testing.expectError(error.ConnectionFailed, server.sendLocalSettings(&blocked, .{}));
+    try std.testing.expectEqual(@as(usize, 0), blocked.end);
+}
+
+test "high-level HTTP2 bounded stream store survives repeated open reset reclaim cycles" {
+    const Conn = Connection(.{ .max_streams = 1, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var wire_storage: [64 * 1024]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.start(&wire);
+    var expected_stream_id: u31 = 1;
+    var cycle: usize = 0;
+    while (cycle < 32) : (cycle += 1) {
+        const request = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/"), &.{}, false);
+        try std.testing.expectEqual(expected_stream_id, request.stream_id);
+        try client.resetStream(&wire, request.stream_id, .cancel);
+        try std.testing.expect(client.reclaimStream(request.stream_id));
+        try std.testing.expect(client.store().get(request.stream_id) == null);
+        expected_stream_id += 2;
+    }
+    try std.testing.expect(client.canOpenRequest());
 }
 
 test "high-level HTTP2 reclaims one closed stream without full-store scan" {
