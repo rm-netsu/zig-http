@@ -134,6 +134,7 @@ so they are kept in sync with the public API.
 Start with [`docs/README.md`](docs/README.md). The focused guides are:
 
 - [Architecture and composition levels](docs/architecture.md)
+- [API stability and 1.0 freeze policy](docs/stability.md)
 - [Basic TCP client/server composition](docs/basic-client-server.md)
 - [HTTP/1.1 composition](docs/http1.md)
 - [HTTP/2 composition](docs/http2.md)

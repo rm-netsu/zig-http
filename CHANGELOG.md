@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add synchronized runtime local SETTINGS updates to `high_level.http2.Connection`, with explicit configured/acknowledged/effective/pending snapshots and one bounded outstanding high-level policy update.
+- Correct local SETTINGS timing so receive-capacity expansions are accepted as soon as the peer can apply them, restrictive transitions wait for ACK, and HPACK table-size changes retain their RFC-defined ACK synchronization. Streams opened while an increased INITIAL_WINDOW_SIZE is in flight now receive the safe expanded window.
+- Make high-level `LocalSettings.max_header_list_size` a concrete `u32` defaulting to `maxInt(u32)`, allowing runtime policy to restore the largest wire-representable header-list limit without an ambiguous optional state.
+- Add preflight validation for fixed-store initial-window transitions before a peer-visible SETTINGS write, plus regression coverage for restrictive/permissive updates, ACK ordering, no-op updates, and header-limit restoration.
+- Add a compile-time smoke contract for the 1.0-candidate composed API and document explicit pre-1.0 stability tiers.
+- Add a compile-tested `http2_settings` example for initial and runtime high-level SETTINGS synchronization.
 - Split the runnable TCP integrations into independent HTTP/1.1 and cleartext prior-knowledge HTTP/2 server/client executables, with persistent server accept loops, explicit per-process build targets, and aggregate checks that compile rather than run the standalone servers. The examples retain pipelining/multiplexing, streaming bodies, HTTP/2 control responses and receive-credit handling.
 
 ## 0.19.0

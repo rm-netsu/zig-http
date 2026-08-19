@@ -26,6 +26,7 @@ These examples cover the optional convenience layer, direct protocol-core compos
   and emit a PRIORITY_UPDATE frame.
 - `http2_scheduler.zig` — apply caller-owned effective RFC 9218 priorities with
   the optional urgency/incremental reference scheduler.
+- `http2_settings.zig` — initial SETTINGS synchronization plus a runtime high-level local SETTINGS update without dropping to `Session`.
 - `error_handling.zig` — exhaustive peer-fault scope mapping plus HTTP/1 writer
   recovery-state checks; see `docs/operations.md` for the full operational model.
 - `support/counting_field_sink.zig` — minimal synchronous field-sink contract.

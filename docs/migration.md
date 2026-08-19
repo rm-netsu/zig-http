@@ -5,6 +5,34 @@ rather than carrying aliases indefinitely. Release notes remain authoritative;
 this document highlights source-level migration patterns.
 
 
+## 0.19.x development after 0.19.0
+
+The high-level HTTP/2 connection now owns runtime local SETTINGS updates rather
+than exposing its internal `SettingsSync`. `settingsSync()`, `localSettings()`,
+and `localSettingsActive()` are removed. Use `configuredInitialSettings()`,
+`acknowledgedLocalSettings()`, `effectiveLocalSettings()`,
+`pendingLocalSettings()`, and `initialSettingsAcknowledged()` instead. Send a
+new complete policy snapshot with `sendLocalSettings(out, next)`; high-level
+composition serializes updates and returns `SettingsPending` while one snapshot
+is awaiting ACK.
+
+`LocalSettings.max_header_list_size` is now a `u32` rather than `?u32`. The
+default is `std.math.maxInt(u32)`, which is both the largest value expressible by
+SETTINGS_MAX_HEADER_LIST_SIZE and a value that can be explicitly restored by a
+later runtime update. Replace `.max_header_list_size = null` with the default or
+`std.math.maxInt(u32)`.
+
+SETTINGS enforcement is now asymmetric around the ACK boundary. Receive-side
+expansions that the peer can use immediately after processing the frame are
+accepted immediately; restrictions wait for the matching ACK. HPACK table-size
+changes remain ACK-synchronized. This also fixes streams created while an
+increased INITIAL_WINDOW_SIZE is in flight.
+
+The project now documents explicit pre-1.0 stability tiers in
+[`stability.md`](stability.md), and the 1.0-candidate composed method families
+are covered by a compile-time smoke contract.
+
+
 ## 0.18.x to 0.19.x
 
 The pre-1.0 high-level APIs intentionally remove ambiguous compatibility forms.

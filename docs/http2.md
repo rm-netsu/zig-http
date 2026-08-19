@@ -20,20 +20,36 @@ const sent = try client.sendRequest(
 );
 ```
 
-The wrapper bundles HPACK encoder/decoder contexts, `Bootstrap`, `Session`,
-`SettingsSync`, `http2.storage.FixedStreamStore`, a copying transactional
-`FixedFieldCollector`, and bounded scratch/staging buffers. `Config.local_settings`
-is the single source of truth for the initial SETTINGS frame and receive-side
-frame/header/stream limits; `start(out)` no longer accepts a second settings list
-and `receive(input)` no longer takes a separately maintained max-frame value.
-Restrictive settings are synchronized correctly: the peer keeps the RFC defaults
-until the initial SETTINGS ticket is ACKed, then stream limits, reductions of the
-HPACK decoder table limit, and `SETTINGS_INITIAL_WINDOW_SIZE` are activated
-atomically for retained streams. Safe receive-side expansions such as a larger
-MAX_FRAME_SIZE can be accepted eagerly. `localSettingsActive()` exposes that
-boundary when application policy needs it. The ordinary constructors perform
-one connection-state allocation so the public handle is safely movable despite
-Session holding internal pointers. `Connection(config).Storage` plus
+The wrapper bundles HPACK encoder/decoder contexts, `Bootstrap`, `Session`, an
+internal `SettingsSync`, `http2.storage.FixedStreamStore`, a copying
+transactional `FixedFieldCollector`, and bounded scratch/staging buffers.
+`Config.local_settings` is the source of the initial SETTINGS frame and the
+associated receive policy; `start(out)` and `receive(input)` do not require a
+second caller-maintained settings/max-frame copy.
+
+Local SETTINGS are modeled as synchronized snapshots. `configuredInitialSettings()`
+reports the initial target, `acknowledgedLocalSettings()` reports the last target
+whose application the peer has ACKed, `effectiveLocalSettings()` reports what the
+receiver currently accepts, and `pendingLocalSettings()` exposes the optional
+in-flight target. Receive-capacity expansions such as a larger MAX_FRAME_SIZE,
+MAX_HEADER_LIST_SIZE, concurrency allowance, or initial stream window are made
+safe immediately after the SETTINGS write because the peer can apply them before
+its ACK reaches us. Restrictions become authoritative at the ACK. HPACK
+SETTINGS_HEADER_TABLE_SIZE changes are synchronized specifically at the ACK
+boundary as required by RFC 9113 compression-state rules.
+
+After the initial frame is acknowledged, `sendLocalSettings(out, next)` emits
+only changed setting values and owns the same synchronization policy. The
+high-level wrapper deliberately permits one unacknowledged local SETTINGS
+snapshot at a time; a second call returns `SettingsPending`. Applications that
+need multiple simultaneously outstanding local policy snapshots should use
+`Session.sendSettings()` with their own policy queue. `LocalSettings.max_header_list_size`
+uses `maxInt(u32)` as the wire-representable default/maximum rather than an
+optional value, allowing a later SETTINGS update to restore that maximum.
+
+The ordinary constructors perform one connection-state allocation so the public
+handle is safely movable despite Session holding internal pointers.
+`Connection(config).Storage` plus
 `initClientInPlace` / `initServerInPlace` instead places that fixed state in
 caller-owned stable memory; the supplied allocator is then used only by HPACK
 dynamic tables. Sockets, TLS, transport buffers, timers, and application
