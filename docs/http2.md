@@ -70,10 +70,12 @@ receive the client preface and even request HEADERS before calling `start()`; th
 keeps event-loop ordering flexible while ensuring its first local frame is still
 SETTINGS. Client requests may be sent immediately after `start()` without waiting
 for the peer's initial SETTINGS, matching HTTP/2 connection-preface rules.
-`canOpenRequest()` reports that exact request-stream condition. Once either endpoint
-has entered GOAWAY draining, new client requests and local SETTINGS policy updates
-fail with `ConnectionDraining`; existing streams may still send
-responses/data/trailers. Terminal receive/send poisoning fails ordinary
+`requestAvailability()` reports the exact reason new work is ready or blocked:
+connection lifecycle, peer `MAX_CONCURRENT_STREAMS`, bounded stream-store
+capacity, and stream-ID exhaustion are distinguished. `canOpenRequest()` is the
+boolean shorthand for `.ready`. Once either endpoint has entered GOAWAY/receive-EOF
+draining, new client requests and local SETTINGS policy updates fail with
+`ConnectionDraining`; existing streams may still send responses/data/trailers. Terminal receive/send poisoning fails ordinary
 application sends with `ConnectionFailed`, while `sendControl()` remains available
 after start to serialize a required terminal GOAWAY.
 
@@ -88,9 +90,14 @@ remains inspectable. `reclaimStream(id)` removes one known-closed record without
 full bounded-store scan; `reclaimClosed()` remains convenient for batch cleanup.
 
 `lifecycle()` reports `handshaking`, `active`, `draining`, or `failed`. Either a
-received or locally sent GOAWAY enters `draining`; terminal receive/decode failures
-are latched as `failed` so a later call cannot accidentally resume frame parsing.
-For client retry policy, `peerGoAwayLastStreamId()` exposes the received cutoff and
+received/locally sent GOAWAY or a clean peer receive-EOF enters `draining`;
+terminal receive/decode failures are latched as `failed` so a later call cannot
+accidentally resume frame parsing. At transport EOF, call
+`finishReceive(pending_input)` with any bytes that the final `receive()` could not
+consume. A partial connection preface/frame or an unfinished HEADERS/CONTINUATION
+block returns `UnexpectedEof` and latches `failed`; a clean boundary sets
+`peerReceiveClosed()` and forbids new requests while still allowing an endpoint
+to finish already accepted streams on a half-closed transport. For client retry policy, `peerGoAwayLastStreamId()` exposes the received cutoff and
 `unprocessedByPeer(stream_id)` is true only when that cutoff proves a locally
 initiated stream was not processed by the peer. This classification says nothing
 about whether the application method itself is safe to retry.

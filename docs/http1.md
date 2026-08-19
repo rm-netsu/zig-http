@@ -91,6 +91,13 @@ and closes rather than trying to reuse an ambiguous connection. Any later
 outstanding pipeline entries remain visible through `pendingResponses()` so
 application retry/idempotency policy can decide what to do with them.
 
+Call `finishReceive()` exactly when the transport read side reaches EOF. A
+truncated head/fixed/chunked message now latches high-level `failed` instead of
+leaving an apparently reusable connection. Clean EOF is still a persistence
+boundary: the connection becomes closing, and a server with already parsed
+pipelined requests marks only the last queued response as closing so earlier
+responses can still be emitted in order.
+
 Use `http.http1.ConnectionDecoder` and `http.http1.MessageWriter` directly when
 your runtime already owns the request/response queue or wants independent
 receive/send composition.

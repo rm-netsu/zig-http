@@ -7,6 +7,20 @@ this document highlights source-level migration patterns.
 
 ## 0.19.x development after 0.19.0
 
+High-level transport EOF handling is now explicit and fail-closed. HTTP/1
+`finishReceive()` latches `failed` on truncated EOF and treats clean EOF as a
+non-reusable connection boundary; servers preserve already parsed pipeline order
+and force only the final queued response to close. HTTP/2 adds
+`finishReceive(pending_input)` / `peerReceiveClosed()`: pass any bytes that the
+last `receive()` could not consume, otherwise a partial frame or unfinished
+CONTINUATION block cannot be distinguished from clean EOF. Clean HTTP/2 EOF
+enters `draining`; truncated EOF enters `failed`.
+
+`canOpenRequest()` is now backed by `requestAvailability()`, which also reports
+peer-concurrency and bounded-store backpressure plus stream-ID exhaustion. Code
+that needs to schedule fairly should switch on `requestAvailability()` rather
+than treating every false result as GOAWAY.
+
 High-level terminal send/receive ordering is stricter. HTTP/1 clients now latch a terminal high-level receive failure when a structurally valid `101` selects an unoffered protocol; `protocolSwitched()` stays false, `lifecycle()` reports `failed`, and client `writeData()` / `finish()` return `ConnectionFailed`. Subsequent receive calls return `ReceiveFailed`; close the transport.
 
 For HTTP/2, `start(out)` is now the only operation allowed to emit the local connection preface. `sendResponse`, `sendData`, `sendTrailers`, `sendPing`, non-empty `sendControl`, receive-credit flushes, stream resets, GOAWAY, and graceful-GOAWAY helpers return `NotStarted` until initial SETTINGS has been emitted. A server may still call `receive()` before `start()`; it must call `start()` before serializing any response/control frame. `controlForReceiveError()` returns `.none` for failures that occur before local start, because a GOAWAY cannot precede the mandatory initial SETTINGS frame.

@@ -48,9 +48,11 @@ responses keep that context; the final response releases it.
 ## High-level transport lifecycle
 
 At the composed layer, prefer the high-level lifecycle query before returning a
-transport to a pool. HTTP/1 reports `closing` for either locally selected or
-peer-selected close semantics; HTTP/2 reports `draining` once GOAWAY is sent or
-received and `failed` after a terminal composed receive/decode failure. These
+transport to a pool. HTTP/1 reports `closing` for either locally selected,
+peer-selected, or clean transport-EOF close semantics and `failed` for truncated
+EOF. HTTP/2 reports `draining` once GOAWAY is sent/received or the peer read side
+closes cleanly, and `failed` after a terminal composed receive/decode/truncated-EOF
+failure. These
 queries summarize protocol state only; the application still owns the actual
 socket close and retry policy.
 
@@ -67,6 +69,12 @@ has already been emitted. Before `start()`, the helper returns `.none`; close th
 transport rather than sending an out-of-order HTTP/2 control frame. All other
 high-level HTTP/2 frame-emitting helpers likewise return `NotStarted` until the
 local preface has been serialized.
+
+When the transport read side reaches EOF, call the protocol-specific composed
+EOF hook before recycling state: `http1.Connection.finishReceive()` or
+`high_level.http2.Connection.finishReceive(pending_input)`. For HTTP/2, retain
+any bytes not consumed from the final read and pass them to the hook so a partial
+frame cannot be mistaken for a clean connection boundary.
 
 ## HTTP/1 send ownership
 

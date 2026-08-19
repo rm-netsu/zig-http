@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make composed transport EOF explicit and fail closed: HTTP/1 `finishReceive()` now latches truncated EOF as terminal and turns clean EOF into a non-reusable persistence boundary while preserving already parsed pipeline response order; HTTP/2 adds `finishReceive(pending_input)` / `peerReceiveClosed()` so partial prefaces/frames/CONTINUATION blocks cannot be mistaken for a clean half-close.
+- Add exact HTTP/2 `requestAvailability()` scheduling diagnostics for lifecycle, peer concurrency, bounded stream-store capacity, and stream-ID exhaustion; `canOpenRequest()` is now the `.ready` shorthand and `sendRequest()` returns the corresponding preflight error before field/HPACK work.
 - Make high-level HTTP/1 Upgrade receive validation terminal and fail closed: unsolicited or mismatched `101` responses now latch `Lifecycle.failed`, suppress protocol-switch reporting, prevent request-body writes, and make subsequent receive calls return `ReceiveFailed` instead of exposing the decoder's already-entered tunnel state.
 - Enforce HTTP/2 local connection-preface ordering across the whole high-level send surface: response/data/trailers/PING/control/WINDOW_UPDATE/RST_STREAM/GOAWAY helpers now reject pre-`start()` wire output with `NotStarted`, while receive-before-start remains supported for event-loop flexibility.
 - Prevent pre-start receive failures from suggesting an impossible out-of-order GOAWAY; `controlForReceiveError()` returns `.none` until the local initial SETTINGS frame has been emitted.

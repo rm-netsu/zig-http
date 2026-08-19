@@ -168,13 +168,38 @@ fn serveConnection(io: std.Io, stream: *net.Stream) !void {
     try out.flush();
 
     // The client can still have SETTINGS ACK / WINDOW_UPDATE bytes in flight.
-    // Drain them before closing the TCP socket so the OS can finish with FIN
-    // instead of resetting a connection that still has unread inbound data.
-    var discard: [1024]u8 = undefined;
+    // Keep parsing them until receive EOF rather than discarding protocol bytes;
+    // then report the exact remaining transport-buffer suffix to finishReceive().
     while (true) {
-        var destinations = [1][]u8{&discard};
-        const n = in.readVec(&destinations) catch break;
-        if (n == 0) break;
+        if (used == wire.len) return error.InputBufferTooSmall;
+        var destinations = [1][]u8{wire[used..]};
+        const n = in.readVec(&destinations) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        if (n == 0) {
+            try server.finishReceive(wire[0..used]);
+            break;
+        }
+        used += n;
+
+        var consumed: usize = 0;
+        while (consumed < used) {
+            const result = (try server.receive(wire[consumed..used])) orelse break;
+            if (result.consumed == 0 and result.event == null) break;
+            consumed += result.consumed;
+            try server.sendControl(out, result.control);
+            if (result.event) |event| switch (event) {
+                .fault => return error.ProtocolFault,
+                else => {},
+            };
+            try out.flush();
+        }
+        if (consumed != 0) {
+            const remaining = used - consumed;
+            std.mem.copyForwards(u8, wire[0..remaining], wire[consumed..used]);
+            used = remaining;
+        }
     }
 }
 

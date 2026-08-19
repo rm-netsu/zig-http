@@ -130,10 +130,11 @@ _ = try conn.flushReceiveCredit(out, data.stream_id);
 
 This prevents flow-control credit from getting ahead of actual body processing.
 
-The finite server drains already-sent peer control bytes after its final GOAWAY
-before closing TCP. That avoids turning an otherwise clean close into a reset
-when SETTINGS ACK or WINDOW_UPDATE bytes are still unread in the kernel receive
-queue.
+The finite server keeps parsing already-sent peer control bytes after its final
+GOAWAY, then calls `finishReceive(pending_input)` at TCP EOF. This both avoids
+turning an otherwise clean close into a reset while SETTINGS ACK/WINDOW_UPDATE
+bytes are still unread and proves that no partial HTTP/2 frame was silently
+discarded at the transport boundary.
 
 ## Build/check behavior
 
