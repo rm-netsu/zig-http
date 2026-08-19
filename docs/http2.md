@@ -68,13 +68,30 @@ for synchronization, then `HeaderCollectionOverflow` is returned and subsequent
 receive calls return `ReceiveFailed`; discard that high-level connection. The
 low-level transactional collector still exposes `overflowed()` for diagnostic or
 proxy integrations that intentionally manage this case themselves. Closed entries
-are retained until the application explicitly calls `reclaimClosed()`, so final
-stream state remains inspectable.
+are retained until the application explicitly reclaims them, so final stream state
+remains inspectable. `reclaimStream(id)` removes one known-closed record without a
+full bounded-store scan; `reclaimClosed()` remains convenient for batch cleanup.
+
+`lifecycle()` reports `handshaking`, `active`, `draining`, or `failed`. Either a
+received or locally sent GOAWAY enters `draining`; terminal receive/decode failures
+are latched as `failed` so a later call cannot accidentally resume frame parsing.
+For client retry policy, `peerGoAwayLastStreamId()` exposes the received cutoff and
+`unprocessedByPeer(stream_id)` is true only when that cutoff proves a locally
+initiated stream was not processed by the peer. This classification says nothing
+about whether the application method itself is safe to retry.
 
 Every receive result also carries a transport-neutral `control` action. Non-ACK
-SETTINGS, non-ACK PING, and protocol faults therefore do not require applications
-to reconstruct the mandatory response. Pass the action to `sendControl(out,
-action)` when the transport is writable. No receive call writes implicitly.
+SETTINGS, non-ACK PING, and protocol faults that reach Session as semantic events
+therefore do not require applications to reconstruct the mandatory response. Pass
+the action to `sendControl(out, action)` when the transport is writable. No receive
+call writes implicitly.
+
+Errors raised before an Event can be produced (for example malformed frame headers
+or connection preface) latch the high-level receive side as failed.
+`controlForReceiveError(err)` maps RFC-defined peer faults such as FRAME_SIZE,
+PROTOCOL, and HPACK compression failures to a GOAWAY action; local resource/policy
+failures map to `.none` so the application closes without incorrectly blaming the
+peer.
 
 After consuming a DATA event, call `releaseData(data)` when the application has
 released the corresponding capacity. `flushReceiveCredit(out, stream_id)` emits

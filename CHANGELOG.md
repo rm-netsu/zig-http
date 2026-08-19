@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Make high-level HTTP/1 connection persistence symmetric with receive semantics: peer-selected `Connection: close`/HTTP/1.0 close now moves the composed connection to a closing lifecycle, prevents parsing/sending another HTTP message on that transport, and makes server final responses close the connection even when the application omitted an explicit `Connection: close`.
+- Add transport-facing high-level lifecycle reporting for HTTP/1 and HTTP/2, latch terminal HTTP/2 receive/decode failures, map terminal peer parse/compression errors to explicit GOAWAY actions, expose received/sent GOAWAY cutoffs and exact `unprocessedByPeer(stream_id)` retry classification, and add O(1)-targeted `reclaimStream(id)` for bounded stores.
+- Add deterministic high-level state-model coverage for HTTP/1 bounded pipeline wrap/reuse plus HTTP/2 GOAWAY/retry, terminal receive failure, and per-stream reclamation.
 - Add synchronized runtime local SETTINGS updates to `high_level.http2.Connection`, with explicit configured/acknowledged/effective/pending snapshots and one bounded outstanding high-level policy update.
 - Correct local SETTINGS timing so receive-capacity expansions are accepted as soon as the peer can apply them, restrictive transitions wait for ACK, and HPACK table-size changes retain their RFC-defined ACK synchronization. Streams opened while an increased INITIAL_WINDOW_SIZE is in flight now receive the safe expanded window.
 - Make high-level `LocalSettings.max_header_list_size` a concrete `u32` defaulting to `maxInt(u32)`, allowing runtime policy to restore the largest wire-representable header-list limit without an ambiguous optional state.

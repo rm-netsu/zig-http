@@ -67,6 +67,16 @@ one-event decoder and invokes `handler.onEvent(event)` synchronously; returning
 `http.high_level.DrainAction.stop` leaves the remaining input untouched. This preserves the ordinary
 borrowed-slice lifetime and avoids buffering an event batch.
 
+High-level persistence is also symmetric with the peer. `lifecycle()` reports
+`active`, `closing`, `switched`, or `failed`, and `peerCloseRequired()` exposes
+the received close decision directly. Once a closing request body completes, a
+server refuses to parse another pipelined request on that transport and forces
+the corresponding final response to close even if the application omitted a
+`Connection: close` field. A client that receives a closing final response stops
+opening or decoding another response on that transport; any later outstanding
+pipeline entries remain visible through `pendingResponses()` so application
+retry/idempotency policy can decide what to do with them.
+
 Use `http.http1.ConnectionDecoder` and `http.http1.MessageWriter` directly when
 your runtime already owns the request/response queue or wants independent
 receive/send composition.

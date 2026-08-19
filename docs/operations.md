@@ -45,6 +45,19 @@ In response mode, the outstanding request method is caller-owned. Call
 `beginResponse(method)` before feeding the corresponding response. Informational
 responses keep that context; the final response releases it.
 
+## High-level transport lifecycle
+
+At the composed layer, prefer the high-level lifecycle query before returning a
+transport to a pool. HTTP/1 reports `closing` for either locally selected or
+peer-selected close semantics; HTTP/2 reports `draining` once GOAWAY is sent or
+received and `failed` after a terminal composed receive/decode failure. These
+queries summarize protocol state only; the application still owns the actual
+socket close and retry policy.
+
+For an HTTP/2 receive error that terminates the composed connection before an
+Event exists, `controlForReceiveError(err)` can produce the corresponding GOAWAY
+when the failure has a peer-visible RFC error code.
+
 ## HTTP/1 send ownership
 
 `http1.MessageWriter` owns only send-side message state. It never owns or closes
