@@ -87,6 +87,11 @@ pub fn Connection(comptime config: Config) type {
                 return &self.items[self.first];
             }
 
+            fn lastPtr(self: *Queue) ?*PendingRequest {
+                if (self.len == 0) return null;
+                return &self.items[(self.first + self.len - 1) % config.max_in_flight];
+            }
+
             fn pop(self: *Queue) ?PendingRequest {
                 const value = self.peek() orelse return null;
                 self.first = (self.first + 1) % config.max_in_flight;
@@ -489,9 +494,29 @@ pub fn Connection(comptime config: Config) type {
             if (self.state.receive_failed) return error.ReceiveFailed;
             if (self.role() == .client and !self.state.decoder.responsePending()) {
                 if (self.state.pending.peek()) |pending|
-                    try self.state.decoder.beginResponse(pending.kind.canonicalMethod());
+                    self.state.decoder.beginResponse(pending.kind.canonicalMethod()) catch |err| {
+                        self.state.receive_failed = true;
+                        return err;
+                    };
             }
-            const event = try self.state.decoder.finish();
+            const event = self.state.decoder.finish() catch |err| {
+                // Transport EOF during a head or framed body is terminal. The
+                // low-level decoder intentionally does not mutate itself from
+                // finish(), so the composed layer must latch this boundary to
+                // prevent accidental reuse after a truncated peer message.
+                self.state.receive_failed = true;
+                return err;
+            };
+
+            // A clean receive EOF still makes this transport non-reusable even
+            // when it arrived exactly between messages. Servers may finish
+            // responses for requests already parsed before the FIN, but the
+            // final queued response must carry close semantics.
+            self.state.peer_close_required = true;
+            if (self.role() == .server) {
+                if (self.state.pending.lastPtr()) |pending| pending.close_after_response = true;
+            }
+
             if (self.role() == .client and !self.state.decoder.responsePending() and self.state.pending.len != 0)
                 _ = self.state.pending.pop().?;
             if (self.role() == .server and event != null) self.state.receive_at_message_start = true;
@@ -1036,4 +1061,56 @@ test "high-level HTTP1 partial request write does not publish pipeline state" {
         client.sendRequest(&retry, h1.message.RequestFields.origin("GET", "/", "example.com"), &.{}),
     );
     try std.testing.expectEqual(@as(usize, 0), retry.end);
+}
+
+test "high-level HTTP1 latches truncated transport EOF" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/", "example.com"), &.{});
+
+    try std.testing.expectError(error.UnexpectedEof, client.finishReceive());
+    try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());
+    try std.testing.expectError(error.ReceiveFailed, client.finishReceive());
+    try std.testing.expectError(
+        error.ConnectionFailed,
+        client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/again", "example.com"), &.{}),
+    );
+}
+
+test "high-level HTTP1 clean server EOF closes only final queued response" {
+    const Conn = Connection(.{ .head_bytes = 1024, .chunk_line_bytes = 128, .max_in_flight = 4, .outbound_fields = 8 });
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    const requests =
+        "GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n" ++
+        "GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    const Sink = struct {
+        pub fn onEvent(_: *@This(), _: h1.Event) DrainAction {
+            return .continue_;
+        }
+    };
+    var sink: Sink = .{};
+    const drained = try server.drain(requests, &sink);
+    try std.testing.expectEqual(requests.len, drained.consumed);
+    try std.testing.expectEqual(@as(usize, 2), server.pendingResponses());
+
+    try std.testing.expect((try server.finishReceive()) == null);
+    try std.testing.expect(server.peerCloseRequired());
+    try std.testing.expectEqual(Lifecycle.closing, server.lifecycle());
+
+    var wire_storage: [1024]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try server.sendResponse(&wire, .{ .status = 204, .reason = "No Content" }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), server.pendingResponses());
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, wire.buffered(), "connection: close"));
+
+    _ = try server.sendResponse(&wire, .{ .status = 204, .reason = "No Content" }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), server.pendingResponses());
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire.buffered(), "connection: close"));
+    try std.testing.expect(server.mustClose());
 }
