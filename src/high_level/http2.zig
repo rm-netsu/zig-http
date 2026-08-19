@@ -269,6 +269,7 @@ pub fn Connection(comptime config: Config) type {
         pub const SendControlError = h2.session.SendSimpleControlError || h2.session.SendStreamControlError || h2.session.SendGoAwayError || error{NotStarted};
         pub const ReceiveCreditError = h2.session.SendStreamControlError || error{ NotStarted, ConnectionFailed };
         pub const ResetStreamError = h2.session.SendStreamControlError || error{ NotStarted, ConnectionFailed };
+        pub const CancelRequestError = h2.session.SendStreamControlError || error{ NotClient, NotLocalRequest, NotStarted, ConnectionFailed };
         pub const SendGoAwayError = h2.session.SendGoAwayError || error{NotStarted};
         pub const GracefulGoAwayError = h2.session.SendGoAwayError || error{ NotStarted, ConnectionFailed };
 
@@ -430,6 +431,35 @@ pub fn Connection(comptime config: Config) type {
         /// new request stream should be opened.
         pub inline fn peerReceiveClosed(self: *const Self) bool {
             return self.state.peer_receive_closed;
+        }
+
+        /// Number of currently active locally initiated streams. Closed and
+        /// reserved records retained by the bounded store are not counted.
+        pub inline fn activeLocalStreams(self: *const Self) u32 {
+            return self.state.session.streams.activeLocal();
+        }
+
+        /// Number of currently active peer-initiated streams. This is the exact
+        /// protocol counter used for SETTINGS_MAX_CONCURRENT_STREAMS enforcement.
+        pub inline fn activeRemoteStreams(self: *const Self) u32 {
+            return self.state.session.streams.activeRemote();
+        }
+
+        pub inline fn activeStreams(self: *const Self) u32 {
+            return self.activeLocalStreams() + self.activeRemoteStreams();
+        }
+
+        /// Number of bounded stream records still retained, including closed
+        /// records that the application has not reclaimed yet.
+        pub inline fn retainedStreams(self: *const Self) usize {
+            return self.state.store.count();
+        }
+
+        /// Snapshot predicate for graceful-drain loops. This reports only
+        /// current protocol activity; an announced first-stage graceful GOAWAY
+        /// can still admit a later peer stream until the final cutoff is sent.
+        pub inline fn streamsDrained(self: *const Self) bool {
+            return self.activeStreams() == 0;
         }
 
         pub inline fn peerGoAwayLastStreamId(self: *const Self) ?u31 {
@@ -829,6 +859,21 @@ pub fn Connection(comptime config: Config) type {
         pub fn resetStream(self: *Self, out: *std.Io.Writer, stream_id: u31, code: h2.protocol.ErrorCode) ResetStreamError!void {
             try self.requireApplicationSend();
             return self.state.session.sendReset(&self.state.store, out, stream_id, code);
+        }
+
+        /// Cancel one locally initiated client request with RST_STREAM(CANCEL).
+        /// On a successful wire write the stream is already closed in Session;
+        /// the high-level bounded store is reclaimed immediately because no
+        /// further application event is needed for a locally initiated cancel.
+        /// Late peer frames remain classifiable from StreamManager high-water
+        /// state, so reclamation does not make the identifier look idle again.
+        pub fn cancelRequest(self: *Self, out: *std.Io.Writer, stream_id: u31) CancelRequestError!void {
+            if (self.role() != .client) return error.NotClient;
+            if (!self.state.session.streams.localInitiated(stream_id)) return error.NotLocalRequest;
+            try self.requireApplicationSend();
+            try self.state.session.sendReset(&self.state.store, out, stream_id, .cancel);
+            const reclaimed = self.state.store.removeClosed(stream_id);
+            std.debug.assert(reclaimed);
         }
 
         pub fn sendGoAway(self: *Self, out: *std.Io.Writer, last_stream_id: u31, code: h2.protocol.ErrorCode, debug_data: []const u8) SendGoAwayError!void {
@@ -1470,12 +1515,12 @@ test "high-level HTTP2 bounded stream store survives repeated open reset reclaim
     _ = try client.start(&wire);
     var expected_stream_id: u31 = 1;
     var cycle: usize = 0;
-    while (cycle < 32) : (cycle += 1) {
+    while (cycle < 128) : (cycle += 1) {
         const request = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/"), &.{}, false);
         try std.testing.expectEqual(expected_stream_id, request.stream_id);
-        try client.resetStream(&wire, request.stream_id, .cancel);
-        try std.testing.expect(client.reclaimStream(request.stream_id));
+        try client.cancelRequest(&wire, request.stream_id);
         try std.testing.expect(client.store().get(request.stream_id) == null);
+        try std.testing.expectEqual(@as(usize, 0), client.retainedStreams());
         expected_stream_id += 2;
     }
     try std.testing.expect(client.canOpenRequest());
@@ -1716,4 +1761,64 @@ test "high-level HTTP2 server may finish accepted streams after clean peer EOF" 
 
     var response = try h2.message.ResponseFields.init(204);
     _ = try server.sendResponse(&s2c, request.stream_id, &response, &.{}, true);
+}
+
+test "high-level HTTP2 cancelRequest sends CANCEL and immediately reclaims bounded state" {
+    const Conn = Connection(.{ .max_streams = 1, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var wire_storage: [4096]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.start(&wire);
+    const request = try client.sendRequest(&wire, h2.message.RequestFields.init("POST", "https", "example.com", "/cancel"), &.{}, false);
+    try std.testing.expectEqual(@as(u32, 1), client.activeLocalStreams());
+    try std.testing.expectEqual(@as(u32, 0), client.activeRemoteStreams());
+    try std.testing.expectEqual(@as(u32, 1), client.activeStreams());
+    try std.testing.expectEqual(@as(usize, 1), client.retainedStreams());
+    try std.testing.expectEqual(RequestAvailability.store_full, client.requestAvailability());
+
+    try client.cancelRequest(&wire, request.stream_id);
+    try std.testing.expectEqual(@as(u32, 0), client.activeLocalStreams());
+    try std.testing.expectEqual(@as(u32, 0), client.activeStreams());
+    try std.testing.expectEqual(@as(usize, 0), client.retainedStreams());
+    try std.testing.expectEqual(RequestAvailability.ready, client.requestAvailability());
+    try std.testing.expect(client.store().get(request.stream_id) == null);
+
+    const next = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/next"), &.{}, true);
+    try std.testing.expectEqual(@as(u31, 3), next.stream_id);
+}
+
+test "high-level HTTP2 cancelRequest rejects server role without wire mutation" {
+    const Conn = Connection(.{ .max_streams = 1, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try server.start(&wire);
+    const before = wire.end;
+    try std.testing.expectError(error.NotClient, server.cancelRequest(&wire, 1));
+    try std.testing.expectEqual(before, wire.end);
+}
+
+test "high-level HTTP2 failed cancel write preserves stream record and poisons sends" {
+    const Conn = Connection(.{ .max_streams = 1, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var setup_storage: [2048]u8 = undefined;
+    var setup = std.Io.Writer.fixed(&setup_storage);
+    _ = try client.start(&setup);
+    const request = try client.sendRequest(&setup, h2.message.RequestFields.init("POST", "https", "example.com", "/cancel"), &.{}, false);
+    try std.testing.expect(!client.streamsDrained());
+
+    var short_storage: [8]u8 = undefined;
+    var short = std.Io.Writer.fixed(&short_storage);
+    try std.testing.expectError(error.WriteFailed, client.cancelRequest(&short, request.stream_id));
+    try std.testing.expect(client.store().get(request.stream_id) != null);
+    try std.testing.expectEqual(@as(usize, 1), client.retainedStreams());
+    try std.testing.expectEqual(@as(u32, 1), client.activeStreams());
+    try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());
+    try std.testing.expectError(error.ConnectionFailed, client.sendData(&setup, request.stream_id, "x", false));
 }

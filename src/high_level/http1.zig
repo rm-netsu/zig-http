@@ -259,6 +259,19 @@ pub fn Connection(comptime config: Config) type {
             return false;
         }
 
+        /// Abort the currently serialized client request body without emitting
+        /// the remaining bytes. HTTP/1 cannot cancel an in-flight request while
+        /// preserving message framing, so this deliberately makes the transport
+        /// non-reusable. The already queued response context is retained so the
+        /// application may still drain a peer response before closing the socket.
+        /// Returns false when no request body is currently open.
+        pub fn cancelRequestBody(self: *Self) bool {
+            if (self.role() != .client) return false;
+            const cancelled = self.state.writer.abandonBody();
+            if (cancelled) self.state.client_continue_gate = null;
+            return cancelled;
+        }
+
         /// Serialize a typed client request and retain only the response-framing
         /// semantics needed when its ordered response arrives. Queue capacity is
         /// checked before any wire bytes are emitted.
@@ -1113,4 +1126,28 @@ test "high-level HTTP1 clean server EOF closes only final queued response" {
     try std.testing.expectEqual(@as(usize, 0), server.pendingResponses());
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire.buffered(), "connection: close"));
     try std.testing.expect(server.mustClose());
+}
+
+test "high-level HTTP1 client can explicitly cancel an unsent request body" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var length = h1.message.ContentLength.init(4);
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("POST", "/cancel", "example.com"), &.{length.header()});
+    try std.testing.expectEqual(Lifecycle.active, client.lifecycle());
+    try std.testing.expectEqual(@as(usize, 1), client.pendingResponses());
+
+    try std.testing.expect(client.cancelRequestBody());
+    try std.testing.expect(!client.cancelRequestBody());
+    try std.testing.expect(client.writer().mustClose());
+    try std.testing.expectEqual(Lifecycle.closing, client.lifecycle());
+    try std.testing.expectEqual(@as(usize, 1), client.pendingResponses());
+    try std.testing.expectError(error.InvalidState, client.writeData(&wire, "data"));
+    try std.testing.expectError(
+        error.ConnectionClosing,
+        client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/later", "example.com"), &.{}),
+    );
 }
