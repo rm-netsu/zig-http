@@ -109,6 +109,7 @@ pub fn Connection(comptime config: Config) type {
             receive_at_message_start: bool = true,
             sending_final_response: bool = false,
             peer_close_required: bool = false,
+            client_continue_gate: ?h1.semantics.ContinueGate = null,
         };
 
         pub const state_bytes = @sizeOf(Storage);
@@ -125,6 +126,8 @@ pub fn Connection(comptime config: Config) type {
             UpgradeOfferTooLarge,
             InvalidUpgradeRequest,
             ConnectionClosing,
+            ProtocolSwitched,
+            ConnectionFailed,
         };
         pub const SendResponseError = h1.MessageWriter.MessageError || error{
             NotServer,
@@ -135,7 +138,11 @@ pub fn Connection(comptime config: Config) type {
             ConnectionClosing,
             TooManyFields,
         };
-        pub const DataError = h1.MessageWriter.MessageError;
+        pub const DataError = h1.MessageWriter.MessageError || error{
+            ContinuePending,
+            RequestBodySuppressed,
+            ConnectionClosing,
+        };
 
         pub const DrainResult = hl_common.DrainResult;
 
@@ -172,6 +179,7 @@ pub fn Connection(comptime config: Config) type {
             storage.receive_at_message_start = true;
             storage.sending_final_response = false;
             storage.peer_close_required = false;
+            storage.client_continue_gate = null;
             storage.decoder = switch (endpoint_role) {
                 .client => h1.ConnectionDecoder.initResponse(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
                 .server => h1.ConnectionDecoder.initRequest(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
@@ -222,6 +230,25 @@ pub fn Connection(comptime config: Config) type {
             return self.state.peer_close_required;
         }
 
+        /// Current client-side `Expect: 100-continue` gate, when the active
+        /// outbound request has content whose transmission is intentionally
+        /// delayed. Informational responses other than 100 do not open it.
+        pub inline fn continuePhase(self: *const Self) ?h1.semantics.ContinueGate.Phase {
+            const gate = self.state.client_continue_gate orelse return null;
+            return gate.phase;
+        }
+
+        /// Stop waiting for 100 Continue after an application-selected timeout.
+        /// Returns false when no request is currently waiting on that gate.
+        pub fn proceedWithoutContinue(self: *Self) bool {
+            if (self.state.client_continue_gate) |*gate| {
+                if (!gate.waiting()) return false;
+                gate.proceedWithoutContinue();
+                return true;
+            }
+            return false;
+        }
+
         /// Serialize a typed client request and retain only the response-framing
         /// semantics needed when its ordered response arrives. Queue capacity is
         /// checked before any wire bytes are emitted.
@@ -232,9 +259,15 @@ pub fn Connection(comptime config: Config) type {
             regular_fields: []const common.Header,
         ) SendRequestError!h1.MessageWriter.BeginResult {
             if (self.role() != .client) return error.NotClient;
-            if (self.state.peer_close_required) return error.ConnectionClosing;
+            switch (self.lifecycle()) {
+                .active => {},
+                .closing => return error.ConnectionClosing,
+                .switched => return error.ProtocolSwitched,
+                .failed => return error.ConnectionFailed,
+            }
             if (self.state.pending.full()) return error.RequestQueueFull;
             const fields = try request.build(&self.state.outbound, regular_fields);
+            const expectation = try h1.semantics.requestExpectationFields(request.version, fields);
             var pending: PendingRequest = .{ .kind = request.kind() };
             const maybe_offer = h1.semantics.copyUpgradeOfferFields(request.version, fields, &pending.upgrade_bytes) catch |err| switch (err) {
                 error.BufferTooSmall => return error.UpgradeOfferTooLarge,
@@ -247,6 +280,10 @@ pub fn Connection(comptime config: Config) type {
             }
             const result = try self.state.writer.beginRequest(out, request.version, request.method, request.target, fields);
             if (!self.state.pending.push(pending)) unreachable;
+            self.state.client_continue_gate = if (!result.message_done and expectation == .continue_100)
+                h1.semantics.ContinueGate.init(expectation)
+            else
+                null;
             return result;
         }
 
@@ -295,7 +332,16 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn writeData(self: *Self, out: *std.Io.Writer, bytes: []const u8) DataError!h1.MessageWriter.DataResult {
+            if (self.role() == .client) {
+                if (self.state.peer_close_required) return error.ConnectionClosing;
+                if (self.state.client_continue_gate) |gate| switch (gate.phase) {
+                    .waiting => return error.ContinuePending,
+                    .final_received => return error.RequestBodySuppressed,
+                    .bypass, .body_allowed => {},
+                };
+            }
             const result = try self.state.writer.writeData(out, bytes);
+            if (self.role() == .client and result.message_done) self.state.client_continue_gate = null;
             if (self.role() == .server and self.state.sending_final_response and result.message_done) {
                 _ = self.state.pending.pop() orelse unreachable;
                 self.state.sending_final_response = false;
@@ -304,12 +350,24 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn finish(self: *Self, out: *std.Io.Writer, trailers: []const common.Header) DataError!void {
+            if (self.role() == .client and self.state.client_continue_gate) |gate| switch (gate.phase) {
+                .waiting => return error.ContinuePending,
+                .final_received => return error.RequestBodySuppressed,
+                .bypass, .body_allowed => {},
+            };
             try self.state.writer.finish(out, trailers);
+            if (self.role() == .client) self.state.client_continue_gate = null;
             self.finishServerResponseIfNeeded();
         }
 
         pub fn finishWithTrailerPolicy(self: *Self, out: *std.Io.Writer, trailers: []const common.Header, policy: anytype) DataError!void {
+            if (self.role() == .client and self.state.client_continue_gate) |gate| switch (gate.phase) {
+                .waiting => return error.ContinuePending,
+                .final_received => return error.RequestBodySuppressed,
+                .bypass, .body_allowed => {},
+            };
             try self.state.writer.finishWithTrailerPolicy(out, trailers, policy);
+            if (self.role() == .client) self.state.client_continue_gate = null;
             self.finishServerResponseIfNeeded();
         }
 
@@ -349,15 +407,29 @@ pub fn Connection(comptime config: Config) type {
                             .response => |value| value,
                             else => unreachable,
                         };
-                        if (!head_event.informational and head_event.persistence == .close)
+                        const current_body_response = !head_event.informational and self.state.pending.len == 1;
+                        if (self.state.client_continue_gate) |*gate| {
+                            if (self.state.pending.len == 1) gate.observeStatus(response.status);
+                        }
+                        if (!head_event.informational and head_event.persistence == .close) {
                             self.state.peer_close_required = true;
+                            _ = self.state.writer.abandonBody();
+                        } else if (current_body_response and self.state.writer.abandonBody()) {
+                            // A final response arrived before the request body
+                            // completed. Do not emit the missing bytes and make
+                            // the transport non-reusable to preserve framing.
+                        }
                         if (response.status == 101) {
                             const pending = self.state.pending.peekPtr() orelse return error.NoOutstandingRequest;
                             if (!pending.upgrade_offered) return error.UnexpectedUpgrade;
                             try h1.semantics.validateRetainedUpgradeSelection(pending.offer(), head_event.head);
                         }
                     }
-                    if (!self.state.decoder.responsePending()) _ = self.state.pending.pop() orelse unreachable;
+                    if (!self.state.decoder.responsePending()) {
+                        _ = self.state.pending.pop() orelse unreachable;
+                        if (self.state.pending.len == 0 and self.state.writer.ready())
+                            self.state.client_continue_gate = null;
+                    }
                 },
                 .server => switch (event) {
                     .head => |head_event| {
@@ -615,6 +687,80 @@ test "high-level HTTP1 client treats EOF before an outstanding response as trunc
     try std.testing.expectEqual(@as(usize, 1), conn.pendingResponses());
 }
 
+test "high-level HTTP1 client gates Expect 100 request content" {
+    const Conn = Connection(.{ .head_bytes = 1024, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var length = h1.message.ContentLength.init(4);
+    var request_storage: [512]u8 = undefined;
+    var request_wire = std.Io.Writer.fixed(&request_storage);
+    _ = try client.sendRequest(&request_wire, h1.message.RequestFields.origin("POST", "/upload", "example.com"), &.{
+        length.header(),
+        h1.message.expectContinue(),
+    });
+    try std.testing.expectEqual(h1.semantics.ContinueGate.Phase.waiting, client.continuePhase().?);
+    const before = request_wire.end;
+    try std.testing.expectError(error.ContinuePending, client.writeData(&request_wire, "data"));
+    try std.testing.expectEqual(before, request_wire.end);
+
+    _ = try client.receive("HTTP/1.1 103 Early Hints\r\n\r\n");
+    try std.testing.expectEqual(h1.semantics.ContinueGate.Phase.waiting, client.continuePhase().?);
+    _ = try client.receive("HTTP/1.1 100 Continue\r\n\r\n");
+    try std.testing.expectEqual(h1.semantics.ContinueGate.Phase.body_allowed, client.continuePhase().?);
+    const data = try client.writeData(&request_wire, "data");
+    try std.testing.expect(data.message_done);
+    try std.testing.expect(client.continuePhase() == null);
+
+    _ = try client.receive("HTTP/1.1 204 No Content\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 0), client.pendingResponses());
+    try std.testing.expectEqual(Lifecycle.active, client.lifecycle());
+}
+
+test "high-level HTTP1 client can time out Expect wait explicitly" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var length = h1.message.ContentLength.init(1);
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("POST", "/", "example.com"), &.{
+        length.header(),
+        h1.message.expectContinue(),
+    });
+    try std.testing.expect(client.proceedWithoutContinue());
+    try std.testing.expect(!client.proceedWithoutContinue());
+    try std.testing.expectEqual(h1.semantics.ContinueGate.Phase.body_allowed, client.continuePhase().?);
+    const data = try client.writeData(&wire, "x");
+    try std.testing.expect(data.message_done);
+}
+
+test "high-level HTTP1 early final suppresses unsent request body and closes" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var length = h1.message.ContentLength.init(4);
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("POST", "/", "example.com"), &.{
+        length.header(),
+        h1.message.expectContinue(),
+    });
+    _ = try client.receive("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n");
+    try std.testing.expectEqual(Lifecycle.closing, client.lifecycle());
+    try std.testing.expect(client.writer().mustClose());
+    try std.testing.expectEqual(h1.semantics.ContinueGate.Phase.final_received, client.continuePhase().?);
+    const before = wire.end;
+    try std.testing.expectError(error.RequestBodySuppressed, client.writeData(&wire, "data"));
+    try std.testing.expectEqual(before, wire.end);
+    try std.testing.expectError(
+        error.ConnectionClosing,
+        client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/later", "example.com"), &.{}),
+    );
+}
+
 test "high-level HTTP1 server requires 100 before 101 when Expect and Upgrade are combined" {
     const Conn = Connection(.{ .head_bytes = 1024, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
     var server = try Conn.initServer(std.testing.allocator);
@@ -714,6 +860,27 @@ test "high-level HTTP1 honors peer close and prevents pipeline reuse" {
     );
     try std.testing.expectEqual(@as(usize, 0), blocked.end);
     try std.testing.expectError(error.ConnectionClosing, client.receive("HTTP/1.1 204 No Content\r\n\r\n"));
+}
+
+test "high-level HTTP1 close response suppresses a later pipelined request body" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 3, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var length = h1.message.ContentLength.init(4);
+    var wire_storage: [1024]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/first", "example.com"), &.{});
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("POST", "/second", "example.com"), &.{length.header()});
+    try std.testing.expectEqual(@as(usize, 2), client.pendingResponses());
+
+    _ = try client.receive("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try std.testing.expectEqual(Lifecycle.closing, client.lifecycle());
+    try std.testing.expect(client.writer().mustClose());
+    try std.testing.expectEqual(@as(usize, 1), client.pendingResponses());
+    const before = wire.end;
+    try std.testing.expectError(error.ConnectionClosing, client.writeData(&wire, "data"));
+    try std.testing.expectEqual(before, wire.end);
 }
 
 test "high-level HTTP1 server forces close response and stops parsing next request" {

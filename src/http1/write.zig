@@ -105,6 +105,23 @@ pub const MessageWriter = struct {
         return self.state == .idle;
     }
 
+    /// Abandon an in-progress message body without emitting any remaining
+    /// framing bytes. This is intended for an HTTP client that receives a
+    /// final response before it has finished sending the request content. The
+    /// connection becomes non-reusable so the missing request bytes cannot be
+    /// confused with a later message. Returns false when no body is pending.
+    pub fn abandonBody(self: *MessageWriter) bool {
+        return switch (self.state) {
+            .fixed, .chunked, .close_delimited => blk: {
+                self.remaining = 0;
+                self.close_after_message = false;
+                self.state = .must_close;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
     /// Start and serialize a request after validating syntax, RFC 9112 framing,
     /// request-target/Host semantics, and persistence without touching `w`.
     pub fn beginRequest(self: *MessageWriter, w: *std.Io.Writer, version: head.Version, method: []const u8, target: []const u8, headers: []const common.Header) MessageError!BeginResult {
@@ -284,6 +301,20 @@ pub const MessageWriter = struct {
         self.close_after_message = false;
     }
 };
+
+test "message writer can abandon an early-final request body only by closing" {
+    var out_storage: [512]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_storage);
+    var writer = MessageWriter.init();
+    _ = try writer.beginRequest(&out, .http_1_1, "POST", "/upload", &.{
+        .{ .name = "host", .value = "example.com" },
+        .{ .name = "content-length", .value = "4" },
+    });
+    try std.testing.expect(writer.abandonBody());
+    try std.testing.expect(writer.mustClose());
+    try std.testing.expect(!writer.abandonBody());
+    try std.testing.expectError(error.InvalidState, writer.writeData(&out, "data"));
+}
 
 fn validateResponseFramingFields(status: u16, request_method: []const u8, headers: []const common.Header) error{InvalidResponseFraming}!void {
     const successful_connect = std.ascii.eqlIgnoreCase(request_method, "CONNECT") and status >= 200 and status < 300;
