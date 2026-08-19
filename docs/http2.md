@@ -62,6 +62,17 @@ minimum bytes per connection. `Connection(config).state_bytes` exposes the fixed
 allocation size at comptime; tune the bounds or use `Session` directly for very
 high connection counts or custom storage topologies.
 
+High-level request creation is lifecycle-gated. `sendRequest()` returns
+`NotStarted` until the local client preface has been emitted, but requests may be
+sent immediately after `start()` without waiting for the peer's initial SETTINGS,
+matching HTTP/2 connection-preface rules. `canOpenRequest()` reports that exact
+composed condition. Once either endpoint has entered GOAWAY draining, new client
+requests and local SETTINGS policy updates fail with `ConnectionDraining`; existing
+streams may still send responses/data/trailers. Terminal receive/send poisoning
+fails ordinary application sends with `ConnectionFailed`, while `sendControl()`
+remains available to serialize the required GOAWAY when the failure is
+peer-attributable.
+
 `receive()` returns copied header fields alongside HEADERS/PUSH_PROMISE events.
 Collector exhaustion is fail-closed in the high-level layer: HPACK is fully drained
 for synchronization, then `HeaderCollectionOverflow` is returned and subsequent

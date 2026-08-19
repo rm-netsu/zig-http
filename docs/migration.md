@@ -32,6 +32,24 @@ The project now documents explicit pre-1.0 stability tiers in
 [`stability.md`](stability.md), and the 1.0-candidate composed method families
 are covered by a compile-time smoke contract.
 
+High-level lifecycle enforcement is now fail-closed. HTTP/2 client
+`sendRequest()` must follow `start()` and returns `NotStarted` before the local
+preface; after either GOAWAY direction it returns `ConnectionDraining` instead
+of exposing the lower-level `GoAway` error. Ordinary application sends return
+`ConnectionFailed` after a terminal composed receive/send failure, while
+`sendControl()` remains usable for the terminal GOAWAY. Use `canOpenRequest()`
+when a scheduler wants to test request-stream eligibility without attempting a
+send.
+
+HTTP/1 high-level clients now integrate `Expect: 100-continue` directly. When a
+request with content carries `expectContinue()`, `writeData()`/`finish()` return
+`ContinuePending` until a 100 response arrives or the application calls
+`proceedWithoutContinue()`. `continuePhase()` exposes the gate state. A final
+response received before the active request content completes abandons the
+remaining body and makes the transport closing; code that previously sent the
+body regardless of the early final response must instead open a new connection
+for subsequent requests.
+
 
 ## 0.18.x to 0.19.x
 

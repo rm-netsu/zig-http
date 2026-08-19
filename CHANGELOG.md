@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Make high-level HTTP/1 client body coordination fail closed: automatically gate `Expect: 100-continue` request content, expose `continuePhase()` / `proceedWithoutContinue()`, and abandon unsent request content with mandatory connection close when an early final or earlier pipelined `Connection: close` response makes further body transmission unsafe.
+- Make high-level HTTP/2 request/policy sends lifecycle-aware: reject request streams before the local preface, expose `canOpenRequest()`, reject new requests/runtime SETTINGS during GOAWAY draining, and reject ordinary application sends after terminal composed failure while keeping explicit control emission available for the required GOAWAY.
+- Strengthen composed state-model coverage with repeated single-slot HTTP/2 open/reset/reclaim cycles and explicit terminal-send/early-final regression tests.
 - Make high-level HTTP/1 connection persistence symmetric with receive semantics: peer-selected `Connection: close`/HTTP/1.0 close now moves the composed connection to a closing lifecycle, prevents parsing/sending another HTTP message on that transport, and makes server final responses close the connection even when the application omitted an explicit `Connection: close`.
 - Add transport-facing high-level lifecycle reporting for HTTP/1 and HTTP/2, latch terminal HTTP/2 receive/decode failures, map terminal peer parse/compression errors to explicit GOAWAY actions, expose received/sent GOAWAY cutoffs and exact `unprocessedByPeer(stream_id)` retry classification, and add O(1)-targeted `reclaimStream(id)` for bounded stores.
 - Add deterministic high-level state-model coverage for HTTP/1 bounded pipeline wrap/reuse plus HTTP/2 GOAWAY/retry, terminal receive failure, and per-stream reclamation.

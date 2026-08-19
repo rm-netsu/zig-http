@@ -39,10 +39,15 @@ application policy.
 
 `http1.semantics.requestExpectation()` classifies request Expect fields as
 `none`, `continue_100`, or `unsupported`; HTTP/1.0 expectations are ignored.
-`ContinueGate` is a tiny caller-owned client coordinator: 100 opens the body
-gate, another informational response leaves it waiting, a final response
-suppresses the body, and the application can stop waiting on its own timer via
-`proceedWithoutContinue()`. No timer is owned by the HTTP package.
+`ContinueGate` remains the tiny low-level caller-owned coordinator. The high-level
+client now wires the same state into the active request automatically:
+`continuePhase()` reports whether content is waiting/allowed/finally suppressed,
+`writeData()` and `finish()` return `ContinuePending` while a 100 response is
+outstanding, and `proceedWithoutContinue()` lets an application-selected timeout
+open the gate without giving the HTTP package timer ownership. Other 1xx responses
+do not open the gate. A final response received before the request content is
+finished suppresses the remaining content and makes that HTTP/1 transport
+non-reusable so unsent bytes cannot become a later-message framing ambiguity.
 `MessageWriter.beginRequest()` also rejects generation of `100-continue` when
 request framing indicates no content, before any wire byte is written.
 
@@ -73,9 +78,13 @@ the received close decision directly. Once a closing request body completes, a
 server refuses to parse another pipelined request on that transport and forces
 the corresponding final response to close even if the application omitted a
 `Connection: close` field. A client that receives a closing final response stops
-opening or decoding another response on that transport; any later outstanding
-pipeline entries remain visible through `pendingResponses()` so application
-retry/idempotency policy can decide what to do with them.
+opening or decoding another response on that transport and abandons any later
+request body that was still being streamed. Likewise, if a server sends a final
+response before the current request body completes (the common early-final /
+`Expect: 100-continue` case), the high-level client abandons the remaining body
+and closes rather than trying to reuse an ambiguous connection. Any later
+outstanding pipeline entries remain visible through `pendingResponses()` so
+application retry/idempotency policy can decide what to do with them.
 
 Use `http.http1.ConnectionDecoder` and `http.http1.MessageWriter` directly when
 your runtime already owns the request/response queue or wants independent
