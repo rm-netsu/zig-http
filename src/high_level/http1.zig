@@ -109,6 +109,7 @@ pub fn Connection(comptime config: Config) type {
             receive_at_message_start: bool = true,
             sending_final_response: bool = false,
             peer_close_required: bool = false,
+            receive_failed: bool = false,
             client_continue_gate: ?h1.semantics.ContinueGate = null,
         };
 
@@ -119,6 +120,7 @@ pub fn Connection(comptime config: Config) type {
             RequestQueueFull,
             UnexpectedUpgrade,
             ConnectionClosing,
+            ReceiveFailed,
         };
         pub const SendRequestError = h1.message.BuildError || h1.MessageWriter.MessageError || error{
             NotClient,
@@ -142,6 +144,7 @@ pub fn Connection(comptime config: Config) type {
             ContinuePending,
             RequestBodySuppressed,
             ConnectionClosing,
+            ConnectionFailed,
         };
 
         pub const DrainResult = hl_common.DrainResult;
@@ -179,6 +182,7 @@ pub fn Connection(comptime config: Config) type {
             storage.receive_at_message_start = true;
             storage.sending_final_response = false;
             storage.peer_close_required = false;
+            storage.receive_failed = false;
             storage.client_continue_gate = null;
             storage.decoder = switch (endpoint_role) {
                 .client => h1.ConnectionDecoder.initResponse(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
@@ -209,18 +213,19 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub inline fn protocolSwitched(self: *const Self) bool {
+            if (self.state.receive_failed) return false;
             return self.state.decoder.protocolSwitched() or self.state.writer.protocolSwitched();
         }
 
         pub inline fn mustClose(self: *const Self) bool {
-            return self.state.writer.mustClose() or self.state.peer_close_required;
+            return self.state.receive_failed or self.state.writer.mustClose() or self.state.peer_close_required;
         }
 
         /// Transport-facing lifecycle. A peer-selected close is surfaced even
         /// when the local MessageWriter has not yet serialized its final
         /// response, preventing accidental connection reuse.
         pub inline fn lifecycle(self: *const Self) Lifecycle {
-            if (self.state.decoder.failed() or self.state.writer.failed()) return .failed;
+            if (self.state.receive_failed or self.state.decoder.failed() or self.state.writer.failed()) return .failed;
             if (self.protocolSwitched()) return .switched;
             if (self.mustClose()) return .closing;
             return .active;
@@ -333,6 +338,7 @@ pub fn Connection(comptime config: Config) type {
 
         pub fn writeData(self: *Self, out: *std.Io.Writer, bytes: []const u8) DataError!h1.MessageWriter.DataResult {
             if (self.role() == .client) {
+                if (self.state.receive_failed or self.state.decoder.failed()) return error.ConnectionFailed;
                 if (self.state.peer_close_required) return error.ConnectionClosing;
                 if (self.state.client_continue_gate) |gate| switch (gate.phase) {
                     .waiting => return error.ContinuePending,
@@ -350,6 +356,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn finish(self: *Self, out: *std.Io.Writer, trailers: []const common.Header) DataError!void {
+            if (self.role() == .client and (self.state.receive_failed or self.state.decoder.failed())) return error.ConnectionFailed;
             if (self.role() == .client and self.state.client_continue_gate) |gate| switch (gate.phase) {
                 .waiting => return error.ContinuePending,
                 .final_received => return error.RequestBodySuppressed,
@@ -361,6 +368,7 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub fn finishWithTrailerPolicy(self: *Self, out: *std.Io.Writer, trailers: []const common.Header, policy: anytype) DataError!void {
+            if (self.role() == .client and (self.state.receive_failed or self.state.decoder.failed())) return error.ConnectionFailed;
             if (self.role() == .client and self.state.client_continue_gate) |gate| switch (gate.phase) {
                 .waiting => return error.ContinuePending,
                 .final_received => return error.RequestBodySuppressed,
@@ -384,6 +392,7 @@ pub fn Connection(comptime config: Config) type {
         /// bounded pipeline backpressure before consuming the next request head
         /// when its outstanding-response queue is full.
         pub fn receive(self: *Self, input: []const u8) ReceiveError!h1.connection.FeedResult {
+            if (self.state.receive_failed) return error.ReceiveFailed;
             switch (self.role()) {
                 .client => {
                     if (!self.state.decoder.responsePending()) {
@@ -420,9 +429,18 @@ pub fn Connection(comptime config: Config) type {
                             // the transport non-reusable to preserve framing.
                         }
                         if (response.status == 101) {
-                            const pending = self.state.pending.peekPtr() orelse return error.NoOutstandingRequest;
-                            if (!pending.upgrade_offered) return error.UnexpectedUpgrade;
-                            try h1.semantics.validateRetainedUpgradeSelection(pending.offer(), head_event.head);
+                            const pending = self.state.pending.peekPtr() orelse {
+                                self.state.receive_failed = true;
+                                return error.NoOutstandingRequest;
+                            };
+                            if (!pending.upgrade_offered) {
+                                self.state.receive_failed = true;
+                                return error.UnexpectedUpgrade;
+                            }
+                            h1.semantics.validateRetainedUpgradeSelection(pending.offer(), head_event.head) catch |err| {
+                                self.state.receive_failed = true;
+                                return err;
+                            };
                         }
                     }
                     if (!self.state.decoder.responsePending()) {
@@ -468,6 +486,7 @@ pub fn Connection(comptime config: Config) type {
 
         /// Complete receive-side close-delimited framing at transport EOF.
         pub fn finishReceive(self: *Self) ReceiveError!?h1.Event {
+            if (self.state.receive_failed) return error.ReceiveFailed;
             if (self.role() == .client and !self.state.decoder.responsePending()) {
                 if (self.state.pending.peek()) |pending|
                     try self.state.decoder.beginResponse(pending.kind.canonicalMethod());
@@ -952,4 +971,69 @@ test "high-level HTTP1 closing request still drains its current body" {
     try std.testing.expect(body_result.event.? == .data);
     try std.testing.expect(body_result.event.?.data.message_done);
     try std.testing.expectError(error.ConnectionClosing, server.receive("GET /later HTTP/1.1\r\nHost: example.com\r\n\r\n"));
+}
+
+test "high-level HTTP1 unoffered 101 latches terminal receive failure" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var length = h1.message.ContentLength.init(4);
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("POST", "/", "example.com"), &.{length.header()});
+
+    const response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    try std.testing.expectError(error.UnexpectedUpgrade, client.receive(response));
+    try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());
+    try std.testing.expect(!client.protocolSwitched());
+    try std.testing.expect(client.mustClose());
+    const body_before = wire.end;
+    try std.testing.expectError(error.ConnectionFailed, client.writeData(&wire, "data"));
+    try std.testing.expectEqual(body_before, wire.end);
+    try std.testing.expectError(error.ReceiveFailed, client.receive(""));
+    try std.testing.expectError(
+        error.ConnectionFailed,
+        client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/later", "example.com"), &.{}),
+    );
+}
+
+test "high-level HTTP1 mismatched 101 selection latches terminal receive failure" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    const offered = h1.message.upgrade("websocket");
+    var wire_storage: [512]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.sendRequest(&wire, h1.message.RequestFields.origin("GET", "/", "example.com"), &offered);
+
+    const response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
+    try std.testing.expectError(error.InvalidUpgradeResponse, client.receive(response));
+    try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());
+    try std.testing.expect(!client.protocolSwitched());
+    try std.testing.expectError(error.ReceiveFailed, client.finishReceive());
+}
+
+test "high-level HTTP1 partial request write does not publish pipeline state" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var tiny_storage: [8]u8 = undefined;
+    var tiny = std.Io.Writer.fixed(&tiny_storage);
+    try std.testing.expectError(
+        error.WriteFailed,
+        client.sendRequest(&tiny, h1.message.RequestFields.origin("GET", "/long-target", "example.com"), &.{}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), client.pendingResponses());
+    try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());
+
+    var retry_storage: [256]u8 = undefined;
+    var retry = std.Io.Writer.fixed(&retry_storage);
+    try std.testing.expectError(
+        error.ConnectionFailed,
+        client.sendRequest(&retry, h1.message.RequestFields.origin("GET", "/", "example.com"), &.{}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), retry.end);
 }
