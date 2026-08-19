@@ -64,3 +64,86 @@ test {
     _ = high_level.http1.Connection;
     _ = high_level.http2.Connection;
 }
+
+test "1.0 candidate composed API surface remains present" {
+    const H1 = high_level.http1.Connection(.{
+        .head_bytes = 256,
+        .chunk_line_bytes = 64,
+        .max_in_flight = 2,
+        .outbound_fields = 8,
+    });
+    const H2 = high_level.http2.Connection(.{
+        .max_streams = 2,
+        .header_block_bytes = 256,
+        .scratch_bytes = 256,
+        .frame_staging_bytes = 256,
+        .collected_fields = 8,
+        .collected_field_bytes = 256,
+        .outbound_fields = 8,
+    });
+
+    comptime {
+        const h1_required = .{
+            "initClientInPlace",
+            "initServerInPlace",
+            "sendRequest",
+            "sendResponse",
+            "writeData",
+            "finish",
+            "receive",
+            "finishReceive",
+            "drain",
+            "pendingResponses",
+            "protocolSwitched",
+            "mustClose",
+        };
+        for (h1_required) |name| if (!@hasDecl(H1, name))
+            @compileError("missing 1.0-candidate high-level HTTP/1 API: " ++ name);
+
+        const h2_required = .{
+            "initClientInPlace",
+            "initServerInPlace",
+            "start",
+            "sendLocalSettings",
+            "sendRequest",
+            "sendResponse",
+            "sendData",
+            "sendTrailers",
+            "sendControl",
+            "sendPing",
+            "releaseData",
+            "flushReceiveCredit",
+            "resetStream",
+            "sendGoAway",
+            "announceGracefulGoAway",
+            "finishGracefulGoAway",
+            "reclaimClosed",
+            "receive",
+            "drain",
+            "acknowledgedLocalSettings",
+            "effectiveLocalSettings",
+            "pendingLocalSettings",
+        };
+        for (h2_required) |name| if (!@hasDecl(H2, name))
+            @compileError("missing 1.0-candidate high-level HTTP/2 API: " ++ name);
+
+        const session_required = .{
+            "receiveBytes",
+            "receiveComplete",
+            "sendHeaders",
+            "sendData",
+            "sendTrailers",
+            "sendSettings",
+            "sendReset",
+            "sendGoAway",
+        };
+        for (session_required) |name| if (!@hasDecl(http2.Session, name))
+            @compileError("missing 1.0-candidate HTTP/2 Session API: " ++ name);
+
+        if (!@hasDecl(http1.ConnectionDecoder, "feed"))
+            @compileError("missing 1.0-candidate HTTP/1 ConnectionDecoder.feed");
+        if (!@hasDecl(http1.MessageWriter, "beginRequest") or
+            !@hasDecl(http1.MessageWriter, "beginResponse"))
+            @compileError("missing 1.0-candidate HTTP/1 MessageWriter begin APIs");
+    }
+}

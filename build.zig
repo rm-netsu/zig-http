@@ -94,6 +94,7 @@ pub fn build(b: *std.Build) void {
         "http2_trailers",
         "http2_priority",
         "http2_scheduler",
+        "http2_settings",
         "error_handling",
     };
     for (example_sources) |name| {
