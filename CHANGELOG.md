@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.20.0
+
+- Add explicit composed cancellation semantics: HTTP/1 `cancelRequestBody()` abandons an unfinished client body and makes the transport non-reusable, while HTTP/2 `cancelRequest()` commits `RST_STREAM(CANCEL)` before immediately reclaiming the bounded stream slot.
+- Expose high-level HTTP/2 active/retained stream counters plus `streamsDrained()` so graceful shutdown and connection-pool backpressure no longer require dropping to Session/store internals; cancellation partial-write tests guarantee failed resets do not reclaim state.
 - Make composed transport EOF explicit and fail closed: HTTP/1 `finishReceive()` now latches truncated EOF as terminal and turns clean EOF into a non-reusable persistence boundary while preserving already parsed pipeline response order; HTTP/2 adds `finishReceive(pending_input)` / `peerReceiveClosed()` so partial prefaces/frames/CONTINUATION blocks cannot be mistaken for a clean half-close.
 - Add exact HTTP/2 `requestAvailability()` scheduling diagnostics for lifecycle, peer concurrency, bounded stream-store capacity, and stream-ID exhaustion; `canOpenRequest()` is now the `.ready` shorthand and `sendRequest()` returns the corresponding preflight error before field/HPACK work.
 - Make high-level HTTP/1 Upgrade receive validation terminal and fail closed: unsolicited or mismatched `101` responses now latch `Lifecycle.failed`, suppress protocol-switch reporting, prevent request-body writes, and make subsequent receive calls return `ReceiveFailed` instead of exposing the decoder's already-entered tunnel state.

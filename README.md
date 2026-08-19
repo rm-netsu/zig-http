@@ -86,7 +86,7 @@ See [the HTTP/2 composition guide](docs/http2.md) and
 Add the package with Zig's package manager:
 
 ```sh
-zig fetch --save git+https://github.com/rm-netsu/zig-http.git#v0.19.0
+zig fetch --save git+https://github.com/rm-netsu/zig-http.git#v0.20.0
 ```
 
 Then import the module in `build.zig`:
