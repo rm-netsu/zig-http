@@ -5,6 +5,12 @@ const hl_common = @import("common.zig");
 
 pub const DrainAction = hl_common.DrainAction;
 
+/// Coarse transport-facing lifecycle for the composed HTTP/2 connection.
+/// `draining` means either endpoint has entered GOAWAY shutdown; existing
+/// streams can still complete, but no new request stream should be scheduled on
+/// this transport.
+pub const Lifecycle = enum { handshaking, active, draining, failed };
+
 /// SETTINGS advertised by the high-level endpoint. This is the single source
 /// of truth for both the initial wire SETTINGS frame and the receive-side
 /// limits enforced by the composed connection.
@@ -346,6 +352,33 @@ pub fn Connection(comptime config: Config) type {
             return self.state.pending_local_settings;
         }
 
+        /// Transport-facing connection lifecycle. Receive-side terminal faults
+        /// and send poisoning are latched as `.failed`; either received or sent
+        /// GOAWAY transitions the composed connection to `.draining`.
+        pub inline fn lifecycle(self: *const Self) Lifecycle {
+            if (self.state.receive_failed or self.state.bootstrap.sendPoisoned() or self.state.session.sendPoisoned())
+                return .failed;
+            if (!self.state.bootstrap.active()) return .handshaking;
+            if (self.state.session.peer.goAwayReceived() or self.state.session.streams.goAwaySent() or self.state.graceful_goaway.phase != .open)
+                return .draining;
+            return .active;
+        }
+
+        pub inline fn peerGoAwayLastStreamId(self: *const Self) ?u31 {
+            return self.state.session.peer.lastGoAwayStream();
+        }
+
+        pub inline fn localGoAwayLastStreamId(self: *const Self) ?u31 {
+            return self.state.session.streams.lastSentGoAwayStream();
+        }
+
+        /// Classify a locally initiated stream after receiving GOAWAY. `true`
+        /// means the peer's last-stream-id proves that this stream was not
+        /// processed and application semantics may retry it on a new connection.
+        pub inline fn unprocessedByPeer(self: *const Self, stream_id: u31) bool {
+            return self.state.session.streams.unprocessedByPeer(&self.state.session.peer, stream_id);
+        }
+
         /// Emits the local HTTP/2 connection preface and initial SETTINGS from
         /// `Config.local_settings`. Expansions become receive-safe immediately;
         /// restrictions become authoritative at the matching SETTINGS ACK.
@@ -407,14 +440,21 @@ pub fn Connection(comptime config: Config) type {
         /// space, and copying field collector.
         pub fn receive(self: *Self, input: []const u8) ReceiveError!?ReceiveResult {
             if (self.state.receive_failed) return error.ReceiveFailed;
-            const result = (try self.state.bootstrap.receiveBytes(
+            const result = (self.state.bootstrap.receiveBytes(
                 &self.state.session,
                 &self.state.store,
                 input,
                 self.state.effective_local_settings.max_frame_size,
                 &self.state.scratch,
                 &self.state.collector,
-            )) orelse return null;
+            ) catch |err| {
+                // A high-level connection cannot prove that HPACK/connection
+                // receive state remains retry-safe after a decode/resource
+                // failure. Latch the receive side closed and require a new
+                // transport instead of permitting accidental continuation.
+                self.state.receive_failed = true;
+                return err;
+            }) orelse return null;
 
             var field_section: ?FieldSection = null;
             var control: ControlAction = .none;
@@ -454,7 +494,13 @@ pub fn Connection(comptime config: Config) type {
                 },
                 .fault => |fault| control = switch (fault) {
                     .stream => |stream_fault| .{ .reset_stream = .{ .stream_id = stream_fault.stream_id, .code = stream_fault.code } },
-                    .connection => |code| .{ .goaway = .{ .last_stream_id = self.state.session.streams.highestRemoteStreamId(), .code = code } },
+                    .connection => |code| blk: {
+                        // A connection error is terminal for further receive
+                        // processing, but sendControl() remains available so the
+                        // transport owner can serialize the required GOAWAY.
+                        self.state.receive_failed = true;
+                        break :blk .{ .goaway = .{ .last_stream_id = self.state.session.streams.highestRemoteStreamId(), .code = code } };
+                    },
                 },
                 else => {},
             };
@@ -579,6 +625,31 @@ pub fn Connection(comptime config: Config) type {
             return self.state.session.sendTrailers(&self.state.store, out, stream_id, &self.state.frame_staging, items, policy);
         }
 
+        /// Translate a terminal receive error into a peer-visible connection
+        /// control action when the error has an RFC-defined connection code.
+        /// Local resource/configuration failures deliberately map to `.none`;
+        /// callers should close the transport without blaming the peer.
+        pub fn controlForReceiveError(self: *const Self, err: ReceiveError) ControlAction {
+            const code: ?h2.protocol.ErrorCode = switch (err) {
+                error.FrameSize => .frame_size_error,
+                error.Protocol, error.InvalidPreface => .protocol_error,
+                error.Truncated,
+                error.IntegerOverflow,
+                error.InvalidPrefix,
+                error.InvalidIndex,
+                error.InvalidHuffman,
+                error.InvalidTableSizeUpdate,
+                error.TableSizeTooLarge,
+                error.TableSizeUpdateRequired,
+                => .compression_error,
+                else => null,
+            };
+            return if (code) |value| .{ .goaway = .{
+                .last_stream_id = self.state.session.streams.highestRemoteStreamId(),
+                .code = value,
+            } } else .none;
+        }
+
         /// Emit a control response suggested by `ReceiveResult.control`. The
         /// action is transport-neutral and never writes implicitly from receive().
         pub fn sendControl(self: *Self, out: *std.Io.Writer, action: ControlAction) SendControlError!void {
@@ -663,6 +734,12 @@ pub fn Connection(comptime config: Config) type {
 
         pub inline fn gracefulGoAwayPhase(self: *const Self) h2.session.GracefulGoAway.Phase {
             return self.state.graceful_goaway.phase;
+        }
+
+        /// Reclaim one known-closed bounded stream slot without scanning the
+        /// whole store. Returns false when the stream is absent or not closed.
+        pub inline fn reclaimStream(self: *Self, stream_id: u31) bool {
+            return self.state.store.removeClosed(stream_id);
         }
 
         pub inline fn reclaimClosed(self: *Self) usize {
@@ -1130,4 +1207,97 @@ test "high-level HTTP2 composes receive-credit release and WINDOW_UPDATE" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "high-level HTTP2 exposes GOAWAY retry classification and lifecycle" {
+    const Conn = Connection(.{ .max_streams = 8, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var wire_storage: [4096]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.start(&wire);
+    try std.testing.expectEqual(Lifecycle.handshaking, client.lifecycle());
+
+    var peer_settings: [9]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
+    _ = (try client.receive(&peer_settings)).?;
+    try std.testing.expectEqual(Lifecycle.active, client.lifecycle());
+
+    const one = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/one"), &.{}, true);
+    const three = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/three"), &.{}, true);
+    const five = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/five"), &.{}, true);
+    try std.testing.expectEqual(@as(u31, 1), one.stream_id);
+    try std.testing.expectEqual(@as(u31, 3), three.stream_id);
+    try std.testing.expectEqual(@as(u31, 5), five.stream_id);
+
+    var goaway: [17]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 8, .type = .goaway, .flags = 0, .stream_id = 0 }).encode(goaway[0..9]);
+    std.mem.writeInt(u32, goaway[9..13], 3, .big);
+    std.mem.writeInt(u32, goaway[13..17], 0, .big);
+    const received = (try client.receive(&goaway)).?;
+    try std.testing.expect(received.event.? == .goaway);
+    try std.testing.expectEqual(Lifecycle.draining, client.lifecycle());
+    try std.testing.expectEqual(@as(?u31, 3), client.peerGoAwayLastStreamId());
+    try std.testing.expect(!client.unprocessedByPeer(one.stream_id));
+    try std.testing.expect(!client.unprocessedByPeer(three.stream_id));
+    try std.testing.expect(client.unprocessedByPeer(five.stream_id));
+
+    var blocked_storage: [256]u8 = undefined;
+    var blocked = std.Io.Writer.fixed(&blocked_storage);
+    try std.testing.expectError(
+        error.GoAway,
+        client.sendRequest(&blocked, h2.message.RequestFields.init("GET", "https", "example.com", "/new"), &.{}, true),
+    );
+    try std.testing.expectEqual(@as(usize, 0), blocked.end);
+}
+
+test "high-level HTTP2 connection faults latch receive terminal state" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    var outbound_storage: [512]u8 = undefined;
+    var outbound = std.Io.Writer.fixed(&outbound_storage);
+    _ = try server.start(&outbound);
+
+    var peer_settings: [9]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
+    const preface = h2.preface.bytes.* ++ peer_settings;
+    _ = (try server.receive(&preface)).?;
+    try std.testing.expectEqual(Lifecycle.active, server.lifecycle());
+
+    var invalid_data: [9]u8 = undefined;
+    try (h2.frame.FrameHeader{ .length = 0, .type = .data, .flags = 0, .stream_id = 0 }).encode(&invalid_data);
+    var receive_error: ?Conn.ReceiveError = null;
+    const maybe_result = server.receive(&invalid_data) catch |err| blk: {
+        receive_error = err;
+        break :blk null;
+    };
+    try std.testing.expect(maybe_result == null);
+    try std.testing.expectEqual(error.Protocol, receive_error.?);
+    try std.testing.expectEqual(Lifecycle.failed, server.lifecycle());
+    try std.testing.expectError(error.ReceiveFailed, server.receive(""));
+
+    const control_action = server.controlForReceiveError(receive_error.?);
+    try std.testing.expect(control_action == .goaway);
+    var control_storage: [64]u8 = undefined;
+    var control = std.Io.Writer.fixed(&control_storage);
+    try server.sendControl(&control, control_action);
+    const parsed = (try h2.frame.parseComplete(control.buffered(), h2.frame.default_max_frame_size)).?;
+    try std.testing.expectEqual(h2.frame.Type.goaway, parsed.frame.header.type);
+}
+
+test "high-level HTTP2 reclaims one closed stream without full-store scan" {
+    const Conn = Connection(.{ .max_streams = 2, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var wire_storage: [1024]u8 = undefined;
+    var wire = std.Io.Writer.fixed(&wire_storage);
+    _ = try client.start(&wire);
+    const request = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/"), &.{}, false);
+    try client.resetStream(&wire, request.stream_id, .cancel);
+    try std.testing.expect(client.reclaimStream(request.stream_id));
+    try std.testing.expect(!client.reclaimStream(request.stream_id));
 }

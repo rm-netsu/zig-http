@@ -13,6 +13,10 @@ pub const Config = struct {
 };
 
 pub const Role = enum { client, server };
+/// Coarse transport-facing lifecycle for the composed HTTP/1 connection.
+/// `closing` means HTTP parsing/writing may finish the current message, but the
+/// transport must not be reused for another HTTP message.
+pub const Lifecycle = enum { active, closing, switched, failed };
 pub const DrainAction = hl_common.DrainAction;
 
 fn requestFramingHasContent(framing: h1.head.BodyFraming) bool {
@@ -45,6 +49,7 @@ pub fn Connection(comptime config: Config) type {
             upgrade_offered: bool = false,
             upgrade_offer_truncated: bool = false,
             continue_sent: bool = false,
+            close_after_response: bool = false,
             upgrade_len: usize = 0,
             upgrade_bytes: [config.upgrade_offer_bytes]u8 = undefined,
 
@@ -103,6 +108,7 @@ pub fn Connection(comptime config: Config) type {
             pending: Queue = .{},
             receive_at_message_start: bool = true,
             sending_final_response: bool = false,
+            peer_close_required: bool = false,
         };
 
         pub const state_bytes = @sizeOf(Storage);
@@ -111,12 +117,14 @@ pub fn Connection(comptime config: Config) type {
             NoOutstandingRequest,
             RequestQueueFull,
             UnexpectedUpgrade,
+            ConnectionClosing,
         };
         pub const SendRequestError = h1.message.BuildError || h1.MessageWriter.MessageError || error{
             NotClient,
             RequestQueueFull,
             UpgradeOfferTooLarge,
             InvalidUpgradeRequest,
+            ConnectionClosing,
         };
         pub const SendResponseError = h1.MessageWriter.MessageError || error{
             NotServer,
@@ -124,6 +132,8 @@ pub fn Connection(comptime config: Config) type {
             ContinueRequiredBeforeUpgrade,
             UpgradeNotOffered,
             UpgradeOfferTooLarge,
+            ConnectionClosing,
+            TooManyFields,
         };
         pub const DataError = h1.MessageWriter.MessageError;
 
@@ -161,6 +171,7 @@ pub fn Connection(comptime config: Config) type {
             storage.pending = .{};
             storage.receive_at_message_start = true;
             storage.sending_final_response = false;
+            storage.peer_close_required = false;
             storage.decoder = switch (endpoint_role) {
                 .client => h1.ConnectionDecoder.initResponse(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
                 .server => h1.ConnectionDecoder.initRequest(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
@@ -194,7 +205,21 @@ pub fn Connection(comptime config: Config) type {
         }
 
         pub inline fn mustClose(self: *const Self) bool {
-            return self.state.writer.mustClose();
+            return self.state.writer.mustClose() or self.state.peer_close_required;
+        }
+
+        /// Transport-facing lifecycle. A peer-selected close is surfaced even
+        /// when the local MessageWriter has not yet serialized its final
+        /// response, preventing accidental connection reuse.
+        pub inline fn lifecycle(self: *const Self) Lifecycle {
+            if (self.state.decoder.failed() or self.state.writer.failed()) return .failed;
+            if (self.protocolSwitched()) return .switched;
+            if (self.mustClose()) return .closing;
+            return .active;
+        }
+
+        pub inline fn peerCloseRequired(self: *const Self) bool {
+            return self.state.peer_close_required;
         }
 
         /// Serialize a typed client request and retain only the response-framing
@@ -207,6 +232,7 @@ pub fn Connection(comptime config: Config) type {
             regular_fields: []const common.Header,
         ) SendRequestError!h1.MessageWriter.BeginResult {
             if (self.role() != .client) return error.NotClient;
+            if (self.state.peer_close_required) return error.ConnectionClosing;
             if (self.state.pending.full()) return error.RequestQueueFull;
             const fields = try request.build(&self.state.outbound, regular_fields);
             var pending: PendingRequest = .{ .kind = request.kind() };
@@ -236,22 +262,31 @@ pub fn Connection(comptime config: Config) type {
             if (self.role() != .server) return error.NotServer;
             const pending = self.state.pending.peekPtr() orelse return error.NoPendingRequest;
             if (response.status == 101) {
+                if (pending.close_after_response) return error.ConnectionClosing;
                 if (!pending.upgrade_offered) return error.UpgradeNotOffered;
                 if (pending.upgrade_offer_truncated) return error.UpgradeOfferTooLarge;
                 if (pending.expect_continue and !pending.continue_sent) return error.ContinueRequiredBeforeUpgrade;
                 try h1.semantics.validateUpgradeSelectionFields(pending.offer(), response.version, response.status, fields);
             }
+            const informational = response.status >= 100 and response.status < 200 and response.status != 101;
+            const response_fields = if (!informational and pending.close_after_response and
+                try h1.semantics.persistenceFields(response.version, fields) != .close)
+            blk: {
+                if (fields.len >= self.state.outbound.len) return error.TooManyFields;
+                @memcpy(self.state.outbound[0..fields.len], fields);
+                self.state.outbound[fields.len] = .{ .name = "connection", .value = "close" };
+                break :blk self.state.outbound[0 .. fields.len + 1];
+            } else fields;
             const result = try self.state.writer.beginResponse(
                 out,
                 response.version,
                 response.status,
                 response.reason,
                 pending.kind.canonicalMethod(),
-                fields,
+                response_fields,
             );
 
             if (response.status == 100) pending.continue_sent = true;
-            const informational = response.status >= 100 and response.status < 200 and response.status != 101;
             if (!informational) {
                 self.state.sending_final_response = !result.message_done;
                 if (result.message_done) _ = self.state.pending.pop().?;
@@ -294,11 +329,13 @@ pub fn Connection(comptime config: Config) type {
             switch (self.role()) {
                 .client => {
                     if (!self.state.decoder.responsePending()) {
+                        if (self.state.peer_close_required) return error.ConnectionClosing;
                         const pending = self.state.pending.peek() orelse return error.NoOutstandingRequest;
                         try self.state.decoder.beginResponse(pending.kind.canonicalMethod());
                     }
                 },
                 .server => {
+                    if (self.state.receive_at_message_start and self.state.peer_close_required) return error.ConnectionClosing;
                     if (self.state.receive_at_message_start and self.state.pending.full()) return error.RequestQueueFull;
                 },
             }
@@ -312,6 +349,8 @@ pub fn Connection(comptime config: Config) type {
                             .response => |value| value,
                             else => unreachable,
                         };
+                        if (!head_event.informational and head_event.persistence == .close)
+                            self.state.peer_close_required = true;
                         if (response.status == 101) {
                             const pending = self.state.pending.peekPtr() orelse return error.NoOutstandingRequest;
                             if (!pending.upgrade_offered) return error.UnexpectedUpgrade;
@@ -331,7 +370,9 @@ pub fn Connection(comptime config: Config) type {
                         var pending: PendingRequest = .{
                             .kind = Kind.from(request.method),
                             .expect_continue = expect_continue,
+                            .close_after_response = head_event.persistence == .close,
                         };
+                        if (pending.close_after_response) self.state.peer_close_required = true;
                         if (h1.semantics.copyUpgradeOffer(head_event.head, &pending.upgrade_bytes)) |offer| {
                             pending.upgrade_offered = true;
                             pending.upgrade_len = offer.len;
@@ -643,4 +684,105 @@ test "high-level HTTP1 client rejects unsolicited 101" {
         error.UnexpectedUpgrade,
         client.receive("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"),
     );
+}
+
+test "high-level HTTP1 honors peer close and prevents pipeline reuse" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 4, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var request_a_storage: [256]u8 = undefined;
+    var request_a = std.Io.Writer.fixed(&request_a_storage);
+    _ = try client.sendRequest(&request_a, h1.message.RequestFields.origin("GET", "/one", "example.com"), &.{});
+    var request_b_storage: [256]u8 = undefined;
+    var request_b = std.Io.Writer.fixed(&request_b_storage);
+    _ = try client.sendRequest(&request_b, h1.message.RequestFields.origin("GET", "/two", "example.com"), &.{});
+    try std.testing.expectEqual(@as(usize, 2), client.pendingResponses());
+
+    const response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+    const received = try client.receive(response);
+    try std.testing.expect(received.event != null);
+    try std.testing.expectEqual(@as(usize, 1), client.pendingResponses());
+    try std.testing.expectEqual(Lifecycle.closing, client.lifecycle());
+    try std.testing.expect(client.peerCloseRequired());
+
+    var blocked_storage: [256]u8 = undefined;
+    var blocked = std.Io.Writer.fixed(&blocked_storage);
+    try std.testing.expectError(
+        error.ConnectionClosing,
+        client.sendRequest(&blocked, h1.message.RequestFields.origin("GET", "/three", "example.com"), &.{}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), blocked.end);
+    try std.testing.expectError(error.ConnectionClosing, client.receive("HTTP/1.1 204 No Content\r\n\r\n"));
+}
+
+test "high-level HTTP1 server forces close response and stops parsing next request" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 4, .outbound_fields = 8 });
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    const first = "GET /one HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    const received = try server.receive(first);
+    try std.testing.expect(received.event != null);
+    try std.testing.expectEqual(Lifecycle.closing, server.lifecycle());
+    try std.testing.expectError(
+        error.ConnectionClosing,
+        server.receive("GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+    );
+
+    const length = h1.message.ContentLength.init(0);
+    var response_storage: [256]u8 = undefined;
+    var response = std.Io.Writer.fixed(&response_storage);
+    _ = try server.sendResponse(&response, h1.message.ResponseFields.init(200, "OK"), &.{length.header()});
+    try std.testing.expect(std.mem.indexOf(u8, response.buffered(), "connection: close\r\n") != null);
+    try std.testing.expect(server.mustClose());
+}
+
+test "high-level HTTP1 bounded pipeline follows deterministic queue model" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 3, .outbound_fields = 8 });
+    var client = try Conn.initClient(std.testing.allocator);
+    defer client.deinit();
+
+    var model_count: usize = 0;
+    var seed: u32 = 0x51f0_1234;
+    const response = "HTTP/1.1 204 No Content\r\n\r\n";
+    var step: usize = 0;
+    while (step < 256) : (step += 1) {
+        seed = seed *% 1_664_525 +% 1_013_904_223;
+        const should_send = model_count == 0 or (model_count < 3 and (seed & 1) == 0);
+        if (should_send) {
+            var wire_storage: [256]u8 = undefined;
+            var wire = std.Io.Writer.fixed(&wire_storage);
+            const method: []const u8 = if ((seed & 2) == 0) "GET" else "HEAD";
+            _ = try client.sendRequest(&wire, h1.message.RequestFields.origin(method, "/model", "example.com"), &.{});
+            model_count += 1;
+        } else {
+            const result = try client.receive(response);
+            try std.testing.expect(result.event != null);
+            model_count -= 1;
+        }
+        try std.testing.expectEqual(model_count, client.pendingResponses());
+        try std.testing.expectEqual(Lifecycle.active, client.lifecycle());
+    }
+    while (model_count != 0) {
+        _ = try client.receive(response);
+        model_count -= 1;
+        try std.testing.expectEqual(model_count, client.pendingResponses());
+    }
+}
+
+test "high-level HTTP1 closing request still drains its current body" {
+    const Conn = Connection(.{ .head_bytes = 512, .chunk_line_bytes = 128, .max_in_flight = 2, .outbound_fields = 8 });
+    var server = try Conn.initServer(std.testing.allocator);
+    defer server.deinit();
+
+    const head_bytes = "POST /upload HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nContent-Length: 3\r\n\r\n";
+    const head_result = try server.receive(head_bytes);
+    try std.testing.expect(head_result.event.? == .head);
+    try std.testing.expectEqual(Lifecycle.closing, server.lifecycle());
+
+    const body_result = try server.receive("abc");
+    try std.testing.expect(body_result.event.? == .data);
+    try std.testing.expect(body_result.event.?.data.message_done);
+    try std.testing.expectError(error.ConnectionClosing, server.receive("GET /later HTTP/1.1\r\nHost: example.com\r\n\r\n"));
 }

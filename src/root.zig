@@ -96,6 +96,8 @@ test "1.0 candidate composed API surface remains present" {
             "pendingResponses",
             "protocolSwitched",
             "mustClose",
+            "lifecycle",
+            "peerCloseRequired",
         };
         for (h1_required) |name| if (!@hasDecl(H1, name))
             @compileError("missing 1.0-candidate high-level HTTP/1 API: " ++ name);
@@ -110,6 +112,7 @@ test "1.0 candidate composed API surface remains present" {
             "sendData",
             "sendTrailers",
             "sendControl",
+            "controlForReceiveError",
             "sendPing",
             "releaseData",
             "flushReceiveCredit",
@@ -117,7 +120,12 @@ test "1.0 candidate composed API surface remains present" {
             "sendGoAway",
             "announceGracefulGoAway",
             "finishGracefulGoAway",
+            "reclaimStream",
             "reclaimClosed",
+            "lifecycle",
+            "peerGoAwayLastStreamId",
+            "localGoAwayLastStreamId",
+            "unprocessedByPeer",
             "receive",
             "drain",
             "acknowledgedLocalSettings",
