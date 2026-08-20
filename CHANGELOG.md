@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.0
+
+- Freeze the installed `http` module as the stable SemVer-governed 1.x API, including both composed entry points and independently usable low-level HTTP/1 and HTTP/2 namespaces.
+- Move high-level HTTP/1 and HTTP/2 result/error contracts out of `Connection(config)` and declare them as module-level stable types, preventing bounded storage configuration or future internal parser/HPACK error-set changes from silently changing user-facing types.
+- Remove high-level internal-composition accessors (`decoder`/`writer` and `core`/`bootstrap`/`store`/`collector`) plus nested HTTP/2 store/collector aliases; users that need those layers instantiate the public low-level components directly.
+- Make `Connection(config).Storage` opaque-by-convention aligned byte storage while preserving caller-owned in-place initialization and existing fixed-state sizes; high-level Session/HPACK/parser/store fields are no longer part of the public layout.
+- Unify endpoint role type identity through `http.common.Role` across HTTP/1 high-level, HTTP/2, and `http.high_level.Role`.
+- Add `http.version` and replace the old declaration-presence smoke test with a stricter compile-time stable-API contract that checks key signatures, module-level result/error ownership, opaque Storage boundaries, and absence of private-composition leaks.
+- Rewrite the stability policy for 1.x: all declarations reachable from the installed `http` module are normal SemVer source API; build support, tests, benchmarks, and executable example source remain non-package development assets.
+
 ## 0.20.0
 
 - Add explicit composed cancellation semantics: HTTP/1 `cancelRequestBody()` abandons an unfinished client body and makes the transport non-reusable, while HTTP/2 `cancelRequest()` commits `RST_STREAM(CANCEL)` before immediately reclaiming the bounded stream slot.
