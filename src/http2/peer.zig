@@ -1,10 +1,11 @@
 const std = @import("std");
+const common = @import("../common.zig");
 const flow = @import("flow.zig");
 const frame = @import("frame.zig");
 const payload = @import("payload.zig");
 const settings = @import("settings.zig");
 
-pub const Role = enum { client, server };
+pub const Role = common.Role;
 
 /// State advertised by the peer and therefore constraining what the local
 /// endpoint can send. Stream-level windows remain caller-owned; changes to

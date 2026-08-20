@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// Endpoint role shared by HTTP/1 and HTTP/2 composed APIs.
+pub const Role = enum { client, server };
+
 pub const Header = struct {
     name: []const u8,
     value: []const u8,

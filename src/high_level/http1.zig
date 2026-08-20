@@ -12,12 +12,113 @@ pub const Config = struct {
     decoder_options: h1.connection.Options = .{},
 };
 
-pub const Role = enum { client, server };
+pub const Role = common.Role;
 /// Coarse transport-facing lifecycle for the composed HTTP/1 connection.
 /// `closing` means HTTP parsing/writing may finish the current message, but the
 /// transport must not be reused for another HTTP message.
 pub const Lifecycle = enum { active, closing, switched, failed };
 pub const DrainAction = hl_common.DrainAction;
+pub const DrainResult = hl_common.DrainResult;
+
+/// Stable high-level HTTP/1 receive errors. This set is intentionally declared
+/// independently from the lower-level parser error unions so internal protocol
+/// refactors cannot silently expand the 1.x composed API.
+pub const ReceiveError = error{
+    HeadTooLarge,
+    InvalidStartLine,
+    InvalidVersion,
+    InvalidStatus,
+    InvalidHeader,
+    InvalidContentLength,
+    ConflictingContentLength,
+    AmbiguousFraming,
+    InvalidTransferEncoding,
+    InvalidRequestTarget,
+    MissingHost,
+    MultipleHost,
+    InvalidHost,
+    MismatchedHost,
+    InvalidUpgradeResponse,
+    InvalidConnectionHeader,
+    InvalidChunk,
+    LineTooLong,
+    ResponseContextRequired,
+    InvalidResponseContext,
+    UnexpectedEof,
+    NoOutstandingRequest,
+    RequestQueueFull,
+    UnexpectedUpgrade,
+    ConnectionClosing,
+    ReceiveFailed,
+};
+
+/// Stable typed-request construction failures surfaced by the high-level API.
+pub const RequestBuildError = error{
+    InvalidRequestTarget,
+    MissingHost,
+    MultipleHost,
+    InvalidHost,
+    MismatchedHost,
+    TooManyFields,
+    DuplicateHost,
+};
+
+/// Stable high-level message serialization failures. Writer I/O is represented
+/// by Zig 0.16's transport-neutral `WriteFailed` error.
+pub const MessageError = error{
+    WriteFailed,
+    InvalidHeader,
+    HeadTooLarge,
+    InvalidStartLine,
+    InvalidVersion,
+    InvalidStatus,
+    InvalidContentLength,
+    ConflictingContentLength,
+    AmbiguousFraming,
+    InvalidTransferEncoding,
+    InvalidRequestTarget,
+    MissingHost,
+    MultipleHost,
+    InvalidHost,
+    MismatchedHost,
+    InvalidUpgradeResponse,
+    InvalidConnectionHeader,
+    InvalidExpectation,
+    InvalidState,
+    ContentLengthMismatch,
+    TrailersNotAllowed,
+    TrailerPolicyRequired,
+    TrailerRejected,
+    InvalidTrailer,
+    InvalidResponseFraming,
+};
+
+pub const SendRequestError = RequestBuildError || MessageError || error{
+    NotClient,
+    RequestQueueFull,
+    UpgradeOfferTooLarge,
+    InvalidUpgradeRequest,
+    ConnectionClosing,
+    ProtocolSwitched,
+    ConnectionFailed,
+};
+
+pub const SendResponseError = MessageError || error{
+    NotServer,
+    NoPendingRequest,
+    ContinueRequiredBeforeUpgrade,
+    UpgradeNotOffered,
+    UpgradeOfferTooLarge,
+    ConnectionClosing,
+    TooManyFields,
+};
+
+pub const DataError = MessageError || error{
+    ContinuePending,
+    RequestBodySuppressed,
+    ConnectionClosing,
+    ConnectionFailed,
+};
 
 fn requestFramingHasContent(framing: h1.head.BodyFraming) bool {
     return switch (framing) {
@@ -59,7 +160,7 @@ pub fn Connection(comptime config: Config) type {
         };
 
         allocator: ?std.mem.Allocator = null,
-        state: *Storage,
+        state: *State,
 
         const Queue = struct {
             items: [config.max_in_flight]PendingRequest = undefined,
@@ -101,9 +202,7 @@ pub fn Connection(comptime config: Config) type {
             }
         };
 
-        /// Caller-owned fixed storage for in-place initialization. Once bound
-        /// to a Connection, its address must remain stable until `deinit`.
-        pub const Storage = struct {
+        const State = struct {
             role: Role,
             head_storage: [config.head_bytes]u8 = undefined,
             chunk_line_storage: [config.chunk_line_bytes]u8 = undefined,
@@ -118,41 +217,19 @@ pub fn Connection(comptime config: Config) type {
             client_continue_gate: ?h1.semantics.ContinueGate = null,
         };
 
+        /// Caller-owned opaque storage for in-place initialization. The byte
+        /// representation is deliberately not part of the public API; only its
+        /// size/alignment and stable address matter. Do not inspect or copy an
+        /// initialized value.
+        pub const Storage = struct {
+            _opaque: [@sizeOf(State)]u8 align(@alignOf(State)) = undefined,
+        };
+
         pub const state_bytes = @sizeOf(Storage);
 
-        pub const ReceiveError = h1.connection.Error || error{
-            NoOutstandingRequest,
-            RequestQueueFull,
-            UnexpectedUpgrade,
-            ConnectionClosing,
-            ReceiveFailed,
-        };
-        pub const SendRequestError = h1.message.BuildError || h1.MessageWriter.MessageError || error{
-            NotClient,
-            RequestQueueFull,
-            UpgradeOfferTooLarge,
-            InvalidUpgradeRequest,
-            ConnectionClosing,
-            ProtocolSwitched,
-            ConnectionFailed,
-        };
-        pub const SendResponseError = h1.MessageWriter.MessageError || error{
-            NotServer,
-            NoPendingRequest,
-            ContinueRequiredBeforeUpgrade,
-            UpgradeNotOffered,
-            UpgradeOfferTooLarge,
-            ConnectionClosing,
-            TooManyFields,
-        };
-        pub const DataError = h1.MessageWriter.MessageError || error{
-            ContinuePending,
-            RequestBodySuppressed,
-            ConnectionClosing,
-            ConnectionFailed,
-        };
-
-        pub const DrainResult = hl_common.DrainResult;
+        inline fn stateFromStorage(storage: *Storage) *State {
+            return @ptrCast(&storage._opaque);
+        }
 
         pub fn initClient(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
             return initOwned(allocator, .client);
@@ -165,35 +242,35 @@ pub fn Connection(comptime config: Config) type {
         /// Initialize a fully allocation-free high-level HTTP/1 connection in
         /// caller-owned storage. `storage` must not move until `deinit`.
         pub fn initClientInPlace(storage: *Storage) Self {
-            return initInPlace(storage, .client);
+            return initState(stateFromStorage(storage), .client);
         }
 
         /// Server counterpart to `initClientInPlace`.
         pub fn initServerInPlace(storage: *Storage) Self {
-            return initInPlace(storage, .server);
+            return initState(stateFromStorage(storage), .server);
         }
 
         fn initOwned(allocator: std.mem.Allocator, endpoint_role: Role) error{OutOfMemory}!Self {
-            const storage = try allocator.create(Storage);
-            var result = initInPlace(storage, endpoint_role);
+            const state = try allocator.create(State);
+            var result = initState(state, endpoint_role);
             result.allocator = allocator;
             return result;
         }
 
-        fn initInPlace(storage: *Storage, endpoint_role: Role) Self {
-            storage.role = endpoint_role;
-            storage.writer = h1.MessageWriter.init();
-            storage.pending = .{};
-            storage.receive_at_message_start = true;
-            storage.sending_final_response = false;
-            storage.peer_close_required = false;
-            storage.receive_failed = false;
-            storage.client_continue_gate = null;
-            storage.decoder = switch (endpoint_role) {
-                .client => h1.ConnectionDecoder.initResponse(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
-                .server => h1.ConnectionDecoder.initRequest(&storage.head_storage, &storage.chunk_line_storage, config.decoder_options),
+        fn initState(state: *State, endpoint_role: Role) Self {
+            state.role = endpoint_role;
+            state.writer = h1.MessageWriter.init();
+            state.pending = .{};
+            state.receive_at_message_start = true;
+            state.sending_final_response = false;
+            state.peer_close_required = false;
+            state.receive_failed = false;
+            state.client_continue_gate = null;
+            state.decoder = switch (endpoint_role) {
+                .client => h1.ConnectionDecoder.initResponse(&state.head_storage, &state.chunk_line_storage, config.decoder_options),
+                .server => h1.ConnectionDecoder.initRequest(&state.head_storage, &state.chunk_line_storage, config.decoder_options),
             };
-            return .{ .state = storage };
+            return .{ .state = state };
         }
 
         pub fn deinit(self: *Self) void {
@@ -203,14 +280,6 @@ pub fn Connection(comptime config: Config) type {
 
         pub inline fn role(self: *const Self) Role {
             return self.state.role;
-        }
-
-        pub inline fn decoder(self: *Self) *h1.ConnectionDecoder {
-            return &self.state.decoder;
-        }
-
-        pub inline fn writer(self: *Self) *h1.MessageWriter {
-            return &self.state.writer;
         }
 
         pub inline fn pendingResponses(self: *const Self) usize {
@@ -704,12 +773,12 @@ test "high-level HTTP1 CONNECT switches both sides without retaining request con
     var response_wire = std.Io.Writer.fixed(&response_storage);
     const sent = try server.sendResponse(&response_wire, h1.message.ResponseFields.init(200, "Connection Established"), &.{});
     try std.testing.expect(sent.protocol_switched);
-    try std.testing.expect(server.writer().protocolSwitched());
+    try std.testing.expect(server.state.writer.protocolSwitched());
     try std.testing.expectEqual(@as(usize, 0), server.pendingResponses());
 
     const received = try client.receive(response_wire.buffered());
     try std.testing.expect(received.event.?.head.protocol_switched);
-    try std.testing.expect(client.decoder().protocolSwitched());
+    try std.testing.expect(client.state.decoder.protocolSwitched());
     try std.testing.expectEqual(@as(usize, 0), client.pendingResponses());
 }
 
@@ -807,7 +876,7 @@ test "high-level HTTP1 early final suppresses unsent request body and closes" {
     });
     _ = try client.receive("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n");
     try std.testing.expectEqual(Lifecycle.closing, client.lifecycle());
-    try std.testing.expect(client.writer().mustClose());
+    try std.testing.expect(client.state.writer.mustClose());
     try std.testing.expectEqual(h1.semantics.ContinueGate.Phase.final_received, client.continuePhase().?);
     const before = wire.end;
     try std.testing.expectError(error.RequestBodySuppressed, client.writeData(&wire, "data"));
@@ -933,7 +1002,7 @@ test "high-level HTTP1 close response suppresses a later pipelined request body"
 
     _ = try client.receive("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     try std.testing.expectEqual(Lifecycle.closing, client.lifecycle());
-    try std.testing.expect(client.writer().mustClose());
+    try std.testing.expect(client.state.writer.mustClose());
     try std.testing.expectEqual(@as(usize, 1), client.pendingResponses());
     const before = wire.end;
     try std.testing.expectError(error.ConnectionClosing, client.writeData(&wire, "data"));
@@ -1142,7 +1211,7 @@ test "high-level HTTP1 client can explicitly cancel an unsent request body" {
 
     try std.testing.expect(client.cancelRequestBody());
     try std.testing.expect(!client.cancelRequestBody());
-    try std.testing.expect(client.writer().mustClose());
+    try std.testing.expect(client.state.writer.mustClose());
     try std.testing.expectEqual(Lifecycle.closing, client.lifecycle());
     try std.testing.expectEqual(@as(usize, 1), client.pendingResponses());
     try std.testing.expectError(error.InvalidState, client.writeData(&wire, "data"));

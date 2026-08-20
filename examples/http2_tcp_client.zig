@@ -50,7 +50,7 @@ const ClientState = struct {
     }
 };
 
-fn handleClientResult(client: *Conn, out: *std.Io.Writer, state: *ClientState, result: Conn.ReceiveResult) !void {
+fn handleClientResult(client: *Conn, out: *std.Io.Writer, state: *ClientState, result: http.high_level.http2.ReceiveResult) !void {
     try client.sendControl(out, result.control);
 
     const event = result.event orelse return;

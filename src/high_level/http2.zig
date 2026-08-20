@@ -139,6 +139,173 @@ pub const LocalSettings = struct {
     }
 };
 
+pub const FieldSection = struct {
+    stream_id: u31,
+    kind: h2.fields.Kind,
+    headers: []const common.Header,
+};
+
+pub const ControlAction = union(enum) {
+    none,
+    settings_ack,
+    ping_ack: [8]u8,
+    reset_stream: struct { stream_id: u31, code: h2.protocol.ErrorCode },
+    goaway: struct { last_stream_id: u31, code: h2.protocol.ErrorCode },
+};
+
+pub const ReceiveResult = struct {
+    consumed: usize,
+    event: ?h2.Event = null,
+    /// Present only when this call committed a HEADERS/PUSH_PROMISE field
+    /// section. Header slices borrow the connection collector and remain valid
+    /// until the next successfully committed field section.
+    fields: ?FieldSection = null,
+    control: ControlAction = .none,
+};
+
+pub const SendRequestResult = struct {
+    stream_id: u31,
+    headers: h2.session.SendHeadersResult,
+};
+
+pub const ReceiveCreditResult = struct {
+    connection: u31 = 0,
+    stream: u31 = 0,
+};
+
+pub const DrainResult = hl_common.DrainResult;
+
+/// Stable subset of HPACK failures surfaced through the composed API. It is
+/// declared independently from `hpack.codec.Error` so future low-level codec
+/// evolution must be mapped deliberately rather than silently changing 1.x.
+pub const HpackError = error{
+    Truncated,
+    IntegerOverflow,
+    InvalidPrefix,
+    InvalidIndex,
+    InvalidHuffman,
+    ScratchTooSmall,
+    InvalidTableSizeUpdate,
+    TableSizeTooLarge,
+    TableSizeUpdateRequired,
+    HeaderListTooLarge,
+    HeaderBlockTooLarge,
+    StringLiteralTooLarge,
+    OutOfMemory,
+    WriteFailed,
+};
+
+pub const StreamError = error{
+    Protocol,
+    StreamClosed,
+    FlowControl,
+    PeerLimit,
+    StoreFull,
+    GoAway,
+};
+
+pub const HeaderSendError = HpackError || StreamError || error{
+    BufferTooSmall,
+    SendPoisoned,
+    TrailerPolicyRequired,
+    TrailerRejected,
+    PeerHeaderListTooLarge,
+};
+
+pub const SendRequestError = HeaderSendError || error{
+    InvalidRequest,
+    InvalidResponse,
+    NotClient,
+    NotStarted,
+    ConnectionDraining,
+    ConnectionFailed,
+    StreamIdExhausted,
+};
+
+pub const SendResponseError = HeaderSendError || error{
+    InvalidRequest,
+    InvalidResponse,
+    NotServer,
+    NotStarted,
+    ConnectionFailed,
+};
+
+pub const SendDataError = StreamError || error{
+    WriteFailed,
+    SendPoisoned,
+    NotStarted,
+    ConnectionFailed,
+};
+
+pub const SendTrailersError = HeaderSendError || error{
+    NotStarted,
+    ConnectionFailed,
+};
+
+pub const SendPingError = error{
+    WriteFailed,
+    SendPoisoned,
+    NotStarted,
+    ConnectionFailed,
+};
+
+pub const SendLocalSettingsError = error{
+    WriteFailed,
+    FrameTooLarge,
+    Protocol,
+    FlowControl,
+    SettingsSequenceExhausted,
+    SendPoisoned,
+    SettingsPending,
+    NotStarted,
+    ConnectionDraining,
+    ConnectionFailed,
+    LocalSettingsFlowControl,
+};
+
+pub const ReceiveError = HpackError || error{
+    FrameSize,
+    Protocol,
+    InvalidPreface,
+    RoleMismatch,
+    HeaderCollectionOverflow,
+    LocalSettingsFlowControl,
+    ReceiveFailed,
+    ConnectionClosed,
+};
+
+pub const FinishReceiveError = error{ ReceiveFailed, UnexpectedEof };
+
+pub const SendControlError = StreamError || error{
+    WriteFailed,
+    SendPoisoned,
+    FrameTooLarge,
+    NotStarted,
+};
+
+pub const ReceiveCreditError = StreamError || error{
+    WriteFailed,
+    SendPoisoned,
+    NotStarted,
+    ConnectionFailed,
+};
+
+pub const ResetStreamError = ReceiveCreditError;
+
+pub const CancelRequestError = ReceiveCreditError || error{
+    NotClient,
+    NotLocalRequest,
+};
+
+pub const SendGoAwayError = StreamError || error{
+    WriteFailed,
+    SendPoisoned,
+    FrameTooLarge,
+    NotStarted,
+};
+
+pub const GracefulGoAwayError = SendGoAwayError || error{ConnectionFailed};
+
 /// Bounded defaults for the optional transport-neutral HTTP/2 connection
 /// wrapper. Applications with different storage/scheduling requirements should
 /// use `http2.Session` directly; no core API depends on this type.
@@ -178,16 +345,14 @@ pub fn Connection(comptime config: Config) type {
 
     return struct {
         const Self = @This();
-        pub const StreamStore = h2.storage.FixedStreamStore(config.max_streams);
-        pub const FieldCollector = h2.storage.FixedFieldCollector(config.collected_fields, config.collected_field_bytes);
+        const StreamStore = h2.storage.FixedStreamStore(config.max_streams);
+        const FieldCollector = h2.storage.FixedFieldCollector(config.collected_fields, config.collected_field_bytes);
 
         allocator: std.mem.Allocator,
         owns_storage: bool = true,
-        state: *Storage,
+        state: *State,
 
-        /// Caller-owned fixed storage for in-place initialization. Once bound
-        /// to a Connection, its address must remain stable until `deinit`.
-        pub const Storage = struct {
+        const State = struct {
             decoder: h2.hpack.Decoder,
             encoder: h2.hpack.Encoder,
             header_storage: [config.header_block_bytes]u8 = undefined,
@@ -212,66 +377,21 @@ pub fn Connection(comptime config: Config) type {
             graceful_goaway: h2.session.GracefulGoAway = .{},
         };
 
+        /// Caller-owned opaque storage for in-place initialization. The high-
+        /// level wrapper may change its internal Session/HPACK/store composition
+        /// in compatible 1.x releases without exposing those implementation
+        /// fields. Keep an initialized value at a stable address until `deinit`.
+        pub const Storage = struct {
+            _opaque: [@sizeOf(State)]u8 align(@alignOf(State)) = undefined,
+        };
+
         /// Size of the fixed connection state for this configuration, excluding
         /// HPACK dynamic-table allocations.
         pub const state_bytes = @sizeOf(Storage);
 
-        pub const FieldSection = struct {
-            stream_id: u31,
-            kind: h2.fields.Kind,
-            headers: []const common.Header,
-        };
-
-        pub const ReceiveResult = struct {
-            consumed: usize,
-            event: ?h2.Event = null,
-            /// Present only when this call committed a HEADERS/PUSH_PROMISE
-            /// field section. Header slices borrow the connection collector and
-            /// remain valid until the next successfully committed field section.
-            fields: ?FieldSection = null,
-            control: ControlAction = .none,
-        };
-
-        pub const ControlAction = union(enum) {
-            none,
-            settings_ack,
-            ping_ack: [8]u8,
-            reset_stream: struct { stream_id: u31, code: h2.protocol.ErrorCode },
-            goaway: struct { last_stream_id: u31, code: h2.protocol.ErrorCode },
-        };
-
-        pub const SendRequestResult = struct {
-            stream_id: u31,
-            headers: h2.session.SendHeadersResult,
-        };
-
-        pub const ReceiveCreditResult = struct {
-            connection: u31 = 0,
-            stream: u31 = 0,
-        };
-
-        pub const DrainResult = hl_common.DrainResult;
-
-        pub const SendRequestError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{
-            NotClient,
-            NotStarted,
-            ConnectionDraining,
-            ConnectionFailed,
-            StreamIdExhausted,
-        };
-        pub const SendResponseError = h2.message.BuildError || h2.session.SendHeadersWithinPeerLimitError || error{ NotServer, NotStarted, ConnectionFailed };
-        pub const SendDataError = h2.session.SendDataError || error{ NotStarted, ConnectionFailed };
-        pub const SendTrailersError = h2.session.SendHeadersWithinPeerLimitError || error{ NotStarted, ConnectionFailed };
-        pub const SendPingError = h2.session.SendSimpleControlError || error{ NotStarted, ConnectionFailed };
-        pub const SendLocalSettingsError = h2.session.SendSettingsError || error{ SettingsPending, NotStarted, ConnectionDraining, ConnectionFailed, LocalSettingsFlowControl };
-        pub const ReceiveError = h2.bootstrap.Bootstrap.ReceiveError || error{ HeaderCollectionOverflow, LocalSettingsFlowControl, ReceiveFailed, ConnectionClosed };
-        pub const FinishReceiveError = error{ ReceiveFailed, UnexpectedEof };
-        pub const SendControlError = h2.session.SendSimpleControlError || h2.session.SendStreamControlError || h2.session.SendGoAwayError || error{NotStarted};
-        pub const ReceiveCreditError = h2.session.SendStreamControlError || error{ NotStarted, ConnectionFailed };
-        pub const ResetStreamError = h2.session.SendStreamControlError || error{ NotStarted, ConnectionFailed };
-        pub const CancelRequestError = h2.session.SendStreamControlError || error{ NotClient, NotLocalRequest, NotStarted, ConnectionFailed };
-        pub const SendGoAwayError = h2.session.SendGoAwayError || error{NotStarted};
-        pub const GracefulGoAwayError = h2.session.SendGoAwayError || error{ NotStarted, ConnectionFailed };
+        inline fn stateFromStorage(storage: *Storage) *State {
+            return @ptrCast(&storage._opaque);
+        }
 
         pub fn initClient(allocator: std.mem.Allocator) error{OutOfMemory}!Self {
             return initOwned(allocator, .client);
@@ -284,46 +404,46 @@ pub fn Connection(comptime config: Config) type {
         /// Bind the high-level client to stable caller-owned fixed storage. HPACK
         /// dynamic-table allocations still use `allocator`.
         pub fn initClientInPlace(storage: *Storage, allocator: std.mem.Allocator) Self {
-            return initInPlace(storage, allocator, .client, false);
+            return initState(stateFromStorage(storage), allocator, .client, false);
         }
 
         /// Server counterpart to `initClientInPlace`.
         pub fn initServerInPlace(storage: *Storage, allocator: std.mem.Allocator) Self {
-            return initInPlace(storage, allocator, .server, false);
+            return initState(stateFromStorage(storage), allocator, .server, false);
         }
 
         fn initOwned(allocator: std.mem.Allocator, endpoint_role: h2.Role) error{OutOfMemory}!Self {
-            const storage = try allocator.create(Storage);
-            return initInPlace(storage, allocator, endpoint_role, true);
+            const state = try allocator.create(State);
+            return initState(state, allocator, endpoint_role, true);
         }
 
-        fn initInPlace(storage: *Storage, allocator: std.mem.Allocator, endpoint_role: h2.Role, owns_storage: bool) Self {
+        fn initState(state: *State, allocator: std.mem.Allocator, endpoint_role: h2.Role, owns_storage: bool) Self {
             const defaults = LocalSettings.defaults.normalized(endpoint_role);
-            storage.decoder = h2.hpack.Decoder.init(allocator, defaults.header_table_size);
-            storage.decoder.setMaxHeaderListSize(defaults.max_header_list_size);
-            storage.encoder = h2.hpack.Encoder.init(allocator, 4096);
-            storage.bootstrap = h2.Bootstrap.init(endpoint_role);
-            storage.settings_sync = .{};
-            storage.acknowledged_local_settings = defaults;
-            storage.effective_local_settings = defaults;
-            storage.pending_local_settings = null;
-            storage.pending_settings_ticket = null;
-            storage.initial_settings_acknowledged = false;
-            storage.store = .{};
-            storage.collector = .{};
-            storage.next_request_stream_id = 1;
-            storage.connection_credit = h2.flow.ReceiveCredit.init(65_535, 32_767) catch unreachable;
-            storage.receive_failed = false;
-            storage.peer_receive_closed = false;
-            storage.graceful_goaway = .{};
-            storage.session = h2.Session.init(.{
+            state.decoder = h2.hpack.Decoder.init(allocator, defaults.header_table_size);
+            state.decoder.setMaxHeaderListSize(defaults.max_header_list_size);
+            state.encoder = h2.hpack.Encoder.init(allocator, 4096);
+            state.bootstrap = h2.Bootstrap.init(endpoint_role);
+            state.settings_sync = .{};
+            state.acknowledged_local_settings = defaults;
+            state.effective_local_settings = defaults;
+            state.pending_local_settings = null;
+            state.pending_settings_ticket = null;
+            state.initial_settings_acknowledged = false;
+            state.store = .{};
+            state.collector = .{};
+            state.next_request_stream_id = 1;
+            state.connection_credit = h2.flow.ReceiveCredit.init(65_535, 32_767) catch unreachable;
+            state.receive_failed = false;
+            state.peer_receive_closed = false;
+            state.graceful_goaway = .{};
+            state.session = h2.Session.init(.{
                 .role = endpoint_role,
                 .local_limits = defaults.streamLimits(endpoint_role),
-                .decoder = &storage.decoder,
-                .encoder = &storage.encoder,
-                .header_storage = &storage.header_storage,
+                .decoder = &state.decoder,
+                .encoder = &state.encoder,
+                .header_storage = &state.header_storage,
             });
-            return .{ .allocator = allocator, .owns_storage = owns_storage, .state = storage };
+            return .{ .allocator = allocator, .owns_storage = owns_storage, .state = state };
         }
 
         pub fn deinit(self: *Self) void {
@@ -335,22 +455,6 @@ pub fn Connection(comptime config: Config) type {
 
         pub inline fn role(self: *const Self) h2.Role {
             return self.state.session.role();
-        }
-
-        pub inline fn core(self: *Self) *h2.Session {
-            return &self.state.session;
-        }
-
-        pub inline fn bootstrap(self: *Self) *h2.Bootstrap {
-            return &self.state.bootstrap;
-        }
-
-        pub inline fn store(self: *Self) *StreamStore {
-            return &self.state.store;
-        }
-
-        pub inline fn collector(self: *Self) *FieldCollector {
-            return &self.state.collector;
         }
 
         pub inline fn peerHeaderListLimit(self: *const Self) ?u32 {
@@ -965,7 +1069,7 @@ test "high-level HTTP2 connection owns defaults and emits typed request" {
         true,
     );
     try std.testing.expectEqual(@as(u31, 1), sent.stream_id);
-    try std.testing.expect(conn.store().get(1) != null);
+    try std.testing.expect(conn.state.store.get(1) != null);
 }
 
 test "high-level HTTP2 reclaims closed bounded stream slots" {
@@ -1001,7 +1105,7 @@ test "high-level HTTP2 drain processes multiple complete control frames" {
 
     const Counter = struct {
         count: usize = 0,
-        pub fn onEvent(self: *@This(), _: Conn.ReceiveResult) DrainAction {
+        pub fn onEvent(self: *@This(), _: ReceiveResult) DrainAction {
             self.count += 1;
             return .continue_;
         }
@@ -1017,7 +1121,7 @@ test "high-level HTTP2 honors peer header list limit before wire mutation" {
     const Conn = Connection(.{ .max_streams = 4, .header_block_bytes = 512, .scratch_bytes = 512, .frame_staging_bytes = 512, .collected_fields = 8, .collected_field_bytes = 256, .outbound_fields = 8 });
     var conn = try Conn.initClient(std.testing.allocator);
     defer conn.deinit();
-    conn.core().peer.settings.max_header_list_size = 64;
+    conn.state.session.peer.settings.max_header_list_size = 64;
 
     var wire_storage: [512]u8 = undefined;
     var wire = std.Io.Writer.fixed(&wire_storage);
@@ -1033,7 +1137,7 @@ test "high-level HTTP2 honors peer header list limit before wire mutation" {
         ),
     );
     try std.testing.expectEqual(before, wire.end);
-    try std.testing.expect(conn.store().get(1) == null);
+    try std.testing.expect(conn.state.store.get(1) == null);
 }
 
 test "high-level HTTP2 derives initial SETTINGS and receive limit from config" {
@@ -1104,9 +1208,9 @@ test "high-level HTTP2 activates restrictive local settings only after ACK" {
     );
 
     try std.testing.expect(!client.initialSettingsAcknowledged());
-    try std.testing.expectEqual(@as(i32, 65_535), client.store().get(sent.stream_id).?.windows.receive.value);
-    try std.testing.expect(client.core().streams.local_limits.enable_push);
-    try std.testing.expectEqual(std.math.maxInt(u32), client.core().streams.local_limits.max_concurrent_streams);
+    try std.testing.expectEqual(@as(i32, 65_535), client.state.store.get(sent.stream_id).?.windows.receive.value);
+    try std.testing.expect(client.state.session.streams.local_limits.enable_push);
+    try std.testing.expectEqual(std.math.maxInt(u32), client.state.session.streams.local_limits.max_concurrent_streams);
 
     var peer_settings: [9]u8 = undefined;
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
@@ -1117,9 +1221,9 @@ test "high-level HTTP2 activates restrictive local settings only after ACK" {
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0x01, .stream_id = 0 }).encode(&ack);
     _ = (try client.receive(&ack)).?;
     try std.testing.expect(client.initialSettingsAcknowledged());
-    try std.testing.expectEqual(@as(i32, 32_768), client.store().get(sent.stream_id).?.windows.receive.value);
-    try std.testing.expect(!client.core().streams.local_limits.enable_push);
-    try std.testing.expectEqual(@as(u32, 0), client.core().streams.local_limits.max_concurrent_streams);
+    try std.testing.expectEqual(@as(i32, 32_768), client.state.store.get(sent.stream_id).?.windows.receive.value);
+    try std.testing.expect(!client.state.session.streams.local_limits.enable_push);
+    try std.testing.expectEqual(@as(u32, 0), client.state.session.streams.local_limits.max_concurrent_streams);
 }
 
 test "high-level HTTP2 accepts permissive initial SETTINGS before ACK" {
@@ -1165,7 +1269,7 @@ test "high-level HTTP2 accepts permissive initial SETTINGS before ACK" {
         &.{},
         true,
     );
-    try std.testing.expectEqual(@as(i32, 131_070), client.store().get(request.stream_id).?.windows.receive.value);
+    try std.testing.expectEqual(@as(i32, 131_070), client.state.store.get(request.stream_id).?.windows.receive.value);
 
     var peer_settings: [9]u8 = undefined;
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
@@ -1213,7 +1317,7 @@ test "high-level HTTP2 serializes runtime local SETTINGS updates" {
         &.{},
         false,
     );
-    try std.testing.expectEqual(@as(i32, 65_535), client.store().get(request.stream_id).?.windows.receive.value);
+    try std.testing.expectEqual(@as(i32, 65_535), client.state.store.get(request.stream_id).?.windows.receive.value);
 
     const restrictive: LocalSettings = .{
         .header_table_size = 2048,
@@ -1236,7 +1340,7 @@ test "high-level HTTP2 serializes runtime local SETTINGS updates" {
     try std.testing.expectEqual(std.math.maxInt(u32), before_ack.max_concurrent_streams);
     try std.testing.expectEqual(std.math.maxInt(u32), before_ack.max_header_list_size);
     try std.testing.expect(before_ack.enable_push);
-    try std.testing.expectEqual(@as(i32, 131_070), client.store().get(request.stream_id).?.windows.receive.value);
+    try std.testing.expectEqual(@as(i32, 131_070), client.state.store.get(request.stream_id).?.windows.receive.value);
 
     var blocked_storage: [64]u8 = undefined;
     var blocked = std.Io.Writer.fixed(&blocked_storage);
@@ -1280,7 +1384,7 @@ test "high-level HTTP2 serializes runtime local SETTINGS updates" {
 
     _ = (try client.receive(&ack)).?;
     try std.testing.expectEqual(relaxed, client.effectiveLocalSettings());
-    try std.testing.expectEqual(@as(i32, 65_535), client.store().get(request.stream_id).?.windows.receive.value);
+    try std.testing.expectEqual(@as(i32, 65_535), client.state.store.get(request.stream_id).?.windows.receive.value);
 
     var noop_storage: [32]u8 = undefined;
     var noop = std.Io.Writer.fixed(&noop_storage);
@@ -1476,7 +1580,7 @@ test "high-level HTTP2 connection faults latch receive terminal state" {
 
     var invalid_data: [9]u8 = undefined;
     try (h2.frame.FrameHeader{ .length = 0, .type = .data, .flags = 0, .stream_id = 0 }).encode(&invalid_data);
-    var receive_error: ?Conn.ReceiveError = null;
+    var receive_error: ?ReceiveError = null;
     const maybe_result = server.receive(&invalid_data) catch |err| blk: {
         receive_error = err;
         break :blk null;
@@ -1519,7 +1623,7 @@ test "high-level HTTP2 bounded stream store survives repeated open reset reclaim
         const request = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/"), &.{}, false);
         try std.testing.expectEqual(expected_stream_id, request.stream_id);
         try client.cancelRequest(&wire, request.stream_id);
-        try std.testing.expect(client.store().get(request.stream_id) == null);
+        try std.testing.expect(client.state.store.get(request.stream_id) == null);
         try std.testing.expectEqual(@as(usize, 0), client.retainedStreams());
         expected_stream_id += 2;
     }
@@ -1577,7 +1681,7 @@ test "high-level HTTP2 server can receive early but cannot answer before local s
         offset += result.consumed;
         if (result.event) |event| if (event == .headers) break;
     }
-    try std.testing.expect(server.store().get(request.stream_id) != null);
+    try std.testing.expect(server.state.store.get(request.stream_id) != null);
 
     var response = try h2.message.ResponseFields.init(204);
     var s2c_storage: [4096]u8 = undefined;
@@ -1687,7 +1791,7 @@ test "high-level HTTP2 finishReceive rejects open continuation block" {
     try (h2.frame.FrameHeader{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 }).encode(&peer_settings);
     _ = (try client.receive(&peer_settings)).?;
 
-    client.core().connection.continuation_guard.stream_id = 1;
+    client.state.session.connection.continuation_guard.stream_id = 1;
     try std.testing.expectError(error.UnexpectedEof, client.finishReceive(&.{}));
     try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());
 }
@@ -1703,14 +1807,14 @@ test "high-level HTTP2 request availability exposes bounded backpressure" {
     _ = try client.start(&outbound);
     try std.testing.expectEqual(RequestAvailability.ready, client.requestAvailability());
 
-    client.core().peer.settings.max_concurrent_streams = 0;
+    client.state.session.peer.settings.max_concurrent_streams = 0;
     try std.testing.expectEqual(RequestAvailability.peer_limit, client.requestAvailability());
     try std.testing.expectError(
         error.PeerLimit,
         client.sendRequest(&outbound, h2.message.RequestFields.init("GET", "https", "example.com", "/blocked"), &.{}, true),
     );
 
-    client.core().peer.settings.max_concurrent_streams = std.math.maxInt(u32);
+    client.state.session.peer.settings.max_concurrent_streams = std.math.maxInt(u32);
     const first = try client.sendRequest(
         &outbound,
         h2.message.RequestFields.init("GET", "https", "example.com", "/one"),
@@ -1749,7 +1853,7 @@ test "high-level HTTP2 server may finish accepted streams after clean peer EOF" 
     _ = try server.start(&s2c);
 
     const Sink = struct {
-        pub fn onEvent(_: *@This(), _: Conn.ReceiveResult) DrainAction {
+        pub fn onEvent(_: *@This(), _: ReceiveResult) DrainAction {
             return .continue_;
         }
     };
@@ -1783,7 +1887,7 @@ test "high-level HTTP2 cancelRequest sends CANCEL and immediately reclaims bound
     try std.testing.expectEqual(@as(u32, 0), client.activeStreams());
     try std.testing.expectEqual(@as(usize, 0), client.retainedStreams());
     try std.testing.expectEqual(RequestAvailability.ready, client.requestAvailability());
-    try std.testing.expect(client.store().get(request.stream_id) == null);
+    try std.testing.expect(client.state.store.get(request.stream_id) == null);
 
     const next = try client.sendRequest(&wire, h2.message.RequestFields.init("GET", "https", "example.com", "/next"), &.{}, true);
     try std.testing.expectEqual(@as(u31, 3), next.stream_id);
@@ -1816,7 +1920,7 @@ test "high-level HTTP2 failed cancel write preserves stream record and poisons s
     var short_storage: [8]u8 = undefined;
     var short = std.Io.Writer.fixed(&short_storage);
     try std.testing.expectError(error.WriteFailed, client.cancelRequest(&short, request.stream_id));
-    try std.testing.expect(client.store().get(request.stream_id) != null);
+    try std.testing.expect(client.state.store.get(request.stream_id) != null);
     try std.testing.expectEqual(@as(usize, 1), client.retainedStreams());
     try std.testing.expectEqual(@as(u32, 1), client.activeStreams());
     try std.testing.expectEqual(Lifecycle.failed, client.lifecycle());

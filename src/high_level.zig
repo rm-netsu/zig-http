@@ -4,6 +4,7 @@
 //! application routing policy.
 
 pub const common = @import("high_level/common.zig");
+pub const Role = @import("common.zig").Role;
 pub const DrainAction = common.DrainAction;
 pub const DrainResult = common.DrainResult;
 

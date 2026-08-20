@@ -70,7 +70,7 @@ fn sendEcho(server: *Conn, out: *std.Io.Writer, stream_id: u31, body: []const u8
     if (sent.blocked or sent.consumed != body.len) return error.UnexpectedFlowControlBlock;
 }
 
-fn handleServerResult(server: *Conn, out: *std.Io.Writer, state: *ServerState, result: Conn.ReceiveResult) !void {
+fn handleServerResult(server: *Conn, out: *std.Io.Writer, state: *ServerState, result: http.high_level.http2.ReceiveResult) !void {
     // SETTINGS/PING/fault responses are explicit: receive() never performs I/O.
     try server.sendControl(out, result.control);
 
