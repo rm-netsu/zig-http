@@ -20,11 +20,12 @@ When the configured queue is full, client `sendRequest()` returns
 backpressure error before consuming a new request head; send an outstanding
 final response (or choose a larger bound) and retry with the same input.
 
-`Connection(config).Storage` exposes the complete fixed high-level state. Use
+`Connection(config).Storage` is opaque caller-owned fixed storage. Use
 `initClientInPlace(&storage)` / `initServerInPlace(&storage)` when the application
-wants fully allocation-free HTTP/1 composition. The storage address must remain
-stable until `deinit`; the ordinary allocator constructors remain convenient when
-a movable handle backed by one allocation is preferable.
+wants fully allocation-free HTTP/1 composition. Declare it, keep its address
+stable until `deinit`, and do not inspect or copy an initialized value; the
+ordinary allocator constructors remain convenient when a movable handle backed
+by one allocation is preferable.
 
 Typed `http1.message.RequestFields` constructors cover origin-form, absolute-
 form, OPTIONS `*`, and CONNECT. They compose Host by construction and reject a

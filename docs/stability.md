@@ -1,75 +1,106 @@
-# API stability and 1.0 freeze policy
+# API stability policy
 
-`zig-http` is still pre-1.0. The project intentionally prefers removing an
-ambiguous API over carrying a compatibility alias that would make the eventual
-1.x surface harder to understand. At the same time, the main composed APIs are
-now treated as **1.0 candidates** so accidental churn is caught before release.
+`zig-http` 1.x treats every declaration reachable from the installed `http`
+module as normal SemVer-governed source API unless this document explicitly
+marks it otherwise. The package does not keep a second hidden category of
+"public but unstable" protocol declarations.
 
-## Tier 1: 1.0-candidate composed surface
+The compatibility promise is source/API and documented-behavior compatibility
+for the supported Zig toolchain. It is not a frozen C ABI and does not promise
+that private implementation layouts or generated machine code remain identical.
 
-These are the recommended integration points. Their owning namespaces and the
-core method families are covered by a compile-time smoke contract in
-`src/root.zig`:
+## Stable composed surface
 
-- `http.common.Header` and the public URI validation helpers;
+These are the recommended integration points and receive the strongest API
+regression coverage:
+
+- `http.common`, including the shared `Role` and header primitives;
+- `http.uri` validation helpers;
 - `http.http1.ConnectionDecoder`;
 - `http.http1.MessageWriter`;
-- `http.http1.message` typed request/response and framing helpers;
+- `http.http1.message` typed request/response/framing helpers;
 - `http.http2.Bootstrap`;
-- `http.http2.Session` and its receive/send/control lifecycle;
+- `http.http2.Session`;
 - `http.http2.message` typed request/response helpers;
+- `http.http2.storage` bounded reference stores/collectors;
 - `http.high_level.http1.Connection(config)`;
 - `http.high_level.http2.Connection(config)`.
 
-Source-breaking changes to these APIs before 1.0 require an explicit migration
-note and a concrete correctness or major-DX justification. Compatibility shims
-are not retained merely to preserve a pre-1.0 spelling.
+The high-level module-level result and error types are intentionally independent
+from the generic `Connection(config)` instantiation and from internal parser /
+HPACK error unions. Different storage configurations therefore share the same
+error/result API, and adding an internal low-level error cannot silently widen a
+1.x high-level error set.
 
-The smoke contract is deliberately not a substitute for semantic tests. It
-prevents accidental removal of the candidate entry points while unit,
-property/fuzz, external interoperability, and h2spec tests protect behavior.
+`Connection(config).Storage` is caller-owned but opaque-by-convention. Its size
+and alignment are available so it can be placed in application memory, but its
+byte representation is not protocol API. Do not inspect or copy an initialized
+Storage value. Keep its address stable until `deinit`.
 
-## Tier 2: advanced public protocol components
+High-level wrappers deliberately do not expose pointers to their bundled
+Session, parser, writer, stream store, collector, or Bootstrap. Applications
+that need lower-level control instantiate those public components directly.
+This prevents a convenience wrapper from freezing its private composition for
+all of 1.x.
 
-The focused namespaces remain public because custom runtimes need them:
+## Stable low-level protocol surface
 
-- HTTP/1 head/body/semantics/write primitives;
-- HTTP/2 frame, payload, continuation, header-block, flow, settings, peer,
-  stream/streams, storage, send, priority, scheduler, dispatch, and contracts.
+The independently composable protocol namespaces are also SemVer-governed API:
 
-They are production-tested and are not "internal" APIs. However, before the 1.0
-freeze they can still receive source-level cleanup when measurements or protocol
-correctness justify it. Such changes must be documented in `CHANGELOG.md` and
-`docs/migration.md`.
+- HTTP/1 head, body, semantics, connection, write, and message primitives;
+- HTTP/2 frame, settings, flow, fields, payload, continuation, preface,
+  bootstrap, protocol, priority, stream/streams, header-block, connection,
+  peer, session, send, scheduler, dispatch, contracts, storage, and message
+  namespaces;
+- the `http.http2.hpack` re-export used by low-level HPACK-facing signatures.
 
-Before tagging 1.0, every Tier 2 namespace will either be accepted into the
-normal SemVer surface or explicitly moved under an experimental namespace. The
-project will not silently declare a currently public namespace exempt from
-SemVer after 1.0.
+This is intentional: one of the library's design goals is that custom event
+loops and sharded runtimes can drop below the composed APIs without copying
+internal implementation files.
 
-## Not package API
+A source-breaking change to this surface requires a new major version after
+1.0. New declarations, new optional helpers, and behavior fixes that preserve
+existing valid usage may ship in 1.x minor/patch releases according to SemVer.
 
-The following are development/reference assets rather than library API:
+## What is not package API
+
+The following remain development/reference assets rather than installed library
+API:
 
 - `build_support/`;
 - `test/` and conformance fixtures;
 - `bench/`;
-- executable examples and their local support code.
+- executable files under `examples/`.
 
 Examples are compile-tested so they remain trustworthy usage references, but
-applications should import `http`, not files from `examples/` or `test/`.
+applications should import `http`, not source files from those directories.
 
-## Release expectations
+## API regression gate
 
-A 1.0 candidate should satisfy all of the following before the final API freeze:
+`src/root.zig` contains a compile-time stable-surface contract. It verifies:
 
-1. `zig build check` succeeds in the supported Zig configuration;
-2. ReleaseSafe and ReleaseFast focused protocol tests pass;
-3. external HTTP/1 and HTTP/2 interoperability passes;
-4. upstream h2spec v2.6.0 passes in strict mode;
-5. public examples compile against only documented API;
-6. migration notes contain no unresolved compatibility ambiguity in Tier 1.
+- required composed entry points remain present;
+- key HTTP/1 and HTTP/2 high-level signatures remain exact;
+- high-level errors/results remain module-level rather than config-specific;
+- the shared endpoint `Role` keeps one type identity;
+- high-level wrappers do not re-expose their private composition;
+- caller-owned in-place Storage stays opaque-by-convention.
 
-After 1.0, changes to the accepted public surface follow normal SemVer. New
-optional functionality can be added in minor releases without forcing consumers
-to adopt high-level composition or any particular transport/runtime.
+This is deliberately only one layer of the release gate. Unit/property tests,
+fuzz replay, external interoperability, generated API docs, and upstream h2spec
+protect semantics that declaration signatures cannot express.
+
+## 1.x release expectations
+
+A stable release must keep all of the following green:
+
+1. `zig build check`;
+2. ReleaseSafe and ReleaseFast tests;
+3. external HTTP/1 and HTTP/2 interoperability;
+4. strict upstream h2spec v2.6.0;
+5. compile-tested examples using only documented API;
+6. migration notes for every intentional source break in the next major line.
+
+The project may change implementation layouts, storage internals, algorithms,
+and performance strategies in compatible 1.x releases as long as the public
+source/API and documented protocol behavior remain compatible.

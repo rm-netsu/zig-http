@@ -1,8 +1,43 @@
 # Migration guide
 
-The package is pre-1.0 and intentionally removes obsolete compatibility surfaces
-rather than carrying aliases indefinitely. Release notes remain authoritative;
-this document highlights source-level migration patterns.
+`zig-http` follows normal SemVer source compatibility starting with 1.0.0.
+This document records the final pre-1.0 cleanup and earlier source migrations;
+release notes remain authoritative for behavior changes.
+
+## 0.20.x to 1.0.0
+
+The 1.0 API freeze removes the last high-level implementation leaks rather than
+carrying compatibility aliases into the stable line.
+
+High-level error/result types are now module-level and shared across all bounded
+`Connection(config)` instantiations. Replace forms such as
+`Conn.ReceiveError` / `Conn.ReceiveResult` with
+`http.high_level.http1.ReceiveError` or `http.high_level.http2.ReceiveResult`
+and the corresponding module-level send/control error types. This also decouples
+the stable high-level error contract from future low-level parser/HPACK error-set
+changes.
+
+`high_level.http1.Connection` no longer exposes `decoder()` / `writer()`, and
+`high_level.http2.Connection` no longer exposes `core()` / `bootstrap()` /
+`store()` / `collector()` or nested `StreamStore` / `FieldCollector` types. If an
+integration needs those layers, instantiate `http1.ConnectionDecoder`,
+`http1.MessageWriter`, `http2.Bootstrap`, `http2.Session`, or `http2.storage`
+directly. This preserves low-level composability without freezing the private
+composition of the convenience wrappers.
+
+`Connection(config).Storage` remains the caller-owned in-place allocation type,
+but its protocol fields are intentionally opaque. Code should only declare it,
+keep it at a stable address, pass it to `init*InPlace`, and retain it until
+`deinit`; direct field inspection from pre-1.0 builds must be removed.
+
+HTTP/1 and HTTP/2 endpoint roles now share one type identity,
+`http.common.Role`. `http.http2.Role`, `http.high_level.Role`, and
+`http.high_level.http1.Role` resolve to that same type. The root module also
+exports `http.version`, which is `1.0.0` for this release.
+
+From 1.0 onward every declaration reachable from the installed `http` module is
+SemVer-governed unless explicitly documented otherwise; see
+[`stability.md`](stability.md).
 
 
 ## 0.19.x to 0.20.x
@@ -53,9 +88,10 @@ accepted immediately; restrictions wait for the matching ACK. HPACK table-size
 changes remain ACK-synchronized. This also fixes streams created while an
 increased INITIAL_WINDOW_SIZE is in flight.
 
-The project now documents explicit pre-1.0 stability tiers in
-[`stability.md`](stability.md), and the 1.0-candidate composed method families
-are covered by a compile-time smoke contract.
+Release 0.20 introduced pre-1.0 stability tiers and a declaration-presence
+smoke contract. Release 1.0 replaces those temporary tiers with the stable
+SemVer policy in [`stability.md`](stability.md) and a signature-level API
+contract.
 
 High-level lifecycle enforcement is now fail-closed. HTTP/2 client
 `sendRequest()` must follow `start()` and returns `NotStarted` before the local

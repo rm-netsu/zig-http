@@ -86,7 +86,7 @@ See [the HTTP/2 composition guide](docs/http2.md) and
 Add the package with Zig's package manager:
 
 ```sh
-zig fetch --save git+https://github.com/rm-netsu/zig-http.git#v0.20.0
+zig fetch --save git+https://github.com/rm-netsu/zig-http.git#v1.0.0
 ```
 
 Then import the module in `build.zig`:
@@ -102,11 +102,12 @@ exe.root_module.addImport("http", http_dep.module("http"));
 The package targets and is tested with Zig 0.16.0; the package manifest sets
 0.16.0 as the minimum Zig version.
 
-Both high-level connection types expose caller-owned `Storage` plus `init*InPlace`
-constructors. HTTP/1 can therefore run fully allocation-free at the composed
-layer; HTTP/2 can avoid the large fixed-state allocation while continuing to use
-the caller-selected allocator only for HPACK dynamic tables. In-place storage
-must remain at a stable address until `deinit`.
+Both high-level connection types expose opaque caller-owned `Storage` plus
+`init*InPlace` constructors. HTTP/1 can therefore run fully allocation-free at
+the composed layer; HTTP/2 can avoid the large fixed-state allocation while
+continuing to use the caller-selected allocator only for HPACK dynamic tables.
+In-place storage must remain at a stable address until `deinit` and its bytes are
+not part of the public protocol API.
 
 The best executable starting points are compile-tested examples. For complete socket-level composition, start with the standalone TCP client/server examples:
 
@@ -134,7 +135,7 @@ so they are kept in sync with the public API.
 Start with [`docs/README.md`](docs/README.md). The focused guides are:
 
 - [Architecture and composition levels](docs/architecture.md)
-- [API stability and 1.0 freeze policy](docs/stability.md)
+- [API stability policy](docs/stability.md)
 - [Basic TCP client/server composition](docs/basic-client-server.md)
 - [HTTP/1.1 composition](docs/http1.md)
 - [HTTP/2 composition](docs/http2.md)
@@ -248,7 +249,9 @@ DNS, timers, or an event loop. The protocol core remains independently usable.
 
 ## Status
 
-The project is still pre-1.0, so incompatible API refinements can occur when
-needed to make the eventual 1.x contracts safer or clearer. Migration notes are
-kept in [`docs/migration.md`](docs/migration.md), and release changes are listed
-in [`CHANGELOG.md`](CHANGELOG.md).
+The public `http` module is stable under SemVer starting with 1.0.0. High-level
+connection internals remain intentionally hidden behind opaque caller-owned
+storage, while all documented low-level protocol namespaces remain directly
+usable and SemVer-governed. See [`docs/stability.md`](docs/stability.md) for the
+exact compatibility policy and [`docs/migration.md`](docs/migration.md) for
+source migration from pre-1.0 releases.

@@ -12,7 +12,7 @@ TLS, event-loop, or thread-pool implementation.
 - [`basic-client-server.md`](basic-client-server.md) — end-to-end TCP client/server composition for HTTP/1.1 and HTTP/2.
 - [`architecture.md`](architecture.md) — protocol/core boundary, composition
   levels, memory model, and low-level module map.
-- [`stability.md`](stability.md) — pre-1.0 stability tiers and the API-freeze policy.
+- [`stability.md`](stability.md) — stable 1.x API and SemVer policy.
 - [`http1.md`](http1.md) — HTTP/1.1 receive/send composition and lower-level
   escape hatches.
 - [`http2.md`](http2.md) — HTTP/2 Session, lower-level connection/stream

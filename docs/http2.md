@@ -53,9 +53,11 @@ handle is safely movable despite Session holding internal pointers.
 `initClientInPlace` / `initServerInPlace` instead places that fixed state in
 caller-owned stable memory; the supplied allocator is then used only by HPACK
 dynamic tables. Sockets, TLS, transport buffers, timers, and application
-scheduling remain caller-owned. `core()`, `store()`, `collector()`, and
-`bootstrap()` expose the underlying components when an integration needs to
-drop down a level.
+scheduling remain caller-owned. The high-level wrapper intentionally does not
+expose pointers to its bundled Session/Bootstrap/store/collector; integrations
+that need those layers instantiate the public `http2.Session`, `Bootstrap`,
+`storage`, or lower-level namespaces directly so wrapper internals are not part
+of the stable API.
 
 The convenience defaults favor a practical standalone integration rather than
 minimum bytes per connection. `Connection(config).state_bytes` exposes the fixed
@@ -86,7 +88,7 @@ receive calls return `ReceiveFailed`; discard that high-level connection. The
 low-level transactional collector still exposes `overflowed()` for diagnostic or
 proxy integrations that intentionally manage this case themselves. Closed entries are retained until the application explicitly reclaims them, so final stream state remains inspectable. `reclaimStream(id)` removes one known-closed record without a full bounded-store scan; `reclaimClosed()` remains convenient for batch cleanup. For client-side timeout/user cancellation, `cancelRequest(out, id)` emits `RST_STREAM(CANCEL)` and immediately reclaims the bounded slot only after the reset frame is successfully committed; a partial write leaves the record intact and poisons further application sends.
 
-`activeLocalStreams()`, `activeRemoteStreams()`, `activeStreams()`, and `retainedStreams()` expose exact composed drain/backpressure state without requiring `core()`/store inspection. `streamsDrained()` is a snapshot of current protocol activity; after the first MAX_STREAM_ID graceful GOAWAY it can become true and later false again if the peer opens another stream before the final cutoff.
+`activeLocalStreams()`, `activeRemoteStreams()`, `activeStreams()`, and `retainedStreams()` expose exact composed drain/backpressure state without requiring direct Session/store inspection. `streamsDrained()` is a snapshot of current protocol activity; after the first MAX_STREAM_ID graceful GOAWAY it can become true and later false again if the peer opens another stream before the final cutoff.
 
 `lifecycle()` reports `handshaking`, `active`, `draining`, or `failed`. Either a
 received/locally sent GOAWAY or a clean peer receive-EOF enters `draining`;
